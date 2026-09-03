@@ -1,386 +1,439 @@
-from playwright.sync_api import sync_playwright
 import re
 import time
 import requests
 import os
 import json
-from typing import List, Dict
-from configuration import MAX_GROUP_URL, MAX_PHONE
-from datetime import datetime, timedelta
 import hashlib
 import shutil
+import io
+from typing import List, Dict
+from playwright.sync_api import sync_playwright
 
+try:
+    from configuration import MAX_GROUP_URL, MAX_PHONE
+except ImportError:
+    MAX_GROUP_URL = "https://web.max.ru"
+    MAX_PHONE = "+79990000000"
 
 SESSION_DIR = "chrome_max_session_permanent"
 SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
+
 os.makedirs(SESSION_DIR, exist_ok=True)
+# Папка downloads больше не используется для сохранения, но оставлена для совместимости
+os.makedirs("downloads", exist_ok=True)
 
 message_cache = set()
 photo_cache = set()
 
+_playwright_instance = None
+_browser_context = None
+_page = None
+
 
 def load_message_cache():
-    """Загружает хэши сообщений из seen_messages.json"""
     global message_cache
+    message_cache.clear()
     if os.path.exists(SEEN_MESSAGES_FILE):
         try:
             with open(SEEN_MESSAGES_FILE, "r", encoding="utf-8") as f:
                 message_cache = set(json.load(f).get('message_hashes', []))
-            print(f"✅ seen_messages.json: {len(message_cache)} сообщений")
-        except:
+            print(f"✅ Кэш сообщений: {len(message_cache)}")
+        except Exception:
             message_cache = set()
     else:
-        message_cache = set()
+        print("ℹ️ Файл seen_messages.json не найден — кэш пуст")
 
 
 def save_message_cache():
-    """Сохраняет хэши сообщений в seen_messages.json"""
     try:
         with open(SEEN_MESSAGES_FILE, "w", encoding="utf-8") as f:
             json.dump({'message_hashes': list(message_cache)}, f)
-        print(f"💾 seen_messages.json: {len(message_cache)} сообщений")
-    except:
+    except Exception:
         pass
 
 
 def load_photo_cache():
-    """Загружает хэши фото из cache_file.json"""
     global photo_cache
+    photo_cache.clear()
     if os.path.exists(PHOTO_CACHE_FILE):
         try:
             with open(PHOTO_CACHE_FILE, "r", encoding="utf-8") as f:
                 photo_cache = set(json.load(f).get('photo_hashes', []))
-            print(f"✅ cache_file.json: {len(photo_cache)} фото")
-        except:
+            print(f"✅ Кэш медиа: {len(photo_cache)}")
+        except Exception:
             photo_cache = set()
     else:
-        photo_cache = set()
+        print("ℹ️ Файл seen_images.json не найден — кэш пуст")
 
 
 def save_photo_cache():
-    """Сохраняет хэши фото в cache_file.json"""
     try:
         with open(PHOTO_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump({'photo_hashes': list(photo_cache)}, f)
-        print(f"💾 cache_file.json: {len(photo_cache)} фото")
-    except:
+    except Exception:
         pass
+
+def normalize_for_hash(text: str) -> str:
+    """Очищает текст от эмодзи 👤 и лишних пробелов для корректного сравнения"""
+    if not text:
+        return ""
+    # Убираем эмодзи 👤 (если он вдруг затесался) и лишние пробелы по краям
+    text = text.replace('👤', '').strip()
+    # Заменяем все множественные пробелы и переносы строк на один обычный пробел
+    # Это спасает от ситуаций, где в одном случае "Имя\nТекст", а в другом "Имя Текст"
+    return " ".join(text.split())
 
 
 def get_message_hash(post: dict) -> str:
-    content = f"{post['name']}{post['text']}"
-    return hashlib.md5(content.encode()).hexdigest()
+    # Очищаем имя и текст перед созданием хэша
+    clean_name = normalize_for_hash(post.get('name', ''))
+    clean_text = normalize_for_hash(post.get('text', ''))
+    
+    # Создаем хэш из очищенных данных
+    content = f"{clean_name}|{clean_text[:150]}"
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 
-def get_photo_hash(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()
+def get_media_hash(url: str) -> str:
+    return hashlib.md5(url.encode('utf-8')).hexdigest()
 
 
 def is_new_message(post: dict) -> bool:
-    """Проверяет новое сообщение (seen_messages.json)"""
+    """Проверяет, новое ли сообщение. Вызывается ТОЛЬКО в боте перед отправкой."""
     msg_hash = get_message_hash(post)
     if msg_hash in message_cache:
         return False
     message_cache.add(msg_hash)
-    save_message_cache() 
+    save_message_cache()
     return True
 
 
-def is_new_photo(url: str) -> bool:
-    """Проверяет новое фото (cache_file.json)"""
-    photo_hash = get_photo_hash(url)
-    if photo_hash in photo_cache:
-        print(f"🚫 ДУБЛЬ ФОТО: {url[:60]}")
+def is_new_media(url: str) -> bool:
+    """Проверяет, скачивали ли мы уже этот URL (для фото и документов)"""
+    media_hash = get_media_hash(url)
+    if media_hash in photo_cache:
         return False
-    photo_cache.add(photo_hash)
+    photo_cache.add(media_hash)
     save_photo_cache()
     return True
 
 
 def clear_all_caches():
-    """Очищает ВСЕ кэши"""
+    """Очищает ТОЛЬКО кэш сообщений и фото, НЕ трогая сессию браузера"""
     global message_cache, photo_cache
     message_cache.clear()
     photo_cache.clear()
-    
-    for file in [SEEN_MESSAGES_FILE, PHOTO_CACHE_FILE, "max_cookies.json"]:
-        if os.path.exists(file):
-            os.remove(file)
-    
-    for folder in ["chrome_max_session_permanent", "downloads"]:
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-    
-    print("✅ ВСЕ КЭШИ ОЧИЩЕНЫ!")
 
+    for f in [SEEN_MESSAGES_FILE, PHOTO_CACHE_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
 
-def is_photo_not_avatar(url: str, element) -> bool:
-    """СУПЕРСТРОГИЙ ФИЛЬТР АВАТАРОК"""
-    url_lower = url.lower()
-    
-    banlist = [
-        'avatar', 'profile', 'userpic', 'user-', 'icon', 'logo', 'emoji', 
-        'sticker', 'thumb', 'thumbnail', 'preview', 'small', 'circle', 
-        'round', 'mini', 'tiny', 'badge', 'status', 'placeholder'
-    ]
-    if any(ban in url_lower for ban in banlist):
-        print(f"🚫 БАН ПО СЛОВУ: {url[:50]}")
-        return False
-    
-    try:
-        width = element.get_attribute("width")
-        height = element.get_attribute("height")
-        if width and int(width) < 300:
-            print(f"🚫 width < 300px: {width}")
-            return False
-        if height and int(height) < 300:
-            print(f"🚫 height < 300px: {height}")
-            return False
-        
-        box = element.bounding_box()
-        if box and (box['width'] < 250 or box['height'] < 250):
-            print(f"🚫 box < 250px: {box['width']}x{box['height']}")
-            return False
-    except:
-        pass
-    
-    if len(url) < 70:
-        print(f"🚫 URL слишком короткий: {len(url)} символов")
-        return False
-    
-    print(f"✅ ✅ РЕАЛЬНОЕ ФОТО: {url[:60]}")
-    return True
-
-
-def download_file(url: str) -> str:
-    if not is_new_photo(url):
-        return None
-    
+    if os.path.exists("downloads"):
+        shutil.rmtree("downloads")
     os.makedirs("downloads", exist_ok=True)
-    filename = f"photo_{int(time.time())}_{get_photo_hash(url)[:12]}.jpg"
-    filepath = f"downloads/{filename}"
-    
+
+    print("✅ Кэш сообщений и фото очищен (сессия сохранена)")
+
+
+def get_media_bytes(url: str, media_type: str = 'image') -> dict:
+    """Скачивает медиа в оперативную память (возвращает байты), не сохраняя на диск"""
+    if not is_new_media(url):
+        return None
+
     try:
-        print(f"📥 НОВОЕ ФОТО: {url[:80]}...")
-        response = requests.get(url, timeout=30, stream=True)
-        if response.status_code == 200:
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return filepath
-    except:
-        pass
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        resp = requests.get(url, timeout=30, headers=headers)
+        if resp.status_code == 200:
+            data = resp.content
+            
+            # Фильтр аватарок только для картинок
+            if media_type == 'image' and len(data) < 5000:
+                print(f"🚫 Файл слишком маленький ({len(data)} байт) — это аватарка")
+                return None
+            
+            print(f"📥 ЗАГРУЖЕНО В ПАМЯТЬ ({media_type}): {len(data) // 1024}KB")
+            return {'bytes': data, 'type': media_type}
+    except Exception as e:
+        print(f"❌ Ошибка скачивания {media_type}: {e}")
     return None
 
 
 def is_human_message(text: str) -> bool:
     text = text.strip().lower()
-    bot_phrases = ['теперь в max', 'напишите что-нибудь', 'сферум', 'удалил', 'удалила', 'изменил', 'изменила', 'вошел', 'вошла', 'покинул', 'покинула']
+    if not text:
+        return False
+    bot_phrases = [
+        'теперь в max', 'напишите что-нибудь', 'сферум',
+        'удалил', 'удалила', 'изменил', 'изменила',
+        'вошел', 'вошла', 'покинул', 'покинула',
+        'добавил', 'добавила', 'исключил', 'исключила',
+        'пригласил', 'пригласила', 'системное',
+        'создал чат', 'создала чат', 'вернулся', 'вернулась'
+    ]
     if any(phrase in text for phrase in bot_phrases):
         return False
-    return (15 < len(text) < 900 and text[0].isalpha())
+    return 10 < len(text) < 2000
 
 
-def chronological_scroll(page, target_url: str):
-    """ХРОНОЛОГИЧЕСКИЙ СКРОЛЛ: СТАРЫЕ → НОВЫЕ"""
-    print("📜 ХРОНОЛОГИЯ: СТАРЫЕ → НОВЫЕ")
-    
-    if target_url not in page.url:
-        page.goto(target_url)
-        page.wait_for_timeout(5000)
-    
-    print("📜 1. К САМЫМ СТАРЫМ...")
-    for i in range(20):
-        page.keyboard.press("Home")
-        page.wait_for_timeout(300)
-    
-    page.wait_for_timeout(4000)
-    
-    print("📜 2. МЕДЛЕННЫЙ скролл ВНИЗ...")
-    scroll_count = 0
-    previous_height = 0
-    
-    while scroll_count < 25:
-        current_height = page.evaluate("document.body.scrollHeight")
-        if current_height == previous_height:
-            print("📜 ✅ ВСЯ ИСТОРИЯ!")
-            break
-        
-        print(f"📜 Раунд {scroll_count+1}/25...")
-        for i in range(15):
-            page.keyboard.press("PageDown")
-            page.wait_for_timeout(400)
-        
-        previous_height = current_height
-        scroll_count += 1
-        page.wait_for_timeout(1500)
-    
-    print("📜 3. К НОВЫМ...")
-    for i in range(30):
-        page.keyboard.press("End")
-        page.wait_for_timeout(200)
-    
-    page.wait_for_timeout(5000)
-
-
-def extract_timestamp(text: str, element) -> tuple:
-    time_match = re.search(r'(\d{1,2}:\d{2})', text)
-    if time_match:
-        try:
-            dt = datetime.strptime(time_match.group(1), '%H:%M')
-            dt = dt + timedelta(hours=4)
-            return dt.timestamp(), 0
-        except:
-            pass
-    return time.time(), 3
-
-
-def session_is_valid(page) -> bool:
-    try:
-        page.goto("https://web.max.ru", timeout=15000)
-        page.wait_for_timeout(4000)
-        return bool(page.query_selector("div[class*='chat'], div[class*='group']"))
-    except:
-        return False
-
-def parse_max_group_media() -> List[Dict]:
-    print("🔥 ПАРСИНГ: seen_messages.json + СТАРЫЕ→НОВЫЕ")
-    load_message_cache()
-    load_photo_cache()
-    
-    human_posts = []
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
+def get_or_init_browser():
+    global _playwright_instance, _browser_context, _page
+    if _browser_context is None:
+        print("🚀 Инициализация браузера...")
+        _playwright_instance = sync_playwright().start()
+        _browser_context = _playwright_instance.chromium.launch_persistent_context(
             user_data_dir=SESSION_DIR,
             headless=False,
-            viewport={'width': 1920, 'height': 1080},
-            args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-            slow_mo=50
+            viewport={'width': 1280, 'height': 800},
+            args=[
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-application-cache',
+                '--disable-offline-load-stale-cache',
+                '--disk-cache-size=10485760',        # Лимит кэша: 10 МБ
+                '--media-cache-size=10485760',
+                '--disable-gpu-compositing',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--no-first-run',
+            ],
+            slow_mo=30
         )
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = {runtime: {}};
-        """)
-        
-        try:
-            if not session_is_valid(page):
-                print("📱 Логиньтесь вручную...")
-                page.goto("https://web.max.ru")
-                page.wait_for_timeout(5000)
-                phone_input = page.query_selector("input[type='tel']")
-                if phone_input:
-                    phone_input.fill(MAX_PHONE)
-                    page.click("button")
-                    page.wait_for_timeout(120000)
-            
-            page.goto(MAX_GROUP_URL, timeout=60000)
-            page.wait_for_timeout(10000)
-            chronological_scroll(page, MAX_GROUP_URL)
-            
-            selectors = [
-                "div[class*='message']", "div[class*='chat-message']", 
-                "div[class*='post']", ".bubble", "[data-testid*='message']",
-                "div[role='listitem']", ".message-content"
-            ]
-            
-            all_candidates = []
-            for selector in selectors:
-                try:
-                    elements = page.query_selector_all(selector)
-                    print(f"🔍 {selector}: {len(elements)}")
-                    all_candidates.extend(elements)
-                except:
-                    pass
-            
-            post_candidates = []
-            seen_timestamps = set()
-            
-            for elem in all_candidates:
-                try:
-                    text = elem.text_content().strip()
-                    if len(text) < 15 or not is_human_message(text):
-                        continue
-                    
-                    timestamp, _ = extract_timestamp(text, elem)
-                    timestamp_key = f"{int(timestamp)}_{hash(text[:50])}"
-                    
-                    if timestamp_key in seen_timestamps:
-                        continue
-                    
-                    seen_timestamps.add(timestamp_key)
-                    post_candidates.append({
-                        'element': elem, 'text': text, 'timestamp': timestamp
-                    })
-                except:
-                    continue
-            
-            post_candidates.sort(key=lambda x: x['timestamp']) 
-            print(f"📊 Постов (СТАРЫЕ→НОВЫЕ): {len(post_candidates)}")
-            
-            photo_posts = 0
-            text_posts = 0
-            
-            for i, candidate in enumerate(post_candidates[:100]):
-                try:
-                    elem = candidate['element']
-                    text = candidate['text']
-                    
-                    post = {'name': '👤', 'text': text}
-                    if not is_new_message(post): 
-                        continue
-                    
-                    name = "👤"
-                    name_elem = elem.query_selector("[class*='name'], [class*='author'], [class*='user']")
-                    if name_elem:
-                        name = name_elem.text_content().strip()[:30]
-                    
-                    media_files = []
-                    imgs = elem.query_selector_all("img")
-                    for img in imgs:
-                        src = (img.get_attribute("src") or img.get_attribute("data-src"))
-                        if not src or len(src) < 60:
-                            continue
-                        
-                        if not is_photo_not_avatar(src, img):
-                            continue
-                        
-                        local_path = download_file(src)
-                        if local_path:
-                            media_files.append({
-                                'url': src, 'local_path': local_path, 'type': 'image'
-                            })
-                    
-                    post_data = {
-                        'id': f'post_{i}_{int(time.time())}',
-                        'name': name,
-                        'text': text[:500],
-                        'media_files': media_files,
-                        'timestamp': candidate['timestamp']
+        _page = _browser_context.pages[0] if _browser_context.pages else _browser_context.new_page()
+    return _browser_context, _page
+
+
+def parse_max_group_media() -> List[Dict]:
+    print("🔥 НАЧАЛО ПАРСИНГА...")
+    load_message_cache()
+    load_photo_cache()
+
+    browser, page = get_or_init_browser()
+
+    try:
+        page.goto("https://web.max.ru", timeout=15000)
+        page.wait_for_timeout(3000)
+
+        if not page.query_selector("div[class*='chat'], div[class*='group'], div[class*='message']"):
+            print("📱 Требуется логин...")
+            page.goto("https://web.max.ru")
+            print("⏳ 120 секунд на логин...")
+            page.wait_for_timeout(120000)
+
+        page.goto(MAX_GROUP_URL, timeout=60000)
+        page.wait_for_timeout(5000)
+
+        print("📜 Скролл к последним сообщениям (ВНИЗ)...")
+        for _ in range(30):
+            page.keyboard.press("End")
+            page.wait_for_timeout(200)
+        page.wait_for_timeout(3000)
+
+        # --- ИЗВЛЕЧЕНИЕ ДАННЫХ ЧЕРЕЗ JAVASCRIPT ---
+        raw_messages = page.evaluate("""
+            () => {
+                const results = [];
+
+                const selectors = [
+                    '[class*="message"]', '[class*="bubble"]',
+                    '[class*="chat-msg"]', '[data-testid*="message"]',
+                    '[class*="post"]'
+                ];
+
+                let containers = new Set();
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => containers.add(el));
+                }
+
+                // Сортируем по позиции в DOM (сверху вниз = старые → новые)
+                let sorted = Array.from(containers).sort((a, b) => {
+                    const pos = a.compareDocumentPosition(b);
+                    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                    return 0;
+                });
+
+                sorted.forEach((container, idx) => {
+                const fullText = container.innerText.trim();
+                if (fullText.length < 10 || fullText.length > 2000) return;
+
+                // 1) ИМЯ АВТОРА (отдельно от текста)
+                const nameEl = container.querySelector(
+                    '[class*="name"], [class*="author"], [class*="sender"], [class*="user-name"]'
+                );
+
+                // Если отдельного элемента с именем нет — это "слипшийся" дубль
+                // (имя+роль+текст одним куском). Пропускаем: корректная версия
+                // этого же сообщения придёт из другого контейнера, где nameEl найден.
+                if (!nameEl) return;
+
+                let name = nameEl.innerText.trim().substring(0, 40);
+                name = name.replace(/👤/g, '').trim();
+                name = name.replace(/\s+/g, ' ');
+
+                // 1b) РОЛЬ/СТАТУС автора (например "Учитель 🎓"), если есть рядом с именем
+                let role = '';
+                const authorBlock = nameEl.closest('[class*="author"], [class*="sender"], [class*="user"]') || nameEl.parentElement;
+                let authorBlockText = authorBlock ? authorBlock.innerText.trim() : name;
+                authorBlockText = authorBlockText.replace(/👤/g, '').trim().replace(/\s+/g, ' ');
+                if (authorBlockText.startsWith(name)) {
+                    role = authorBlockText.substring(name.length).trim();
+                }
+                // Защита: если "роль" оказалась длинной — скорее всего, туда затесался текст сообщения
+                if (role.length > 40) role = '';
+
+                // 2) ЧИСТЫЙ ТЕКСТ (без имени, роли и времени)
+                let cleanText = fullText;
+                cleanText = cleanText.replace(/👤/g, '').trim();
+
+                // Удаляем связку "имя + роль" из начала текста
+                const prefixToStrip = role ? `${name} ${role}` : name;
+                if (cleanText.startsWith(prefixToStrip)) {
+                    cleanText = cleanText.substring(prefixToStrip.length).trim();
+                } else if (cleanText.startsWith(name)) {
+                    cleanText = cleanText.substring(name.length).trim();
+                    if (role && cleanText.startsWith(role)) {
+                        cleanText = cleanText.substring(role.length).trim();
                     }
-                    
-                    human_posts.append(post_data)
-                    
-                    if media_files:
-                        photo_posts += 1
-                        display_time = time.strftime('%H:%M', time.localtime(candidate['timestamp']))
-                        print(f"✅ 📸 #{photo_posts} [{display_time}] {name}")
-                    else:
-                        text_posts += 1
-                        print(f"✅ 💬 #{text_posts} {name}")
-                    
-                except:
-                    continue
+                }
+                cleanText = cleanText.replace(/\s+/g, ' ').trim();
+
+                // Обработка пересланных: "Переслано: Имя Фамилия   текст"
+                const fwdMatch = cleanText.match(/^Переслано:\s*(.+?)\s{2,}/);
+                if (fwdMatch) {
+                    if (!name) name = fwdMatch[1].trim();
+                    cleanText = cleanText.substring(fwdMatch[0].length).trim();
+                }
+
+                // Извлекаем время из конца текста
+                const timeMatch = cleanText.match(/(\d{1,2}:\d{2})\s*$/);
+                let msgTime = timeMatch ? timeMatch[1] : '';
+                if (msgTime) {
+                    cleanText = cleanText.substring(0, cleanText.length - msgTime.length).trim();
+                }
+
+                // 3) ФОТО (без аватарок)
+                const images = [];
+                container.querySelectorAll('img').forEach(img => {
+                    const src = img.src || img.dataset.src || '';
+                    if (src.length < 50) return;
+                    if (src.match(/avatar|userpic|profile|icon|emoji|sticker|thumb|logo/i)) return;
+
+                    const avatarParent = img.closest(
+                        '[class*="avatar"], [class*="userpic"], [class*="profile"], [class*="sender-photo"]'
+                    );
+                    if (avatarParent) return;
+
+                    const rect = img.getBoundingClientRect();
+                    if (rect.width < 100 || rect.height < 100) return;
+
+                    images.push(src);
+                });
+
+                // 4) ДОКУМЕНТЫ / ФАЙЛЫ
+                const documents = [];
+                container.querySelectorAll('a').forEach(a => {
+                    const href = a.href || '';
+                    const downloadAttr = a.getAttribute('download') || '';
+
+                    if (href && href.startsWith('http') && !href.match(/\\.(jpg|jpeg|png|gif|webp|svg|bmp)$/i)) {
+                        const hasExtension = href.match(/\\.[a-zA-Z0-9]+$/);
+                        const isFileElement = downloadAttr || hasExtension || a.className.match(/file|document|attachment/i);
+
+                        if (isFileElement) {
+                            let filename = downloadAttr || href.split('/').pop().split('?')[0] || 'document';
+                            if (!documents.some(d => d.url === href)) {
+                                documents.push({ url: href, filename: filename });
+                            }
+                        }
+                    }
+                });
+
+                // Итоговое имя = имя + роль (если есть)
+                let fullName = role ? `${name} ${role}` : name;
+                if (!fullName) fullName = 'Аноним';
+
+                results.push({
+                    idx: idx,
+                    name: fullName,
+                    text: cleanText,
+                    time: msgTime,
+                    images: images,
+                    documents: documents
+                });
+            });
+
+                return results;
+            }
+        """)
+
+        print(f"📊 JS извлёк {len(raw_messages)} сообщений")
+
+        # --- Фильтрация и удаление дубликатов ---
+        seen_texts = set()
+        unique = []
+        for msg in raw_messages:
+            text_key = msg['text'][:100]
+            if text_key in seen_texts:
+                continue
+            if not is_human_message(msg['text']):
+                continue
+            seen_texts.add(text_key)
+            unique.append(msg)
+
+        print(f"📊 После фильтрации: {len(unique)} сообщений")
+
+        # --- БЕРЁМ ПОСЛЕДНИЕ 10 (DOM-порядок = хронологический) ---
+        last_10 = unique[-10:]
+        print(f"📤 Последние {len(last_10)} сообщений (СТАРЫЕ → НОВЫЕ)")
+
+        # --- Скачиваем медиа В ПАМЯТЬ и формируем результат ---
+        human_posts = []
+        for msg in last_10:
+            media_files = []
             
-        finally:
-            browser.close()
-    
-    print(f"🎉 {photo_posts} ФОТО + {text_posts} ТЕКСТ = {len(human_posts)} ПОСТОВ!")
-    return human_posts
+            # 1. Скачиваем изображения в память
+            for img_url in msg['images']:
+                res = get_media_bytes(img_url, media_type='image')
+                if res:
+                    media_files.append({
+                        'url': img_url,
+                        'bytes': res['bytes'],      # ← Храним байты, а не путь к файлу!
+                        'type': 'image'
+                    })
 
+            # 2. Скачиваем документы в память
+            for doc in msg.get('documents', []):
+                res = get_media_bytes(doc['url'], media_type='document')
+                if res:
+                    media_files.append({
+                        'url': doc['url'],
+                        'bytes': res['bytes'],      # ← Храним байты
+                        'type': 'document',
+                        'filename': doc['filename']
+                    })
 
-def is_new_post(post: dict) -> bool:
-    return is_new_message(post)
+            human_posts.append({
+                'name': msg['name'],
+                'text': msg['text'],
+                'time': msg['time'],
+                'media_files': media_files
+            })
+
+            if media_files:
+                types_str = ", ".join([m['type'] for m in media_files])
+                print(f"  📎 {msg['name'][:25]} — {len(media_files)} файл(ов) [{types_str}]")
+            else:
+                print(f"  💬 {msg['name'][:25]}")
+
+        print(f"🎉 ИТОГ: {len(human_posts)} постов передано в бот")
+        return human_posts
+
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
