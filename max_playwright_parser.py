@@ -85,11 +85,16 @@ def normalize_for_hash(text: str) -> str:
 
 
 def get_message_hash(post: dict) -> str:
-    clean_name = normalize_for_hash(post.get('name', ''))
-    clean_text = normalize_for_hash(post.get('text', ''))
+    name = post.get('name', '')
+    text = post.get('text', '')
     
-    content = f"{clean_name}|{clean_text[:150]}"
-    return hashlib.md5(content.encode('utf-8')).hexdigest()
+    name = name.replace('👤', '').replace('Аноним', '')
+
+    combined = f"{name} {text}"
+    
+    normalized = " ".join(combined.split())
+    
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()
 
 
 def get_media_hash(url: str) -> str:
@@ -170,9 +175,10 @@ def get_or_init_browser():
         _playwright_instance = sync_playwright().start()
         _browser_context = _playwright_instance.chromium.launch_persistent_context(
         user_data_dir=SESSION_DIR,
-        headless=False,
+        headless=True,
         viewport={'width': 1280, 'height': 800},
         args=[
+	    '--lang=ru-RU',
         '--no-sandbox',
         '--disable-blink-features=AutomationControlled',
         '--disable-application-cache',
@@ -192,6 +198,35 @@ def get_or_init_browser():
         _page = _browser_context.pages[0] if _browser_context.pages else _browser_context.new_page()
     return _browser_context, _page
 
+def convert_to_24h(time_str: str) -> str:
+    if not time_str:
+        return time_str
+    
+    time_str = time_str.strip()
+    
+    if 'PM' in time_str.upper():
+        time_part = time_str.upper().replace('PM', '').strip()
+        try:
+            hours, minutes = time_part.split(':')
+            hours = int(hours)
+            if hours != 12:
+                hours += 12
+            return f"{hours:02d}:{minutes}"
+        except:
+            return time_str
+    elif 'AM' in time_str.upper():
+        time_part = time_str.upper().replace('AM', '').strip()
+        try:
+            hours, minutes = time_part.split(':')
+            hours = int(hours)
+            if hours == 12:
+                hours = 0
+            return f"{hours:02d}:{minutes}"
+        except:
+            return time_str
+    
+    return time_str
+
 def parse_max_group_media() -> List[Dict]:
     load_message_cache()
     load_photo_cache()
@@ -209,13 +244,13 @@ def parse_max_group_media() -> List[Dict]:
             page.wait_for_timeout(120000)
 
         page.goto(MAX_GROUP_URL, timeout=60000)
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(1000)
 
         for _ in range(30):
             page.keyboard.press("End")
             page.wait_for_timeout(200)
         page.wait_for_timeout(3000)
-
+        print("✅ Страница загружена, начинаем парсинг сообщений...")
         raw_messages = page.evaluate("""
             () => {
                 const results = [];
@@ -272,16 +307,25 @@ def parse_max_group_media() -> List[Dict]:
                 let cleanText = fullText;
                 cleanText = cleanText.replace(/👤/g, '').trim();
 
-                // Удаляем связку "имя + роль" из начала текста
-                const prefixToStrip = role ? `${name} ${role}` : name;
-                if (cleanText.startsWith(prefixToStrip)) {
-                    cleanText = cleanText.substring(prefixToStrip.length).trim();
-                } else if (cleanText.startsWith(name)) {
-                    cleanText = cleanText.substring(name.length).trim();
-                    if (role && cleanText.startsWith(role)) {
-                        cleanText = cleanText.substring(role.length).trim();
+                // --- НОВАЯ, НАДЕЖНАЯ ЛОГИКА РАЗДЕЛЕНИЯ ---
+                // Если у нас есть отдельный элемент с именем (nameEl),
+                // то мы точно знаем, что имя есть, и можем безопасно его вырезать.
+                if (nameEl) {
+                    // Сначала пробуем вырезать связку "имя + роль"
+                    const prefixToStrip = role ? `${name} ${role}` : name;
+                    if (cleanText.startsWith(prefixToStrip)) {
+                        cleanText = cleanText.substring(prefixToStrip.length).trim();
+                    } else if (cleanText.startsWith(name)) {
+                        // Если роль не приклеилась, вырезаем только имя
+                        cleanText = cleanText.substring(name.length).trim();
+                        // И если после имени сразу идет роль, вырезаем и ее
+                        if (role && cleanText.startsWith(role)) {
+                            cleanText = cleanText.substring(role.length).trim();
+                        }
                     }
                 }
+                // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
                 cleanText = cleanText.replace(/\s+/g, ' ').trim();
 
                 // Обработка пересланных: "Переслано: Имя Фамилия   текст"
@@ -354,15 +398,20 @@ def parse_max_group_media() -> List[Dict]:
         """)
 
 
-        seen_texts = set()
+        seen_hashes = set()
         unique = []
         for msg in raw_messages:
-            text_key = msg['text'][:100]
-            if text_key in seen_texts:
-                continue
             if not is_human_message(msg['text']):
                 continue
-            seen_texts.add(text_key)
+            
+            clean_text = normalize_for_hash(msg.get('text', ''))
+            content = clean_text[-100:] if len(clean_text) > 100 else clean_text
+            msg_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+            
+            if msg_hash in seen_hashes:
+                continue 
+                
+            seen_hashes.add(msg_hash)
             unique.append(msg)
 
         last_10 = unique[-10:]
@@ -393,7 +442,7 @@ def parse_max_group_media() -> List[Dict]:
             human_posts.append({
                 'name': msg['name'],
                 'text': msg['text'],
-                'time': msg['time'],
+                'time': convert_to_24h(msg['time']),
                 'media_files': media_files
             })
 
