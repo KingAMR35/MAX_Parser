@@ -25,7 +25,6 @@ SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
 
 os.makedirs(SESSION_DIR, exist_ok=True)
-# Папка downloads больше не используется для сохранения, но оставлена для совместимости
 os.makedirs("downloads", exist_ok=True)
 
 message_cache = set()
@@ -81,19 +80,14 @@ def normalize_for_hash(text: str) -> str:
     """Очищает текст от эмодзи 👤 и лишних пробелов для корректного сравнения"""
     if not text:
         return ""
-    # Убираем эмодзи 👤 (если он вдруг затесался) и лишние пробелы по краям
     text = text.replace('👤', '').strip()
-    # Заменяем все множественные пробелы и переносы строк на один обычный пробел
-    # Это спасает от ситуаций, где в одном случае "Имя\nТекст", а в другом "Имя Текст"
     return " ".join(text.split())
 
 
 def get_message_hash(post: dict) -> str:
-    # Очищаем имя и текст перед созданием хэша
     clean_name = normalize_for_hash(post.get('name', ''))
     clean_text = normalize_for_hash(post.get('text', ''))
     
-    # Создаем хэш из очищенных данных
     content = f"{clean_name}|{clean_text[:150]}"
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
@@ -103,7 +97,6 @@ def get_media_hash(url: str) -> str:
 
 
 def is_new_message(post: dict) -> bool:
-    """Проверяет, новое ли сообщение. Вызывается ТОЛЬКО в боте перед отправкой."""
     msg_hash = get_message_hash(post)
     if msg_hash in message_cache:
         return False
@@ -113,7 +106,6 @@ def is_new_message(post: dict) -> bool:
 
 
 def is_new_media(url: str) -> bool:
-    """Проверяет, скачивали ли мы уже этот URL (для фото и документов)"""
     media_hash = get_media_hash(url)
     if media_hash in photo_cache:
         return False
@@ -123,7 +115,6 @@ def is_new_media(url: str) -> bool:
 
 
 def clear_all_caches():
-    """Очищает ТОЛЬКО кэш сообщений и фото, НЕ трогая сессию браузера"""
     global message_cache, photo_cache
     message_cache.clear()
     photo_cache.clear()
@@ -138,7 +129,6 @@ def clear_all_caches():
 
 
 def get_media_bytes(url: str, media_type: str = 'image') -> dict:
-    """Скачивает медиа в оперативную память (возвращает байты), не сохраняя на диск"""
     if not is_new_media(url):
         return None
 
@@ -148,7 +138,6 @@ def get_media_bytes(url: str, media_type: str = 'image') -> dict:
         if resp.status_code == 200:
             data = resp.content
             
-            # Фильтр аватарок только для картинок
             if media_type == 'image' and len(data) < 5000:
                 return None
             
@@ -178,7 +167,6 @@ def is_human_message(text: str) -> bool:
 def get_or_init_browser():
     global _playwright_instance, _browser_context, _page
     if _browser_context is None:
-        print("🚀 Инициализация браузера...")
         _playwright_instance = sync_playwright().start()
         _browser_context = _playwright_instance.chromium.launch_persistent_context(
         user_data_dir=SESSION_DIR,
@@ -189,7 +177,7 @@ def get_or_init_browser():
         '--disable-blink-features=AutomationControlled',
         '--disable-application-cache',
         '--disable-offline-load-stale-cache',
-        '--disk-cache-size=10485760',        # Лимит кэша: 10 МБ
+        '--disk-cache-size=10485760',
         '--media-cache-size=10485760',
         '--disable-gpu-compositing',
         '--disable-extensions',
@@ -228,7 +216,6 @@ def parse_max_group_media() -> List[Dict]:
             page.wait_for_timeout(200)
         page.wait_for_timeout(3000)
 
-        # --- ИЗВЛЕЧЕНИЕ ДАННЫХ ЧЕРЕЗ JAVASCRIPT ---
         raw_messages = page.evaluate("""
             () => {
                 const results = [];
@@ -367,7 +354,6 @@ def parse_max_group_media() -> List[Dict]:
         """)
 
 
-        # --- Фильтрация и удаление дубликатов ---
         seen_texts = set()
         unique = []
         for msg in raw_messages:
@@ -379,31 +365,27 @@ def parse_max_group_media() -> List[Dict]:
             seen_texts.add(text_key)
             unique.append(msg)
 
-        # --- БЕРЁМ ПОСЛЕДНИЕ 10 (DOM-порядок = хронологический) ---
         last_10 = unique[-10:]
 
-        # --- Скачиваем медиа В ПАМЯТЬ и формируем результат ---
         human_posts = []
         for msg in last_10:
             media_files = []
             
-            # 1. Скачиваем изображения в память
             for img_url in msg['images']:
                 res = get_media_bytes(img_url, media_type='image')
                 if res:
                     media_files.append({
                         'url': img_url,
-                        'bytes': res['bytes'],      # ← Храним байты, а не путь к файлу!
+                        'bytes': res['bytes'],
                         'type': 'image'
                     })
 
-            # 2. Скачиваем документы в память
             for doc in msg.get('documents', []):
                 res = get_media_bytes(doc['url'], media_type='document')
                 if res:
                     media_files.append({
                         'url': doc['url'],
-                        'bytes': res['bytes'],      # ← Храним байты
+                        'bytes': res['bytes'],
                         'type': 'document',
                         'filename': doc['filename']
                     })

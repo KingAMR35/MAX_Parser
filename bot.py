@@ -20,7 +20,6 @@ load_dotenv()
 
 
 print("🚀 MAX Parser Bot запущен")
-# Включаем MarkdownV2 глобально для красивого форматирования
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='MarkdownV2')
 
 ADMIN_ID = os.getenv("ADMIN_ID")
@@ -44,39 +43,32 @@ def format_message(post: dict) -> str:
     text = post.get('text', '').strip()
     msg_time = post.get('time', '').strip()
 
-    # Заголовок с именем
     if name and name != 'Аноним':
         header = f"👤 *{escape_md(name)}*\n\n"
     else:
         header = ""
 
-    # Тело сообщения
     body = escape_md(text)
     result = f"{header}{body}"
 
-    # Время внизу
     if msg_time:
         result += f"\n\n🕐 _{escape_md(msg_time)}_"
 
     return result
 
 def parse_max_loop(chat_id):
-    """Основной цикл автопарсинга"""
     global PARSING_ACTIVE
     while PARSING_ACTIVE:
         try:
-            print(f"\n🔄 Автопарсинг для чата {chat_id}...")
             posts = parse_max_group_media()
             new_count = 0
             skipped_count = 0
 
             if not posts:
-                print("📭 Новых сообщений не найдено")
+                pass
             else:
                 for post in posts:
-                    # ЕДИНСТВЕННОЕ место проверки на дубли (перед отправкой)
                     if not is_new_message(post):
-                        print(f"⏭️ Пропущено (уже отправлено): {post['name'][:25]}")
                         skipped_count += 1
                         continue
 
@@ -86,19 +78,15 @@ def parse_max_loop(chat_id):
                         if media_files:
                             first = media_files[0]
                             
-                            # Создаём файловый объект из байтов в памяти
                             file_obj = io.BytesIO(first['bytes'])
                             
                             if first['type'] == 'document':
                                 filename = first.get('filename', 'document.pdf')
                                 bot.send_document(chat_id, file_obj, caption=msg_text, visible_file_name=filename)
-                                print(f"✅ Отправлен документ из памяти: {filename}")
                                 
                             elif first['type'] == 'image':
                                 bot.send_photo(chat_id, file_obj, caption=msg_text)
-                                print(f"✅ Отправлено фото из памяти: {len(first['bytes']) // 1024}KB")
 
-                            # Отправка дополнительных файлов
                             for extra in media_files[1:]:
                                 extra_obj = io.BytesIO(extra['bytes'])
                                 if extra['type'] == 'document':
@@ -109,14 +97,12 @@ def parse_max_loop(chat_id):
                                 time.sleep(0.5)
                         else:
                             bot.send_message(chat_id, msg_text)
-                            print(f"✅ Отправлен текст: {post['name'][:25]}")
 
                         new_count += 1
                         time.sleep(1.5)
 
                     except Exception as e:
                         print(f"❌ Ошибка отправки: {e}")
-                # Итоговое сообщение о результатах цикла
                 if new_count > 0:
                     save_message_cache()
                     summary = f"✅ Отправлено: *{new_count}* новых"
@@ -124,16 +110,15 @@ def parse_max_loop(chat_id):
                         summary += f"\n⏭️ Пропущено: *{skipped_count}* (дубли)"
                     bot.send_message(chat_id, summary, reply_markup=comeback111())
                 elif skipped_count > 0:
-                    print(f"📭 Все {skipped_count} сообщений уже были отправлены ранее")
+                    pass
 
-            time.sleep(20) # Пауза 20 секунд между циклами парсинга
+            time.sleep(60) # Пауза 60 секунд между циклами парсинга
 
         except Exception as e:
             print(f"❌ Ошибка в цикле автопарсинга: {e}")
-            time.sleep(20)
+            time.sleep(60)
 
 
-# Загружаем кэш при старте бота
 load_message_cache()
 
 
@@ -166,8 +151,6 @@ def comeback111():
     return kb
 
 
-# ================= ОБРАБОТЧИКИ =================
-
 @bot.message_handler(commands=['start'])
 def start_bot(message):
     status = "🟢 Активен" if PARSING_ACTIVE else "🔴 Остановлен"
@@ -193,10 +176,9 @@ def parse_max_command(call):
     PARSING_ACTIVE = True
     CURRENT_CHAT_ID = chat_id
     bot.edit_message_text(
-        "▶️ *Автопарсинг ЗАПУЩЕН*\n⏳ Проверка каждые *20 сек*\\.",
+        "▶️ *Автопарсинг ЗАПУЩЕН*\n⏳ Проверка каждые *60 сек*\\.",
         chat_id, call.message.message_id, reply_markup=comeback()
     )
-    print(f"🚀 Автопарсинг запущен для чата {chat_id}")
     
     PARSING_THREAD = threading.Thread(target=parse_max_loop, args=(chat_id,), daemon=True)
     PARSING_THREAD.start()
@@ -266,7 +248,7 @@ def info(call):
         "ℹ️ *О боте Max\\_Parser*\n\n"
         "Этот бот разработан для автоматической пересылки сообщений, фотографий и документов из платформы Max прямо в этот Telegram\\-чат\\.\n\n"
         "⚙️ *Как это работает:*\n"
-        "• Бот работает в фоновом режиме, проверяя чат каждые 20 секунд\\.\n"
+        "• Бот работает в фоновом режиме, проверяя чат каждые 60 секунд\\.\n"
         "• Управление \\(запуск, остановка, очистка\\) доступно **только администратору**\\.\n"
         "• Обычные пользователи могут просматривать только эту справку\\.\n\n"
         "Приятного использования\! 🚀"
