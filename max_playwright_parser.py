@@ -6,14 +6,19 @@ import json
 import hashlib
 import shutil
 import io
+import subprocess
+import base64
+import sys
+import subprocess
+import base64
 from typing import List, Dict
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
 
-try:
-    from configuration import MAX_GROUP_URL, MAX_PHONE
-except ImportError:
-    MAX_GROUP_URL = "https://web.max.ru"
-    MAX_PHONE = "+79990000000"
+
+load_dotenv()
+MAX_GROUP_URL = os.getenv("MAX_GROUP_URL")
+MAX_PHONE = os.getenv("MAX_PHONE")
 
 SESSION_DIR = "chrome_max_session_permanent"
 SEEN_MESSAGES_FILE = "seen_messages.json"
@@ -38,11 +43,10 @@ def load_message_cache():
         try:
             with open(SEEN_MESSAGES_FILE, "r", encoding="utf-8") as f:
                 message_cache = set(json.load(f).get('message_hashes', []))
-            print(f"✅ Кэш сообщений: {len(message_cache)}")
         except Exception:
             message_cache = set()
     else:
-        print("ℹ️ Файл seen_messages.json не найден — кэш пуст")
+        pass
 
 
 def save_message_cache():
@@ -60,11 +64,10 @@ def load_photo_cache():
         try:
             with open(PHOTO_CACHE_FILE, "r", encoding="utf-8") as f:
                 photo_cache = set(json.load(f).get('photo_hashes', []))
-            print(f"✅ Кэш медиа: {len(photo_cache)}")
         except Exception:
             photo_cache = set()
     else:
-        print("ℹ️ Файл seen_images.json не найден — кэш пуст")
+        pass
 
 
 def save_photo_cache():
@@ -133,8 +136,6 @@ def clear_all_caches():
         shutil.rmtree("downloads")
     os.makedirs("downloads", exist_ok=True)
 
-    print("✅ Кэш сообщений и фото очищен (сессия сохранена)")
-
 
 def get_media_bytes(url: str, media_type: str = 'image') -> dict:
     """Скачивает медиа в оперативную память (возвращает байты), не сохраняя на диск"""
@@ -149,10 +150,8 @@ def get_media_bytes(url: str, media_type: str = 'image') -> dict:
             
             # Фильтр аватарок только для картинок
             if media_type == 'image' and len(data) < 5000:
-                print(f"🚫 Файл слишком маленький ({len(data)} байт) — это аватарка")
                 return None
             
-            print(f"📥 ЗАГРУЖЕНО В ПАМЯТЬ ({media_type}): {len(data) // 1024}KB")
             return {'bytes': data, 'type': media_type}
     except Exception as e:
         print(f"❌ Ошибка скачивания {media_type}: {e}")
@@ -182,32 +181,30 @@ def get_or_init_browser():
         print("🚀 Инициализация браузера...")
         _playwright_instance = sync_playwright().start()
         _browser_context = _playwright_instance.chromium.launch_persistent_context(
-            user_data_dir=SESSION_DIR,
-            headless=False,
-            viewport={'width': 1280, 'height': 800},
-            args=[
-                '--no-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-application-cache',
-                '--disable-offline-load-stale-cache',
-                '--disk-cache-size=10485760',        # Лимит кэша: 10 МБ
-                '--media-cache-size=10485760',
-                '--disable-gpu-compositing',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--no-first-run',
-            ],
-            slow_mo=30
+        user_data_dir=SESSION_DIR,
+        headless=False,
+        viewport={'width': 1280, 'height': 800},
+        args=[
+        '--no-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-application-cache',
+        '--disable-offline-load-stale-cache',
+        '--disk-cache-size=10485760',        # Лимит кэша: 10 МБ
+        '--media-cache-size=10485760',
+        '--disable-gpu-compositing',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--no-first-run',
+        ],
+        slow_mo=30
         )
         _page = _browser_context.pages[0] if _browser_context.pages else _browser_context.new_page()
     return _browser_context, _page
 
-
 def parse_max_group_media() -> List[Dict]:
-    print("🔥 НАЧАЛО ПАРСИНГА...")
     load_message_cache()
     load_photo_cache()
 
@@ -226,7 +223,6 @@ def parse_max_group_media() -> List[Dict]:
         page.goto(MAX_GROUP_URL, timeout=60000)
         page.wait_for_timeout(5000)
 
-        print("📜 Скролл к последним сообщениям (ВНИЗ)...")
         for _ in range(30):
             page.keyboard.press("End")
             page.wait_for_timeout(200)
@@ -370,7 +366,6 @@ def parse_max_group_media() -> List[Dict]:
             }
         """)
 
-        print(f"📊 JS извлёк {len(raw_messages)} сообщений")
 
         # --- Фильтрация и удаление дубликатов ---
         seen_texts = set()
@@ -384,11 +379,8 @@ def parse_max_group_media() -> List[Dict]:
             seen_texts.add(text_key)
             unique.append(msg)
 
-        print(f"📊 После фильтрации: {len(unique)} сообщений")
-
         # --- БЕРЁМ ПОСЛЕДНИЕ 10 (DOM-порядок = хронологический) ---
         last_10 = unique[-10:]
-        print(f"📤 Последние {len(last_10)} сообщений (СТАРЫЕ → НОВЫЕ)")
 
         # --- Скачиваем медиа В ПАМЯТЬ и формируем результат ---
         human_posts = []
@@ -425,11 +417,9 @@ def parse_max_group_media() -> List[Dict]:
 
             if media_files:
                 types_str = ", ".join([m['type'] for m in media_files])
-                print(f"  📎 {msg['name'][:25]} — {len(media_files)} файл(ов) [{types_str}]")
             else:
-                print(f"  💬 {msg['name'][:25]}")
+                pass
 
-        print(f"🎉 ИТОГ: {len(human_posts)} постов передано в бот")
         return human_posts
 
     except Exception as e:

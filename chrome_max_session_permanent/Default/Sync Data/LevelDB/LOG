@@ -1,3 +1,2 @@
-2026/09/03-20:28:44.583 97ae9b Reusing MANIFEST /Users/KingAMR35/Desktop/TG_BOTS/MAX_parser/chrome_max_session_permanent/Default/Sync Data/LevelDB/MANIFEST-000001
-2026/09/03-20:28:44.594 97ae9b Recovering log #3
-2026/09/03-20:28:44.594 97ae9b Reusing old log /Users/KingAMR35/Desktop/TG_BOTS/MAX_parser/chrome_max_session_permanent/Default/Sync Data/LevelDB/000003.log 
+2026/09/04-17:57:33.628 b7a672 Creating DB /Users/KingAMR35/Desktop/TG_BOTS/MAX_parser/chrome_max_session_permanent/Default/Sync Data/LevelDB since it was missing.
+2026/09/04-17:57:33.648 b7a672 Reusing MANIFEST /Users/KingAMR35/Desktop/TG_BOTS/MAX_parser/chrome_max_session_permanent/Default/Sync Data/LevelDB/MANIFEST-000001

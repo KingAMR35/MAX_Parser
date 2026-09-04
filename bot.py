@@ -5,6 +5,7 @@ import io
 import re
 import threading
 from telebot import types
+from dotenv import load_dotenv
 
 from max_playwright_parser import (
     parse_max_group_media,
@@ -14,21 +15,19 @@ from max_playwright_parser import (
     clear_all_caches
 )
 
-try:
-    from configuration import BOT_TOKEN
-except ImportError:
-    BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+load_dotenv()
+
+
 
 print("🚀 MAX Parser Bot запущен")
 # Включаем MarkdownV2 глобально для красивого форматирования
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode='MarkdownV2')
+bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='MarkdownV2')
 
-ADMIN_ID = 5213315899
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 PARSING_ACTIVE = False
 PARSING_THREAD = None
 CURRENT_CHAT_ID = None
-
 
 def escape_md(text: str) -> str:
     """Экранирует спецсимволы для Telegram MarkdownV2"""
@@ -61,7 +60,6 @@ def format_message(post: dict) -> str:
 
     return result
 
-
 def parse_max_loop(chat_id):
     """Основной цикл автопарсинга"""
     global PARSING_ACTIVE
@@ -84,7 +82,6 @@ def parse_max_loop(chat_id):
 
                     media_files = post.get('media_files', [])
                     msg_text = format_message(post)
-
                     try:
                         if media_files:
                             first = media_files[0]
@@ -119,7 +116,6 @@ def parse_max_loop(chat_id):
 
                     except Exception as e:
                         print(f"❌ Ошибка отправки: {e}")
-
                 # Итоговое сообщение о результатах цикла
                 if new_count > 0:
                     save_message_cache()
@@ -140,8 +136,6 @@ def parse_max_loop(chat_id):
 # Загружаем кэш при старте бота
 load_message_cache()
 
-
-# ================= КЛАВИАТУРЫ =================
 
 def menu_button():
     global PARSING_ACTIVE
@@ -180,13 +174,12 @@ def start_bot(message):
     text = f"🚀 *MAX\\_Parser готов\\!*\nСтатус: {status}\n\nВыберите действие:"
     bot.send_message(message.chat.id, text, reply_markup=menu_button())
 
-
 @bot.callback_query_handler(func=lambda call: call.data == 'button')
 def parse_max_command(call):
     global PARSING_ACTIVE, PARSING_THREAD, CURRENT_CHAT_ID
     chat_id = call.message.chat.id
 
-    if call.from_user.id != ADMIN_ID:
+    if call.from_user.id != int(ADMIN_ID):
         bot.answer_callback_query(call.id, "Только для админа 🤓", show_alert=True)
         return
 
@@ -208,7 +201,6 @@ def parse_max_command(call):
     PARSING_THREAD = threading.Thread(target=parse_max_loop, args=(chat_id,), daemon=True)
     PARSING_THREAD.start()
 
-
 @bot.callback_query_handler(func=lambda call: call.data == 'button01')
 def back_to_menu(call):
     status = "🟢 Активен" if PARSING_ACTIVE else "🔴 Остановлен"
@@ -223,7 +215,7 @@ def delete_msg(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == 'button3')
 def test(call):
-    if call.from_user.id != ADMIN_ID:
+    if call.from_user.id != int(ADMIN_ID):
         bot.answer_callback_query(call.id, "Только для админа 🤓", show_alert=True)
         return
     bot.edit_message_text("✅ *БОТ РАБОТАЕТ ШТАТНО\\!*", call.message.chat.id, call.message.message_id, reply_markup=comeback())
@@ -231,17 +223,16 @@ def test(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == 'button1')
 def clear_cache(call):
-    if call.from_user.id != ADMIN_ID:
+    if call.from_user.id != int(ADMIN_ID):
         bot.answer_callback_query(call.id, "Только для админа 🤓", show_alert=True)
         return
     
     clear_all_caches()
     bot.edit_message_text("🗑 *Кэш очищен\\!*", call.message.chat.id, call.message.message_id, reply_markup=comeback())
 
-
 @bot.callback_query_handler(func=lambda call: call.data == 'button2')
 def status(call):
-    if call.from_user.id != ADMIN_ID:
+    if call.from_user.id != int(ADMIN_ID):
         bot.answer_callback_query(call.id, "Только для админа 🤓", show_alert=True)
         return
     
@@ -268,7 +259,6 @@ def updates(call):
         reply_markup=comeback(),
         parse_mode='MarkdownV2'
     )
-
 
 @bot.callback_query_handler(func=lambda call: call.data == 'button5')
 def info(call):
