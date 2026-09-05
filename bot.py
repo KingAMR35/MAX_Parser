@@ -199,9 +199,35 @@ def process_single_chat(chat):
                 skipped_count += 1
                 continue
 
+            media_files = post.get('media_files', [])
             msg_text = format_message(post)
+            
             try:
-                bot.send_message(chat_id, msg_text, **NO_PREVIEW)
+                if media_files:
+                    first = media_files[0]
+                    file_obj = io.BytesIO(first['bytes'])
+                    if first['type'] == 'document':
+                        filename = first.get('filename', 'document.pdf')
+                        bot.send_document(chat_id, file_obj, caption=msg_text, visible_file_name=filename)
+                    elif first['type'] == 'image':
+                        bot.send_photo(chat_id, file_obj, caption=msg_text)
+                    
+                    for extra in media_files[1:]:
+                        extra_obj = io.BytesIO(extra['bytes'])
+                        if extra['type'] == 'document':
+                            filename = extra.get('filename', 'document.pdf')
+                            bot.send_document(chat_id, extra_obj, visible_file_name=filename)
+                        else:
+                            bot.send_photo(chat_id, extra_obj)
+                        time.sleep(0.5)
+                else:
+                    try:
+                        bot.send_message(chat_id, msg_text, **NO_PREVIEW)
+                    except Exception as md_error:
+                        print(f"⚠️ Ошибка HTML: {md_error}")
+                        plain_text = f"👤 {post.get('name', '')}\n\n{post.get('text', '')}\n\n🕐 {post.get('time', '')}"
+                        bot.send_message(chat_id, plain_text, **NO_PREVIEW)
+
                 person_name = post.get('name', 'Аноним')
                 person_role = ''
                 if '│' in person_name:
@@ -209,14 +235,17 @@ def process_single_chat(chat):
                     person_name = parts[0].strip().replace('👤', '').replace('<b>', '').replace('</b>', '')
                     if len(parts) > 1:
                         person_role = parts[1].strip().replace('<i>', '').replace('</i>', '')
+                
                 save_message(chat_id, person_name, person_role, post.get('text', ''), post.get('time', ''))
                 new_count += 1
                 time.sleep(1.5)
+                
             except Exception as e:
                 print(f"❌ Ошибка отправки в чат {title}: {e}")
 
         if new_count > 0:
             save_message_cache()
+            save_photo_cache() # Добавлено сохранение кэша фото
             
             summary_text = (
                 f"✅ <b>Парсинг завершён для: {title}</b>\n\n"
@@ -369,6 +398,16 @@ def format_message(post: dict) -> str:
     raw_name = post.get('name', '').strip()
     raw_text = post.get('text', '').strip()
     raw_time = post.get('time', '').strip()
+
+    # Очистка имени от мусора (переносы строк, время), который мог попасть туда из-за верстки MAX
+    if raw_name:
+        # Убираем время из конца имени, если оно туда случайно попало
+        raw_name = re.sub(r'\s*\d{1,2}:\d{2}\s*(AM|PM|am|pm)?\s*$', '', raw_name, flags=re.IGNORECASE).strip()
+        # Убираем переносы строк из имени (имя должно быть в одну строку)
+        raw_name = raw_name.replace('\n', ' ').replace('\r', '').strip()
+        # Если имя после очистки совпадает с текстом, пустое или "Аноним", считаем его отсутствующим
+        if not raw_name or raw_name == raw_text or raw_name == 'Аноним':
+            raw_name = 'Аноним'
 
     if not raw_name or raw_name == 'Аноним':
         fwd_match = re.match(r'^Переслано:\s*([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)\s+(.+)$', raw_text, re.DOTALL)

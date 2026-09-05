@@ -463,25 +463,68 @@ def get_media_bytes(url: str, media_type: str = 'image', chat_id: int = 0) -> di
         return None
         
     if not is_new_media(url, chat_id=chat_id):
+        print(f"⏭️ Пропуск медиа (уже в кэше): {url[:50]}...")
         return None
 
+    print(f"📥 Попытка скачать {media_type}: {url[:60]}...")
+    
     try:
+        # === ОБРАБОТКА data: URL (base64) ===
+        if url.startswith('data:'):
+            print(f"   🔄 Обнаружен data: URL, декодирую base64...")
+            try:
+                # Формат: data:image/png;base64,iVBORw0KGgo...
+                if ',' in url:
+                    base64_data = url.split(',', 1)[1]
+                    import base64
+                    data = base64.b64decode(base64_data)
+                    
+                    # Фильтр: игнорируем слишком маленькие изображения (1x1 пиксель, placeholder)
+                    if media_type == 'image' and len(data) < 500:
+                        print(f"   ⛔ Файл слишком мал ({len(data)} байт), вероятно это placeholder")
+                        return None
+                    
+                    print(f"   ✅ Успешно декодировано base64: {len(data)} байт")
+                    return {'bytes': data, 'type': media_type}
+                else:
+                    print(f"   ❌ Неверный формат data: URL")
+                    return None
+            except Exception as e:
+                print(f"   ❌ Ошибка декодирования base64: {e}")
+                return None
+        
+        # === ОБРАБОТКА обычных HTTP/HTTPS URL ===
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         resp = requests.get(url, timeout=30, headers=headers)
         if resp.status_code == 200:
             data = resp.content
             if media_type == 'image' and len(data) < 5000:
+                print(f"   ⛔ Файл слишком мал ({len(data)} байт), вероятно это иконка")
                 return None
+            print(f"   ✅ Успешно скачано: {len(data)} байт")
             return {'bytes': data, 'type': media_type}
+        else:
+            print(f"   ❌ Ошибка HTTP: статус {resp.status_code}")
     except Exception as e:
         print(f"❌ Ошибка скачивания {media_type}: {e}")
     return None
 
 
-def is_human_message(text: str) -> bool:
-    text = text.strip().lower()
-    if not text:
+def is_human_message(msg: dict) -> bool:
+    text = msg.get('text', '').strip().lower()
+    has_media = len(msg.get('images', [])) > 0 or len(msg.get('documents', [])) > 0
+    
+    print(f"🔍 Проверка сообщения: текст='{text[:30]}...', длина={len(text)}, есть_медиа={has_media}")
+    
+    if not text and not has_media:
+        print("   ⛔ Отклонено: нет ни текста, ни медиа")
         return False
+    
+    # Пустой текст но есть медиа = фото без подписи, пропускаем!
+    if not text and has_media:
+        print("   ✅ Пропущено: фото без текста")
+        return True
+        
     bot_phrases = [
         'теперь в max', 'now on max', 'напишите что-нибудь', 'write something', 'сферум',
         'удалил', 'удалила', 'изменил', 'изменила',
@@ -492,8 +535,17 @@ def is_human_message(text: str) -> bool:
         'скачать видео', 'ютуб', 'тикток', 'подарок', 'исчезнет'
     ]
     if any(phrase in text for phrase in bot_phrases):
+        print(f"   ⛔ Отклонено: содержит фразу бота '{[p for p in bot_phrases if p in text][0]}'")
         return False
-    return 10 < len(text) < 2000
+        
+    # Если есть медиа, разрешаем более короткий текст (даже 0 символов)
+    if has_media:
+        print("   ✅ Пропущено: есть медиафайлы")
+        return len(text) < 2000
+    
+    result = 5 < len(text) < 2000 # Снизил минимальный порог с 10 до 5
+    print(f"   {'✅ Пропущено' if result else '⛔ Отклонено'}: длина текста {len(text)}")
+    return result
 
 def get_parse_debug_screenshot(chat_id: int) -> str:
     """Возвращает путь к диагностическому скриншоту последней ошибки парсинга"""
@@ -581,14 +633,37 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
             pw.stop()
             raise Exception(f"EMPTY_PAGE|{debug_path}")
 
+        # === ДОЖИДАЕМСЯ ЗАГРУЗКИ ИЗОБРАЖЕНИЙ ===
+        print(f"[{chat_id}] Ожидание загрузки изображений...")
         for i in range(30):
             page.keyboard.press("End")
             page.wait_for_timeout(200)
-        page.wait_for_timeout(3000)
+        
+        # Ждем появления реальных изображений (не data: URL)
+        try:
+            page.wait_for_function(
+                """() => {
+                    const imgs = document.querySelectorAll('img');
+                    for (const img of imgs) {
+                        const src = img.src || '';
+                        if (src.startsWith('http') && !src.includes('avatar') && !src.includes('icon')) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                timeout=5000
+            )
+            print(f"[{chat_id}] ✅ Реальные изображения загружены")
+        except:
+            print(f"[{chat_id}] ⚠️ Таймаут ожидания изображений (продолжаем без них)")
+        
+        page.wait_for_timeout(2000)  # Дополнительная пауза для полной загрузки
 
         raw_messages = page.evaluate(r"""() => {
             const results = [];
             const containers = new Set();
+            const allFoundImageUrls = new Set();
             
             const selectors = [
                 '[class*="message"]', '[class*="Message"]',
@@ -600,7 +675,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 try {
                     const elements = document.querySelectorAll(sel);
                     elements.forEach(el => {
-                        if (el.innerText && el.innerText.trim().length > 10) {
+                        if (el.innerText && el.innerText.trim().length > 2) {
                             containers.add(el);
                         }
                     });
@@ -614,7 +689,42 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 return 0;
             });
             
-            console.log('[MAX Parser] Найдено ' + sorted.length + ' контейнеров');
+            function isSignificantImg(img) {
+                const src = img.src || (img.dataset ? img.dataset.src : '') || '';
+                // === ИГНОРИРУЕМ data: URL (это placeholder-ы) ===
+                if (src.startsWith('data:')) return '';
+                if (src.length < 50) return '';
+                const s = src.toLowerCase();
+                if (s.includes('avatar') || s.includes('userpic') || 
+                    s.includes('profile') || s.includes('icon') ||
+                    s.includes('emoji') || s.includes('sticker') ||
+                    s.includes('spacer') || s.includes('blank')) return '';
+                if (s.includes('.jpg') || s.includes('.jpeg') || 
+                    s.includes('.png') || s.includes('.webp') || 
+                    s.includes('photo') || s.includes('image') ||
+                    s.includes('cdn') || s.includes('attachment') ||
+                    s.includes('media') || s.includes('file')) return src;
+                if (img.naturalWidth >= 100 && img.naturalHeight >= 100) return src;
+                const rect = img.getBoundingClientRect();
+                if (rect.width >= 50 && rect.height >= 50) return src;
+                return '';
+            }
+            
+            function getBgImageUrl(el) {
+                try {
+                    const bg = window.getComputedStyle(el).backgroundImage;
+                    if (bg && bg !== 'none') {
+                        const m = bg.match(/url\(["']?(.*?)["']?\)/);
+                        if (m && m[1].length > 50 && !m[1].startsWith('data:')) {
+                            const s = m[1].toLowerCase();
+                            if (!s.includes('avatar') && !s.includes('icon') && !s.includes('emoji')) {
+                                return m[1];
+                            }
+                        }
+                    }
+                } catch(e) {}
+                return '';
+            }
             
             sorted.forEach((container, idx) => {
                 if (container.closest('.sidebar, .chat-list, .ChatList, .SuggestedChats, .suggested, .LeftPanel')) {
@@ -622,7 +732,30 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 }
 
                 const fullText = container.innerText.trim();
-                if (fullText.length < 10 || fullText.length > 2000) return;
+                
+                const imgs = container.querySelectorAll('img');
+                let hasSignificantImage = false;
+                
+                imgs.forEach(img => {
+                    const src = isSignificantImg(img);
+                    if (src) {
+                        hasSignificantImage = true;
+                        allFoundImageUrls.add(src);
+                    }
+                });
+                
+                if (!hasSignificantImage) {
+                    const divs = container.querySelectorAll('div, span, a, picture');
+                    divs.forEach(d => {
+                        const bgUrl = getBgImageUrl(d);
+                        if (bgUrl) {
+                            hasSignificantImage = true;
+                            allFoundImageUrls.add(bgUrl);
+                        }
+                    });
+                }
+
+                if (!hasSignificantImage && (fullText.length < 5 || fullText.length > 2000)) return;
                 
                 let name = '';
                 let role = '';
@@ -649,21 +782,15 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     }
                 }
                 
-                // === ОЧИСТКА ТЕКСТА ===
-                
-                // 1. Убираем служебные слова времени в начале
                 cleanText = cleanText.replace(/^(Today|Yesterday|Сегодня|Вчера)\s+/i, '').trim();
                 cleanText = cleanText.replace(/^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\s+/i, '').trim();
                 cleanText = cleanText.replace(/^\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\s+/i, '').trim();
                 cleanText = cleanText.replace(/^(Январь|Февраль|Март|Апрель|Май|Июнь|Июль|Август|Сентябрь|Октябрь|Ноябрь|Декабрь)\s+\d{1,2},?\s+\d{4}\s+/i, '').trim();
                 cleanText = cleanText.replace(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2},?\s+\d{4}\s+/i, '').trim();
-
-                // 2. Убираем эмодзи 👤
                 cleanText = cleanText.replace(/\u{1F464}/gu, '').trim();
                 
-                // 3. Убираем имя и роль из начала текста
                 if (name) {
-                    const escapeRegExp = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&');
+                    const escapeRegExp = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                     const nameEsc = escapeRegExp(name.trim());
                     const roleEsc = role ? escapeRegExp(role.trim()) : '';
                     
@@ -678,10 +805,8 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     }
                 }
                 
-                // 4. Нормализуем пробелы
                 cleanText = cleanText.replace(/\s+/g, ' ').trim();
                 
-                // 5. Извлекаем время с конца (поддержка AM/PM)
                 let msgTime = '';
                 const timeMatch = cleanText.match(/(\d{1,2}:\d{2})\s*(AM|PM|am|pm)?\s*$/i);
                 if (timeMatch) {
@@ -689,23 +814,20 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     cleanText = cleanText.substring(0, cleanText.length - msgTime.length).trim();
                 }
                 
-                // === ИЗОБРАЖЕНИЯ ===
                 const images = [];
-                const imgs = container.querySelectorAll('img');
                 imgs.forEach(img => {
-                    const src = img.src || (img.dataset ? img.dataset.src : '') || '';
-                    if (src.length < 50) return;
-                    const srcLower = src.toLowerCase();
-                    if (srcLower.includes('avatar') || srcLower.includes('userpic') || 
-                        srcLower.includes('profile') || srcLower.includes('icon') ||
-                        srcLower.includes('emoji') || srcLower.includes('sticker')) return;
-                    
-                    const rect = img.getBoundingClientRect();
-                    if (rect.width < 100 || rect.height < 100) return;
-                    images.push(src);
+                    const src = isSignificantImg(img);
+                    if (src) images.push(src);
                 });
                 
-                // === ДОКУМЕНТЫ ===
+                const divs = container.querySelectorAll('div, span, a, picture');
+                divs.forEach(d => {
+                    const bgUrl = getBgImageUrl(d);
+                    if (bgUrl && !images.includes(bgUrl)) {
+                        images.push(bgUrl);
+                    }
+                });
+                
                 const documents = [];
                 const links = container.querySelectorAll('a');
                 links.forEach(a => {
@@ -742,13 +864,40 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 });
             });
             
+            const allPageImgs = document.querySelectorAll('img');
+            allPageImgs.forEach(img => {
+                const src = isSignificantImg(img);
+                if (src && !allFoundImageUrls.has(src)) {
+                    let parentMsg = img.closest('[class*="message"], [class*="Message"], [class*="bubble"], [class*="Bubble"], article');
+                    let pName = 'Аноним';
+                    let pTime = '';
+                    
+                    if (parentMsg) {
+                        const nEl = parentMsg.querySelector('[class*="name"], [class*="author"], [class*="sender"]');
+                        if (nEl) pName = nEl.innerText.trim();
+                        const tMatch = parentMsg.innerText.match(/(\d{1,2}:\d{2})\s*(AM|PM|am|pm)?/i);
+                        if (tMatch) pTime = tMatch[0].trim();
+                    }
+                    
+                    results.push({
+                        idx: results.length,
+                        name: pName,
+                        text: '',
+                        time: pTime,
+                        images: [src],
+                        documents: []
+                    });
+                    allFoundImageUrls.add(src);
+                }
+            });
+            
             return results;
         }""")
 
         seen_hashes = set()
         unique = []
         for msg in raw_messages:
-            if not is_human_message(msg['text']):
+            if not is_human_message(msg):
                 continue
 
             clean_text = normalize_for_hash(msg.get('text', ''))
