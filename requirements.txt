@@ -2,3 +2,4 @@ pyTelegramBotAPI==4.14.0
 playwright==1.44.0
 requests==2.31.0
 python-dotenv==1.0.0
+#bot.answer_callback_query(call.id, "Только для админа 🤓", show_alert=True)
