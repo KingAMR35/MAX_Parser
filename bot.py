@@ -245,7 +245,7 @@ def process_single_chat(chat):
 
         if new_count > 0:
             save_message_cache()
-            save_photo_cache() # Добавлено сохранение кэша фото
+            save_photo_cache()
             
             summary_text = (
                 f"✅ <b>Парсинг завершён для: {title}</b>\n\n"
@@ -256,7 +256,6 @@ def process_single_chat(chat):
             
             try:
                 bot.send_message(chat_id, summary_text, parse_mode='HTML', reply_markup=del_kb, **NO_PREVIEW)
-                print(f"✅ Отчёт мгновенно отправлен в чат '{title}' ({new_count} новых)")
             except Exception as e:
                 print(f"❌ Не удалось отправить отчёт в чат {title}: {e}")
                 
@@ -399,13 +398,9 @@ def format_message(post: dict) -> str:
     raw_text = post.get('text', '').strip()
     raw_time = post.get('time', '').strip()
 
-    # Очистка имени от мусора (переносы строк, время), который мог попасть туда из-за верстки MAX
     if raw_name:
-        # Убираем время из конца имени, если оно туда случайно попало
         raw_name = re.sub(r'\s*\d{1,2}:\d{2}\s*(AM|PM|am|pm)?\s*$', '', raw_name, flags=re.IGNORECASE).strip()
-        # Убираем переносы строк из имени (имя должно быть в одну строку)
         raw_name = raw_name.replace('\n', ' ').replace('\r', '').strip()
-        # Если имя после очистки совпадает с текстом, пустое или "Аноним", считаем его отсутствующим
         if not raw_name or raw_name == raw_text or raw_name == 'Аноним':
             raw_name = 'Аноним'
 

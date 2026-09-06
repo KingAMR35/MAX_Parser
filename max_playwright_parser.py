@@ -463,28 +463,19 @@ def get_media_bytes(url: str, media_type: str = 'image', chat_id: int = 0) -> di
         return None
         
     if not is_new_media(url, chat_id=chat_id):
-        print(f"⏭️ Пропуск медиа (уже в кэше): {url[:50]}...")
         return None
-
-    print(f"📥 Попытка скачать {media_type}: {url[:60]}...")
     
     try:
-        # === ОБРАБОТКА data: URL (base64) ===
         if url.startswith('data:'):
-            print(f"   🔄 Обнаружен data: URL, декодирую base64...")
             try:
-                # Формат: data:image/png;base64,iVBORw0KGgo...
                 if ',' in url:
                     base64_data = url.split(',', 1)[1]
                     import base64
                     data = base64.b64decode(base64_data)
                     
-                    # Фильтр: игнорируем слишком маленькие изображения (1x1 пиксель, placeholder)
                     if media_type == 'image' and len(data) < 500:
-                        print(f"   ⛔ Файл слишком мал ({len(data)} байт), вероятно это placeholder")
                         return None
                     
-                    print(f"   ✅ Успешно декодировано base64: {len(data)} байт")
                     return {'bytes': data, 'type': media_type}
                 else:
                     print(f"   ❌ Неверный формат data: URL")
@@ -493,15 +484,12 @@ def get_media_bytes(url: str, media_type: str = 'image', chat_id: int = 0) -> di
                 print(f"   ❌ Ошибка декодирования base64: {e}")
                 return None
         
-        # === ОБРАБОТКА обычных HTTP/HTTPS URL ===
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         resp = requests.get(url, timeout=30, headers=headers)
         if resp.status_code == 200:
             data = resp.content
             if media_type == 'image' and len(data) < 5000:
-                print(f"   ⛔ Файл слишком мал ({len(data)} байт), вероятно это иконка")
                 return None
-            print(f"   ✅ Успешно скачано: {len(data)} байт")
             return {'bytes': data, 'type': media_type}
         else:
             print(f"   ❌ Ошибка HTTP: статус {resp.status_code}")
@@ -514,15 +502,11 @@ def is_human_message(msg: dict) -> bool:
     text = msg.get('text', '').strip().lower()
     has_media = len(msg.get('images', [])) > 0 or len(msg.get('documents', [])) > 0
     
-    print(f"🔍 Проверка сообщения: текст='{text[:30]}...', длина={len(text)}, есть_медиа={has_media}")
     
     if not text and not has_media:
-        print("   ⛔ Отклонено: нет ни текста, ни медиа")
         return False
     
-    # Пустой текст но есть медиа = фото без подписи, пропускаем!
     if not text and has_media:
-        print("   ✅ Пропущено: фото без текста")
         return True
         
     bot_phrases = [
@@ -535,16 +519,12 @@ def is_human_message(msg: dict) -> bool:
         'скачать видео', 'ютуб', 'тикток', 'подарок', 'исчезнет'
     ]
     if any(phrase in text for phrase in bot_phrases):
-        print(f"   ⛔ Отклонено: содержит фразу бота '{[p for p in bot_phrases if p in text][0]}'")
         return False
         
-    # Если есть медиа, разрешаем более короткий текст (даже 0 символов)
     if has_media:
-        print("   ✅ Пропущено: есть медиафайлы")
         return len(text) < 2000
     
-    result = 5 < len(text) < 2000 # Снизил минимальный порог с 10 до 5
-    print(f"   {'✅ Пропущено' if result else '⛔ Отклонено'}: длина текста {len(text)}")
+    result = 5 < len(text) < 2000
     return result
 
 def get_parse_debug_screenshot(chat_id: int) -> str:
@@ -633,13 +613,11 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
             pw.stop()
             raise Exception(f"EMPTY_PAGE|{debug_path}")
 
-        # === ДОЖИДАЕМСЯ ЗАГРУЗКИ ИЗОБРАЖЕНИЙ ===
         print(f"[{chat_id}] Ожидание загрузки изображений...")
         for i in range(30):
             page.keyboard.press("End")
             page.wait_for_timeout(200)
         
-        # Ждем появления реальных изображений (не data: URL)
         try:
             page.wait_for_function(
                 """() => {
@@ -654,11 +632,10 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 }""",
                 timeout=5000
             )
-            print(f"[{chat_id}] ✅ Реальные изображения загружены")
         except:
             print(f"[{chat_id}] ⚠️ Таймаут ожидания изображений (продолжаем без них)")
         
-        page.wait_for_timeout(2000)  # Дополнительная пауза для полной загрузки
+        page.wait_for_timeout(2000)
 
         raw_messages = page.evaluate(r"""() => {
             const results = [];

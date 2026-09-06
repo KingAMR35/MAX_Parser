@@ -1,1 +1,6 @@
 .env
+sessions
+seen_images.json
+seen_messages.json
+downloades
+MAX_parser.db
