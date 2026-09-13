@@ -413,7 +413,7 @@ def format_message_time(raw_time: str) -> str:
     except ValueError:
         pass
     
-    return f"🗓 {date_str} | 🕐 {time_str}"
+    return f"<b><blockquote>🗓 {date_str} | 🕐 {time_str}</blockquote></b>"
 
 def format_message(post: dict) -> str:
     raw_name = post.get('name', '').strip()
