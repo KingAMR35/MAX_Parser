@@ -41,29 +41,25 @@ def init_db():
             max_url TEXT,
             phone TEXT,
             is_active INTEGER DEFAULT 0,
+            message_count INTEGER DEFAULT 0,
             added_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            sender_name TEXT,
-            sender_role TEXT,
-            text TEXT,
-            msg_time TEXT,
-            parsed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
-        )
-    """)
-
+    # Миграции для существующей БД
     try:
-        con.execute("ALTER TABLE chats ADD COLUMN phone TEXT")
-        conn.commit()
+        con.execute("ALTER TABLE chats ADD COLUMN message_count INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
 
+    try:
+        con.execute("ALTER TABLE chats ADD COLUMN phone TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # ВАЖНО: Удаляем старую таблицу messages, если она существует, чтобы освободить место на диске
+    con.execute("DROP TABLE IF EXISTS messages")
+    
     conn.commit()
     conn.close()
 
@@ -144,8 +140,8 @@ def get_user_count():
 def add_chat(chat_id: int, title: str, max_url: str = None, phone: str = None):
     conn = get_connection()
     conn.execute("""
-        INSERT OR IGNORE INTO chats (chat_id, title, max_url, phone, is_active)
-        VALUES (?, ?, ?, ?, 0)
+        INSERT OR IGNORE INTO chats (chat_id, title, max_url, phone, is_active, message_count)
+        VALUES (?, ?, ?, ?, 0, 0)
     """, (chat_id, title, max_url, phone))
     conn.commit()
     conn.close()
@@ -207,77 +203,45 @@ def toggle_chat(chat_id: int, active: bool):
 def delete_chat(chat_id: int):
     conn = get_connection()
     conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
-    conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+    # Удаление записей из messages больше не требуется
     conn.commit()
     conn.close()
 
 
-#! ============ СООБЩЕНИЯ ============
+#! ============ СЧЕТЧИКИ СООБЩЕНИЙ ============
 
-def save_message(chat_id: int, sender_name: str, sender_role: str, text: str, msg_time: str):
+def increment_message_count(chat_id: int):
+    """Увеличивает счетчик сообщений для чата на 1"""
     conn = get_connection()
-    conn.execute("""
-        INSERT INTO messages (chat_id, sender_name, sender_role, text, msg_time)
-        VALUES (?, ?, ?, ?, ?)
-    """, (chat_id, sender_name, sender_role, text, msg_time))
+    conn.execute("UPDATE chats SET message_count = message_count + 1 WHERE chat_id = ?", (chat_id,))
     conn.commit()
     conn.close()
-
-    trim_messages(chat_id, 100)
 
 
 def get_chat_stats(chat_id: int):
     conn = get_connection()
-    total = conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,)).fetchone()[0]
-    today = conn.execute("""
-        SELECT COUNT(*) FROM messages
-        WHERE chat_id = ? AND date(parsed_at) = date('now')
-    """, (chat_id,)).fetchone()[0]
+    row = conn.execute("SELECT message_count FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
-    return {"total": total, "today": today}
+    count = row['message_count'] if row else 0
+    # Возвращаем общее число и для "сегодня", так как детальное логирование по дням отключено для экономии места
+    return {"total": count, "today": count}
 
 
 def get_global_stats():
     conn = get_connection()
     total_chats = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
     active_chats = conn.execute("SELECT COUNT(*) FROM chats WHERE is_active = 1").fetchone()[0]
-    total_msgs = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    today_msgs = conn.execute("""
-        SELECT COUNT(*) FROM messages WHERE date(parsed_at) = date('now')
-    """).fetchone()[0]
+    
+    # Суммируем счетчики всех чатов
+    total_msgs_row = conn.execute("SELECT SUM(message_count) FROM chats").fetchone()
+    total_msgs = total_msgs_row[0] if total_msgs_row[0] is not None else 0
+    
     conn.close()
     return {
         "total_chats": total_chats,
         "active_chats": active_chats,
         "total_msgs": total_msgs,
-        "today_msgs": today_msgs
+        "today_msgs": total_msgs
     }
-
-def trim_messages(chat_id: int, max_count: int = 100):
-    """Оставляет только последние max_count сообщений для чата"""
-    conn = get_connection()
-    conn.execute("""
-        DELETE FROM messages 
-        WHERE chat_id = ? AND id NOT IN (
-            SELECT id FROM messages 
-            WHERE chat_id = ? 
-            ORDER BY parsed_at DESC 
-            LIMIT ?
-        )
-    """, (chat_id, chat_id, max_count))
-    conn.commit()
-    conn.close()
-
-def get_recent_messages(chat_id: int, limit: int = 10):
-    """Возвращает последние сообщения для чата"""
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT * FROM messages 
-        WHERE chat_id = ? 
-        ORDER BY parsed_at DESC 
-        LIMIT ?
-    """, (chat_id, limit)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 init_db()

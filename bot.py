@@ -156,17 +156,9 @@ def _process_posts(chat_id: int, title: str, posts: list, send_summary: bool = F
         try:
             _send_post(chat_id, post)
             _commit_successful_post(chat_id, post)
-            person_name = post.get("name", "Аноним")
-            person_role = ""
-            if "│" in person_name:
-                person_name, person_role = [part.strip() for part in person_name.split("│", 1)]
-            save_message(
-                chat_id,
-                person_name.replace("👤", "").replace("<b>", "").replace("</b>", "").strip(),
-                person_role.replace("<i>", "").replace("</i>", "").strip(),
-                post.get("text", ""),
-                post.get("time", ""),
-            )
+            
+            increment_message_count(chat_id)
+            
             new_count += 1
             time.sleep(1.5)
         except Exception as error:
@@ -679,30 +671,15 @@ def show_chat_statistics(chat_id, message_id, target_chat_id):
         
     stats = get_chat_stats(target_chat_id)
     cache_count = get_chat_cache_count(target_chat_id)
-    recent_msgs = get_recent_messages(target_chat_id, 10)
     
     text = (
         f"📊 <b>Статистика: {chat['title']}</b>\n\n"
         f"<blockquote>"
-        f"💬 <b>Отправлено сегодня:</b> {stats['today']}\n"
-        f"📦 <b>Всего отправлено:</b> {stats['total']}\n"
+        f"💬 <b>Отправлено всего:</b> {stats['total']}\n"
         f"🗃️ <b>В кэше (защита от дублей):</b> {cache_count} сообщений"
         f"</blockquote>\n\n"
+        f"<i>Детальный список последних сообщений отключен для экономии места в БД и ускорения работы парсера.</i>"
     )
-    
-    if recent_msgs:
-        text += "🕐 <b>Последние сообщения:</b>\n\n"
-        for msg in recent_msgs:
-            name = msg['sender_name'] or 'Аноним'
-            role = msg.get('sender_role', '')
-            time_str = msg.get('msg_time', '')
-            msg_text = (msg['text'] or '')[:60]
-            if role:
-                name = f"{name} │ {role}"
-            text += f"👤 <b>{name}</b>\n"
-            text += f"   {msg_text}...\n"
-            if time_str:
-                text += f"    {time_str}\n\n"
                 
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("🔙 Назад к настройкам чата", callback_data=f"admin_chat_{target_chat_id}"))
