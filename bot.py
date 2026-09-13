@@ -396,22 +396,24 @@ def format_message_time(raw_time: str) -> str:
     day = now_samara.day
     month = months[now_samara.month - 1]
     date_str = f"{weekday}, {day} {month}"
-    
+
     raw_time = raw_time.strip()
-    time_str = raw_time 
+    time_str = raw_time
     
     try:
         raw_upper = raw_time.upper()
         if 'AM' in raw_upper or 'PM' in raw_upper:
             dt = datetime.strptime(raw_upper.replace(' ', ''), "%I:%M%p")
+            dt = dt + timedelta(hours=1)
             time_str = dt.strftime("%H:%M")
         elif ':' in raw_time:
             dt = datetime.strptime(raw_time, "%H:%M")
+            dt = dt + timedelta(hours=1)
             time_str = dt.strftime("%H:%M")
     except ValueError:
         pass
     
-    return f"<blockquote><b>🗓 {date_str} | 🕐 {time_str}</b></blockquote>"
+    return f"🗓 {date_str} | 🕐 {time_str}"
 
 def format_message(post: dict) -> str:
     raw_name = post.get('name', '').strip()
