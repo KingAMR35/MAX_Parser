@@ -6,7 +6,7 @@ import re
 import hashlib
 import threading
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from telebot import types
 from dotenv import load_dotenv
 import concurrent.futures
@@ -381,21 +381,29 @@ def escape_html(text: str) -> str:
     text = text.replace('>', '&gt;')
     return text
 
-def format_time_to_24h(time_str: str) -> str:
-    if not time_str:
+def format_message_time(raw_time: str) -> str:
+    if not raw_time:
         return ""
-    time_str = time_str.strip().upper()
-    if 'AM' in time_str or 'PM' in time_str:
-        try:
-            dt = datetime.strptime(time_str.replace(' ', ''), "%I:%M%p")
-            return dt.strftime("%H:%M")
-        except ValueError:
-            pass
-    match = re.search(r'(\d{1,2}:\d{2})', time_str)
-    if match:
-        h, m = match.group(1).split(':')
-        return f"{int(h):02d}:{m}"
-    return time_str
+    
+    samara_tz = timezone(timedelta(hours=4))
+    now_samara = datetime.now(samara_tz)
+    date_str = now_samara.strftime("%d.%m.%Y")
+    
+    raw_time = raw_time.strip()
+    time_str = raw_time
+    
+    try:
+        raw_upper = raw_time.upper()
+        if 'AM' in raw_upper or 'PM' in raw_upper:
+            dt = datetime.strptime(raw_upper.replace(' ', ''), "%I:%M%p")
+            time_str = dt.strftime("%H:%M")
+        elif ':' in raw_time:
+            dt = datetime.strptime(raw_time, "%H:%M")
+            time_str = dt.strftime("%H:%M")
+    except ValueError:
+        pass
+    
+    return f"📅 {date_str} 🕐 {time_str}"
 
 def format_message(post: dict) -> str:
     raw_name = post.get('name', '').strip()
@@ -451,9 +459,11 @@ def format_message(post: dict) -> str:
         
     body = escape_html(raw_text)
     result = f"{header}{body}"
-    raw_time_formatted = format_time_to_24h(raw_time)
-    if raw_time_formatted:
-        result += f"\n\n🕐 <i>{escape_html(raw_time_formatted)}</i>"
+    
+    time_footer = format_message_time(raw_time)
+    if time_footer:
+        result += f"\n\n{time_footer}"
+        
     return result
 
 def get_cancel_keyboard():
