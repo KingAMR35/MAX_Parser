@@ -387,10 +387,18 @@ def format_message_time(raw_time: str) -> str:
     
     samara_tz = timezone(timedelta(hours=4))
     now_samara = datetime.now(samara_tz)
-    date_str = now_samara.strftime("%d.%m.%Y")
+    
+    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+            'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+    
+    weekday = weekdays[now_samara.weekday()]
+    day = now_samara.day
+    month = months[now_samara.month - 1]
+    date_str = f"{weekday}, {day} {month}"
     
     raw_time = raw_time.strip()
-    time_str = raw_time
+    time_str = raw_time 
     
     try:
         raw_upper = raw_time.upper()
@@ -403,7 +411,7 @@ def format_message_time(raw_time: str) -> str:
     except ValueError:
         pass
     
-    return f"📅 {date_str} 🕐 {time_str}"
+    return f"<blockquote><b>🗓 {date_str} | 🕐 {time_str}</b></blockquote>"
 
 def format_message(post: dict) -> str:
     raw_name = post.get('name', '').strip()
