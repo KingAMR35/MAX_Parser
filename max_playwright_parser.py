@@ -7,15 +7,20 @@ import hashlib
 import shutil
 import io
 import base64
+import subprocess
 from urllib.parse import unquote, urlparse
 import queue
 import threading
+import traceback
 from typing import List, Dict
 from playwright.sync_api import sync_playwright
+from debug_log import logger as debug_logger, preview as log_preview
 
 SESSIONS_DIR = "sessions"
 SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
+MAX_MESSAGES_TO_PARSE = 10  #! Тут менять кол-во сообщений
+MAX_MESSAGES_TO_PARSE = max(0, int(MAX_MESSAGES_TO_PARSE))
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -23,6 +28,17 @@ message_cache_by_chat = {}
 photo_cache_by_chat = {}
 recent_post_hashes_by_chat = {}
 message_signatures_by_chat = {}
+
+
+def _strip_browser_video_fallback(text: str) -> str:
+    """Remove text rendered inside an unsupported video element, keeping captions."""
+    text = str(text or "")
+    text = re.sub(
+        r"(?:your browser does not support (?:this )?video|your browser does not support the video tag|"
+        r"ваш браузер не поддерживает (?:это )?видео)(?:\s+\d{1,2}:\d{2})?\.?",
+        " ", text, flags=re.I,
+    )
+    return " ".join(text.split()).strip()
 
 #! ==========================================
 #! 1. QR-АВТОРИЗАЦИЯ
@@ -54,6 +70,29 @@ def _is_logged_in(page) -> bool:
     except Exception as e:
         print(f"️ Ошибка проверки авторизации: {e}")
         return False
+
+def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int = 60000):
+    """Retry one transient MAX navigation failure and identify it in console logs."""
+    retryable_errors = (
+        "err_connection_closed",
+        "err_connection_reset",
+        "err_timed_out",
+        "err_network_changed",
+        "err_name_not_resolved",
+        "err_tunnel_connection_failed",
+    )
+    for attempt in range(1, 3):
+        try:
+            return page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if attempt >= 2 or not any(marker in error_text for marker in retryable_errors):
+                raise
+            print(
+                f"[{chat_id}] ⚠️ MAX: соединение закрыто на этапе «{stage}» "
+                f"({type(exc).__name__}); повтор через 2 сек."
+            )
+            page.wait_for_timeout(2000)
 
 def _get_password_input(page):
     password_selectors = [
@@ -355,11 +394,27 @@ def normalize_for_hash(text: str) -> str:
     return " ".join(text.split())
 
 def _get_post_content_signature(post: dict) -> str:
-    """Stable signature that does not depend on MAX's unstable data-index."""
+    """Stable content key that distinguishes separate media messages."""
     name = normalize_for_hash(post.get("name", ""))
     text = normalize_for_hash(post.get("text", ""))
     msg_time = normalize_for_hash(post.get("time", ""))
-    return "|".join([name, text, msg_time])
+    special = dict(post.get("special")) if isinstance(post.get("special"), dict) else {}
+    for key in ("location", "poll", "contact"):
+        if key not in special and post.get(key):
+            special[key] = post.get(key)
+    try:
+        special_key = json.dumps(special, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        special_key = str(special)
+    media_keys = sorted(
+        str(item.get("hash") or item.get("content_hash") or item.get("url") or "")
+        for item in (post.get("media_files") or [])
+        if isinstance(item, dict) and (item.get("hash") or item.get("content_hash") or item.get("url"))
+    )
+    return "|".join([
+        name, text, msg_time, normalize_for_hash(post.get("date", "")),
+        normalize_for_hash(special_key), "|".join(media_keys),
+    ])
 
 def get_message_hash(post: dict) -> str:
     """Primary duplicate key: message content, never data-index/date-of-today."""
@@ -372,7 +427,7 @@ def get_message_hash(post: dict) -> str:
         value = item.get("hash") or item.get("content_hash") or item.get("url") or ""
         if value:
             media_hashes.append(str(value))
-    content = "|".join([name, text, msg_time, "|".join(sorted(media_hashes))])
+    content = "|".join([name, text, msg_time, normalize_for_hash(post.get("date", "")), "|".join(sorted(media_hashes))])
     if not any([name, text, msg_time, media_hashes]):
         source_id = str(post.get("source_id") or "").strip()
         content = f"max-empty:{source_id}"
@@ -386,7 +441,9 @@ def get_text_message_hash(post: dict) -> str:
 
 def get_legacy_message_hash(post: dict) -> str:
     source_id = str(post.get("source_id") or "").strip()
-    if not source_id:
+    # MAX data-index/fallback positions can be reused after loading older history.
+    # They are not safe duplicate keys; content hashes above remain authoritative.
+    if not source_id or post.get("source_id_is_index"):
         return ""
     return hashlib.md5(f"max-message:{source_id}".encode("utf-8")).hexdigest()
 
@@ -399,22 +456,74 @@ def get_media_hash(data=None, url=None) -> str:
         return hashlib.md5(str(url).encode("utf-8")).hexdigest()
     return hashlib.md5(str(data).encode("utf-8")).hexdigest()
 
+
+def _image_visual_hash(data: bytes):
+    """Small perceptual hash used only to drop screenshot fallbacks of an image already fetched."""
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(io.BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source).convert("L")
+            aspect = image.width / max(1, image.height)
+            image = image.resize((9, 8))
+            pixels = list(image.getdata())
+        bits = 0
+        for y in range(8):
+            for x in range(8):
+                bits = (bits << 1) | int(pixels[y * 9 + x] > pixels[y * 9 + x + 1])
+        return aspect, bits
+    except Exception:
+        return None
+
+
+def _same_visual_image(first, second) -> bool:
+    if not first or not second or abs(first[0] - second[0]) > 0.06:
+        return False
+    return (first[1] ^ second[1]).bit_count() <= 1
+
+def _similar_visual_image(first, second) -> bool:
+    if not first or not second or abs(first[0] - second[0]) > 0.06:
+        return False
+    return (first[1] ^ second[1]).bit_count() <= 4
+
+def _visual_cache_key(visual) -> str:
+    return f"visual:{visual[0]:.4f}:{visual[1]:016x}"
+
+def _parse_visual_cache_key(value):
+    try:
+        prefix, aspect, bits = str(value).split(":", 2)
+        if prefix != "visual":
+            return None
+        return float(aspect), int(bits, 16)
+    except (TypeError, ValueError):
+        return None
+
 def is_new_message(post: dict, chat_id: int = 0) -> bool:
     if not isinstance(chat_id, int):
         print(f"⚠️ Некорректный chat_id в is_new_message: {chat_id}")
         return False
     cache = message_cache_by_chat.get(chat_id, set())
     signature = _get_post_content_signature(post)
-    if signature and signature in message_signatures_by_chat.get(chat_id, set()):
+    known_signatures = message_signatures_by_chat.get(chat_id, set())
+    if signature and signature in known_signatures:
         return False
+    special = post.get("special") if isinstance(post.get("special"), dict) else {}
+    poll = post.get("poll") or special.get("poll") or {}
     msg_hash = get_message_hash(post)
     if msg_hash in cache:
+        # Poll counts can change while the source message id and question stay the same.
+        # A new poll signature must be processed so it can update or establish tracking.
+        if poll and signature and signature not in known_signatures:
+            return True
         return False
     text_hash = get_text_message_hash(post)
     if text_hash and text_hash in cache:
+        if poll and signature and signature not in known_signatures:
+            return True
         return False
     legacy_hash = get_legacy_message_hash(post)
     if legacy_hash and legacy_hash in cache:
+        if poll and signature and signature not in known_signatures:
+            return True
         # Старый кэш мог быть создан по data-index. Мигрируем его
         # на стабильный контентный ключ, чтобы дальнейшая переиндексация
         # после системных событий MAX не привела к повторной отправке.
@@ -450,7 +559,14 @@ def is_new_media(data=None, chat_id: int = 0, url=None, media_hash=None) -> bool
         return False
     if media_hash is None:
         media_hash = get_media_hash(data=data, url=url)
-    return media_hash not in photo_cache_by_chat.get(chat_id, set())
+    cache = photo_cache_by_chat.get(chat_id, set())
+    target_visual = _parse_visual_cache_key(media_hash)
+    if target_visual:
+        for cached_hash in cache:
+            cached_visual = _parse_visual_cache_key(cached_hash)
+            if _similar_visual_image(target_visual, cached_visual):
+                return False
+    return media_hash not in cache
 
 def mark_media_seen(data=None, chat_id: int = 0, url=None, media_hash=None) -> None:
     if chat_id not in photo_cache_by_chat:
@@ -492,16 +608,37 @@ def _looks_like_image(data: bytes, content_type: str = "") -> bool:
     ct = (content_type or "").lower()
     if ct.startswith("image/"):
         return True
+    data = data.lstrip()
     signatures = (
         b"\xff\xd8\xff",      # JPEG
         b"\x89PNG\r\n\x1a\n", # PNG
-        b"RIFF",              # WEBP
         b"GIF8",              # GIF
         b"BM",                # BMP
         b"<svg",
         b"<?xml",
     )
-    return any(data.startswith(signature) for signature in signatures)
+    return (
+        any(data.startswith(signature) for signature in signatures)
+        or (data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+    )
+
+
+def _sniff_rich_media_type(data: bytes, content_type: str = "") -> str:
+    """Identify audio/video returned for an image candidate so it is not retried as a photo."""
+    content_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("audio/"):
+        return "audio"
+    if len(data) > 12 and data[4:8] == b"ftyp":
+        return "video"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video"
+    if data.startswith(b"OggS") or data.startswith(b"ID3") or data.startswith(b"fLaC"):
+        return "audio"
+    if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return "audio"
+    return ""
 
 def get_media_bytes(
     url: str,
@@ -543,35 +680,90 @@ def get_media_bytes(
                 data = bytes(result.get("bytes", []))
                 content_type = result.get("contentType", "")
             elif url.startswith(("http://", "https://")):
-                cookies = _browser_cookies_as_dict(context) if context is not None else {}
                 headers = {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/140.0 Safari/537.36"
-                    ),
                     "Referer": "https://web.max.ru/",
-                    "Accept": "image/avif,image/webp,image/apng,image/jpeg,image/png,image/*,*/*;q=0.8",
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+                    if media_type == "image" else "*/*",
                 }
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    cookies=cookies,
-                    timeout=(15, 60),
-                )
-                response.raise_for_status()
-                data = response.content
-                content_type = response.headers.get("content-type", "")
+                response = None
+                # Для картинок MAX часто требует cookies/контекст браузера.
+                # requests() в таком случае возвращает HTML shell (~250 KB),
+                # из-за чего caption сохранялся, а фото терялось.
+                if context is not None:
+                    try:
+                        response = context.request.get(url, headers=headers, timeout=60_000, fail_on_status_code=False)
+                    except Exception:
+                        response = None
+                if response is not None and response.ok:
+                    data = response.body()
+                    content_type = response.headers.get("content-type", "")
+                else:
+                    cookies = _browser_cookies_as_dict(context) if context is not None else {}
+                    fallback_headers = {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/140.0 Safari/537.36"
+                        ),
+                        "Referer": "https://web.max.ru/",
+                        "Accept": headers["Accept"],
+                    }
+                    response2 = requests.get(url, headers=fallback_headers, cookies=cookies, timeout=(15, 60))
+                    response2.raise_for_status()
+                    data = response2.content
+                    content_type = response2.headers.get("content-type", "")
+                # Последний browser-only fallback полезен для CORS/proxy URLs.
+                if media_type == "image" and (not data or not _looks_like_image(data, content_type)) and page is not None:
+                    try:
+                        fetched = page.evaluate(
+                            """async (url) => {
+                                const r = await fetch(url, {credentials:'include', headers:{'Accept':'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'}});
+                                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                                const b = await r.blob();
+                                const ab = await b.arrayBuffer();
+                                return {bytes:Array.from(new Uint8Array(ab)), contentType:b.type||''};
+                            }""",
+                            url,
+                        )
+                        browser_bytes = bytes(fetched.get("bytes") or [])
+                        browser_type = fetched.get("contentType") or ""
+                        if browser_bytes:
+                            data = browser_bytes
+                            content_type = browser_type or content_type
+                    except Exception:
+                        pass
             else:
                 print(f"[{chat_id}] ⚠️ Неизвестный URL медиа: {url[:120]}")
                 return None
             if not data:
                 raise RuntimeError("MAX вернул пустой файл")
+            detected_type = _sniff_rich_media_type(data, content_type) if media_type == "image" else ""
+            if detected_type:
+                print(
+                    f"[{chat_id}] ℹ️ MAX вернул {detected_type} вместо изображения; "
+                    "обрабатываю как медиа"
+                )
+                result = {
+                    "url": url,
+                    "bytes": data,
+                    "type": detected_type,
+                    "hash": get_media_hash(data=data),
+                    "content_type": content_type,
+                }
+                result["filename"] = _media_filename(
+                    "", url, content_type, data, detected_type
+                )
+                return result
             if media_type == "image":
                 if len(data) < 500:
                     print(f"[{chat_id}] ⛔ Слишком маленькое изображение: {len(data)} байт")
                     return None
                 if not _looks_like_image(data, content_type):
+                    # Если MAX вернул HTML shell вместо картинки, не повторяем
+                    # бессмысленные запросы. Выходим в screenshot fallback ниже.
+                    if str(content_type or "").lower().startswith("text/html") or data.lstrip().lower().startswith((b"<html", b"<!doctype")):
+                        print(f"[{chat_id}] ℹ️ URL изображения вернул HTML MAX; используем визуальный fallback")
+                        return None
                     raise RuntimeError(
                         f"ответ не похож на изображение: content-type={content_type!r}, size={len(data)}"
                     )
@@ -591,21 +783,33 @@ def get_media_bytes(
     return None
 
 def is_human_message(msg: dict) -> bool:
-    text = (msg.get("text") or "").strip().lower()
-    has_media = bool(msg.get("images") or msg.get("documents"))
-    if not text and not has_media:
+    """Принимает любой реальный тип сообщения MAX, включая сообщения без текста."""
+    text = (msg.get("text") or "").strip()
+    has_media = bool(
+        msg.get("images") or msg.get("documents") or msg.get("attachments")
+        or msg.get("emoji_image_urls") or msg.get("voice_hint")
+        or msg.get("video_note_hint") or msg.get("emoji_texts")
+        or msg.get("sticker_hint")
+    )
+    has_special = bool(
+        msg.get("location") or msg.get("poll") or msg.get("contact")
+    )
+    has_sticker = bool(msg.get("stickers"))
+    # Emoji-only и короткие сообщения тоже являются полноценными сообщениями.
+    if not text and not has_media and not has_special and not has_sticker:
         return False
-    if any(phrase in text for phrase in [
+
+    if any(phrase in text.casefold() for phrase in [
         "теперь в max", "now on max", "напишите что-нибудь", "write something",
         "сферум", "удалил", "удалила", "изменил", "изменила", "вошел", "вошла",
         "покинул", "покинула", "добавил", "добавила", "исключил", "исключила",
         "пригласил", "пригласила", "системное", "создал чат", "создала чат",
-        "вернулся", "вернулась", "скачать видео", "ютуб", "тикток", "подарок", "исчезнет",
+        "вернулся", "вернулась",
     ]):
         return False
-    if has_media:
-        return len(text) < 2000
-    return 5 < len(text) < 2000
+
+    # Не ограничиваем длину медиа/спецсообщений: подпись может быть большой.
+    return len(text) < 10000 if text else True
 
 def get_parse_debug_screenshot(chat_id: int) -> str:
     debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
@@ -659,7 +863,878 @@ def _normalize_document_filename(filename: str, url: str = "", content_type: str
             filename = "document.bin"
     return filename[:240]
 
-def _download_document_to_memory(page, context, url: str, filename: str = "", chat_id: int = 0) -> dict | None:
+
+def _media_filename(filename: str, url: str, content_type: str, data: bytes, media_type: str) -> str:
+    """Keep downloaded voice/video files recognizable to Telegram's media endpoints."""
+    name = _normalize_document_filename(filename, url, content_type)
+    suffix = os.path.splitext(name)[1].lower()
+    valid_suffixes = {
+        "voice": {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav"},
+        "audio": {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav"},
+        "video": {".mp4", ".m4v", ".mov", ".webm", ".gif", ".webp"},
+        "video_note": {".mp4", ".m4v", ".webm"},
+        "animation": {".gif", ".mp4", ".m4v"},
+    }
+    if media_type not in valid_suffixes:
+        return name
+    if suffix not in valid_suffixes[media_type]:
+        content_type = (content_type or "").lower()
+        path_suffix = os.path.splitext(urlparse(url).path)[1].lower()
+        signature_suffix = ""
+        if data.startswith(b"OggS"):
+            signature_suffix = ".ogg"
+        elif data.startswith(b"ID3"):
+            signature_suffix = ".mp3"
+        elif len(data) > 12 and data[4:8] == b"ftyp":
+            signature_suffix = ".mp4"
+        elif data.startswith(b"\x1a\x45\xdf\xa3"):
+            signature_suffix = ".webm"
+        elif data.startswith((b"GIF87a", b"GIF89a")):
+            signature_suffix = ".gif"
+        elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            signature_suffix = ".webp"
+        suffix_by_type = {
+            "audio/ogg": ".ogg", "application/ogg": ".ogg", "audio/opus": ".opus",
+            "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+            "audio/wav": ".wav", "audio/x-wav": ".wav", "video/mp4": ".mp4",
+            "video/webm": ".webm", "video/quicktime": ".mov", "image/gif": ".gif",
+            "image/webp": ".webp",
+        }
+        detected = signature_suffix or suffix_by_type.get(content_type) or path_suffix
+        if detected not in valid_suffixes[media_type]:
+            detected = ".ogg" if media_type == "voice" else ".mp4" if media_type in ("video", "video_note") else ".gif"
+        name = os.path.splitext(name)[0] + detected
+    return name[:240]
+
+
+def _animated_image_kind(data: bytes) -> str:
+    """Return the container name for animated GIF, APNG, or WebP payloads."""
+    if data.startswith((b"GIF87a", b"GIF89a")) and data.count(b"\x21\xf9\x04") > 1:
+        return "gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP" and b"ANIM" in data and b"ANMF" in data:
+        return "webp"
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and b"acTL" in data:
+        return "apng"
+    return ""
+
+
+def _prepare_static_emoji_image(media: dict, chat_id: int = 0) -> dict:
+    """Use the first rendered frame as a photo when MAX exposes no emoji Unicode."""
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return media
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(bytes(data))) as source:
+            source.seek(0)
+            frame = source.convert("RGBA")
+            output = io.BytesIO()
+            frame.save(output, format="PNG")
+            media["bytes"] = output.getvalue()
+            media["type"] = "image"
+            media["filename"] = "emoji.png"
+            media["content_type"] = "image/png"
+            return media
+    except Exception:
+        pass
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg and _media_payload_kind(media) == "video":
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-frames:v", "1",
+                 "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+                input=bytes(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+            )
+            if result.returncode == 0 and result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+                media["bytes"] = result.stdout
+                media["type"] = "image"
+                media["filename"] = "emoji.png"
+                media["content_type"] = "image/png"
+                return media
+        except Exception as exc:
+            debug_logger.warning("MAX_EMOJI_PREVIEW_FAILED chat_id=%s error=%s", chat_id, log_preview(exc, 180))
+    media["type"] = "image"
+    return media
+
+
+def _prepare_static_sticker_image(media: dict, chat_id: int = 0) -> dict:
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return media
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(bytes(data))) as source:
+            source.seek(0)
+            frame = source.convert("RGBA")
+            output = io.BytesIO()
+            frame.save(output, format="PNG")
+        media["bytes"] = output.getvalue()
+        media["type"] = "image"
+        media["filename"] = "sticker.png"
+        media["content_type"] = "image/png"
+        media["hash"] = get_media_hash(data=media["bytes"])
+    except Exception as exc:
+        debug_logger.warning("MAX_STICKER_CONVERSION_FAILED chat_id=%s error=%s", chat_id, log_preview(exc, 180))
+    return media
+
+
+def _encode_animated_image_frames(data: bytes, ffmpeg: str, chat_id: int = 0) -> bytes | None:
+    """Decode animated WebP/APNG frames and encode one cycle as MP4 raw video."""
+    try:
+        from PIL import Image, ImageSequence
+
+        source = Image.open(io.BytesIO(data))
+        if int(getattr(source, "n_frames", 1)) < 2:
+            return None
+        width, height = source.size
+        out_width = max(2, width + width % 2)
+        out_height = max(2, height + height % 2)
+        fps = 24
+        raw_frames = bytearray()
+        for index, frame in enumerate(ImageSequence.Iterator(source)):
+            if index >= 900:
+                raise ValueError("в анимированном WebP больше 900 кадров")
+            rgba = frame.convert("RGBA")
+            if rgba.size != (width, height):
+                rgba = rgba.resize((width, height), Image.Resampling.LANCZOS)
+            rgb = Image.new("RGB", (out_width, out_height), (0, 0, 0))
+            rgb.paste(rgba, (0, 0), rgba.getchannel("A"))
+            duration_ms = max(10, int(frame.info.get("duration") or source.info.get("duration") or 100))
+            repeats = max(1, round(duration_ms * fps / 1000))
+            frame_bytes = rgb.tobytes()
+            raw_frames.extend(frame_bytes * repeats)
+        if not raw_frames:
+            return None
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_width}x{out_height}",
+            "-r", str(fps), "-i", "pipe:0", "-map", "0:v:0", "-an",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4", "pipe:1",
+        ]
+        converted = subprocess.run(
+            command, input=bytes(raw_frames), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=45, check=False,
+        )
+        if converted.returncode == 0 and converted.stdout and b"ftyp" in converted.stdout[:64]:
+            return converted.stdout
+        detail = converted.stderr.decode("utf-8", "replace")[-300:]
+        print(f"[{chat_id}] ⚠️ Не удалось собрать MP4 из кадров анимации: {detail}")
+    except Exception as exc:
+        print(f"[{chat_id}] ⚠️ Не удалось прочитать кадры анимации: {exc}")
+    return None
+
+
+def _media_payload_kind(media: dict) -> str:
+    """Classify downloaded bytes by payload, independent of a stale DOM label."""
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)):
+        return ""
+    data = bytes(data)
+    content_type = str(media.get("content_type") or "").lower().split(";", 1)[0].strip()
+    if (content_type.startswith("video/") and not content_type.startswith("video/ogg")) or data[4:8] == b"ftyp" or data.startswith(b"\x1aE\xdf\xa3"):
+        return "video"
+    if content_type.startswith("audio/") or data.startswith((b"OggS", b"ID3", b"fLaC")):
+        return "audio"
+    if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return "audio"
+    return ""
+
+
+def _media_satisfies_hint(media: dict, msg: dict) -> bool:
+    """A voice/circle hint is valid only when the bytes match the expected stream."""
+    if msg.get("video_note_hint"):
+        return _media_payload_kind(media) == "video"
+    if msg.get("voice_hint"):
+        return _media_payload_kind(media) == "audio"
+    return True
+
+
+_MEDIA_DURATION_CACHE = {}
+
+
+def _probe_media_duration(data: bytes) -> float | None:
+    """Read a media duration from memory so adjacent lazy voice responses can be matched."""
+    if not data:
+        return None
+    media_hash = get_media_hash(data=data)
+    if media_hash in _MEDIA_DURATION_CACHE:
+        return _MEDIA_DURATION_CACHE[media_hash]
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    duration = None
+    if data.startswith(b"OggS"):
+        try:
+            offset = 0
+            last_granule = 0
+            while True:
+                page_start = data.find(b"OggS", offset)
+                if page_start < 0 or page_start + 27 > len(data):
+                    break
+                segment_count = data[page_start + 26]
+                lace_start = page_start + 27
+                lace_end = lace_start + segment_count
+                if lace_end > len(data):
+                    break
+                page_size = sum(data[lace_start:lace_end])
+                granule = int.from_bytes(data[page_start + 6:page_start + 14], "little")
+                if granule < 0xFFFFFFFFFFFFFFFF:
+                    last_granule = max(last_granule, granule)
+                offset = lace_end + page_size
+                if offset <= page_start or offset >= len(data):
+                    break
+            opus_head = data.find(b"OpusHead")
+            if last_granule and opus_head >= 0 and opus_head + 12 <= len(data):
+                pre_skip = int.from_bytes(data[opus_head + 10:opus_head + 12], "little")
+                duration = max(0.0, (last_granule - pre_skip) / 48000.0)
+        except Exception:
+            duration = None
+    if ffmpeg:
+        try:
+            if duration is not None:
+                _MEDIA_DURATION_CACHE[media_hash] = duration
+                return duration
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", "pipe:0", "-f", "null", "-"],
+                input=bytes(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=12, check=False,
+            )
+            text = result.stderr.decode("utf-8", "replace")
+            match = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", text)
+            if match:
+                duration = int(match.group(1))*3600 + int(match.group(2))*60 + float(match.group(3))
+        except Exception:
+            duration = None
+    _MEDIA_DURATION_CACHE[media_hash] = duration
+    return duration
+
+
+def _install_max_media_response_cache(page, chat_id: int) -> None:
+    """Capture audio/video responses during history warmup, before lazy cards are clicked."""
+    page._max_media_response_cache = []
+    page._max_media_claimed_responses = set()
+
+    def on_response(resp):
+        try:
+            content_type = str(resp.headers.get("content-type") or "").lower()
+            if not any(kind in content_type for kind in ("audio/", "video/", "octet-stream", "binary")):
+                return
+            url = str(resp.url or "")
+            parsed_url = urlparse(url)
+            path = (parsed_url.netloc + parsed_url.path)[:180]
+            # Ignore MAX's bundled call/ringtone sounds; only message media belongs here.
+            if "/_app/immutable/assets/" in parsed_url.path:
+                return
+            body = resp.body()
+            if not body or len(body) <= 300 or len(body) > 25 * 1024 * 1024:
+                return
+            media_kind = _media_payload_kind({"bytes": body, "content_type": content_type})
+            if media_kind not in ("audio", "video"):
+                return
+            entry = {
+                "url": url,
+                "path": path,
+                "bytes": body,
+                "type": media_kind,
+                "content_type": content_type,
+                "content_range": str(resp.headers.get("content-range") or ""),
+                "response_order": len(page._max_media_response_cache),
+                "hash": get_media_hash(data=body),
+            }
+            page._max_media_response_cache.append(entry)
+            debug_logger.info(
+                "MAX_MEDIA_PRELOAD_CAPTURED chat_id=%s order=%s type=%s endpoint=%s content_type=%s bytes=%s content_range=%s",
+                chat_id, entry["response_order"], media_kind, path, content_type,
+                len(body), entry["content_range"] or "<none>"
+            )
+        except Exception:
+            pass
+
+    page._max_media_response_listener = on_response
+    page.on("response", on_response)
+
+
+def _take_preloaded_media(page, msg: dict, expected_type: str, chat_id: int) -> list[dict]:
+    """Use a matching lazy-loaded MAX response when its card has no DOM URL."""
+    wanted = "audio" if expected_type == "voice" else "video"
+    claimed = getattr(page, "_max_media_claimed_responses", set())
+    responses = getattr(page, "_max_media_response_cache", [])
+    wanted_duration = float(msg.get("media_duration_seconds") or 0)
+    candidates = []
+    for entry in responses:
+        order = entry.get("response_order")
+        if order in claimed or entry.get("type") != wanted:
+            continue
+        path = str(entry.get("path") or "").lower()
+        if expected_type == "video_note":
+            if not any(marker in path for marker in ("videomsg", "video-message", "video_note", "video-note")):
+                continue
+        elif expected_type == "voice":
+            if "/audio" not in path and "audio" not in path:
+                continue
+        data = bytes(entry.get("bytes") or b"")
+        content_range = str(entry.get("content_range") or "")
+        range_match = re.search(r"bytes\s+\d+-\d+/(\d+)", content_range, re.I)
+        if expected_type == "video_note" and range_match and int(range_match.group(1)) > len(data):
+            expected_size = int(range_match.group(1))
+            try:
+                full = page.context.request.get(
+                    entry["url"], headers={"Referer": "https://web.max.ru/"},
+                    timeout=60_000, fail_on_status_code=False,
+                )
+                full_data = full.body() if full.ok else b""
+            except Exception as exc:
+                debug_logger.warning(
+                    "MAX_MEDIA_PRELOAD_RANGE_FAILED chat_id=%s source_id=%s response_order=%s error=%s",
+                    chat_id, msg.get("source_id") or msg.get("idx"), order, log_preview(exc, 180),
+                )
+                continue
+            if len(full_data) < expected_size:
+                debug_logger.warning(
+                    "MAX_MEDIA_PRELOAD_INCOMPLETE_RANGE chat_id=%s source_id=%s response_order=%s expected_bytes=%s actual_bytes=%s",
+                    chat_id, msg.get("source_id") or msg.get("idx"), order,
+                    expected_size, len(full_data),
+                )
+                continue
+            data = full_data
+            content_range = "full-response"
+            debug_logger.info(
+                "MAX_MEDIA_PRELOAD_RANGE_COMPLETED chat_id=%s source_id=%s response_order=%s bytes=%s",
+                chat_id, msg.get("source_id") or msg.get("idx"), order, len(data),
+            )
+        actual_duration = _probe_media_duration(data) if wanted_duration else None
+        difference = abs(actual_duration - wanted_duration) if actual_duration is not None else float("inf")
+        candidates.append((difference, order, entry, data, actual_duration, content_range))
+
+    if not candidates:
+        return []
+    # Nearby MAX cards may prefetch more than one audio stream at once. Match the
+    # duration displayed on this exact card before falling back to response order.
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    difference, order, entry, data, actual_duration, content_range = candidates[0]
+    if difference != float("inf") and difference > max(1.25, wanted_duration * 0.75):
+        debug_logger.warning(
+            "MAX_MEDIA_PRELOAD_DURATION_MISMATCH chat_id=%s source_id=%s expected_type=%s wanted_seconds=%.2f candidate_seconds=%.2f",
+            chat_id, msg.get("source_id") or msg.get("idx"), expected_type,
+            wanted_duration, actual_duration,
+        )
+        return []
+    range_match = re.search(r"bytes\s+\d+-\d+/(\d+)", content_range, re.I)
+    if range_match and int(range_match.group(1)) > len(data):
+        try:
+            full = page.context.request.get(
+                entry["url"], headers={"Referer": "https://web.max.ru/"},
+                timeout=60_000, fail_on_status_code=False,
+            )
+            full_data = full.body() if full.ok else b""
+            if len(full_data) >= int(range_match.group(1)):
+                data = full_data
+                content_range = "full-response"
+        except Exception:
+            pass
+    if not _media_satisfies_hint({"bytes": data, "content_type": entry.get("content_type")}, msg):
+        return []
+    claimed.add(order)
+    page._max_media_claimed_responses = claimed
+    suffix = ".ogg" if wanted == "audio" and "ogg" in entry.get("content_type", "") else ".mp4" if wanted == "video" and "mp4" in entry.get("content_type", "") else ".bin"
+    media = {
+        "url": entry.get("url") or "",
+        "bytes": data,
+        "type": expected_type,
+        "filename": ("voice" if wanted == "audio" else "video_note") + suffix,
+        "content_type": entry.get("content_type") or "",
+        "hash": get_media_hash(data=data),
+    }
+    debug_logger.info(
+        "MAX_MEDIA_PRELOAD_USED chat_id=%s source_id=%s expected=%s response_order=%s bytes=%s content_type=%s duration_seconds=%s content_range=%s",
+        chat_id, msg.get("source_id") or msg.get("idx"), expected_type,
+        order, len(data), media["content_type"] or "<none>", actual_duration, content_range or "<none>"
+    )
+    return [media]
+
+
+def _claim_preloaded_media(page, media_files: list[dict]) -> None:
+    claimed = getattr(page, "_max_media_claimed_responses", set())
+    hashes = {m.get("hash") or get_media_hash(data=m.get("bytes") or b"") for m in media_files}
+    for entry in getattr(page, "_max_media_response_cache", []):
+        if entry.get("hash") in hashes:
+            claimed.add(entry.get("response_order"))
+    page._max_media_claimed_responses = claimed
+
+
+def _capture_video_canvas(page, msg: dict, chat_id: int = 0) -> list[dict]:
+    """Record MAX's canvas-rendered circular video through visible browser frames."""
+    try:
+        card = _strict_message_card_locator(page, msg)
+        if not card.count():
+            return []
+        canvas = card.locator("canvas.videoCanvas").first
+        if not canvas.count():
+            return []
+        info = card.evaluate("""card=>{
+            const c=card.querySelector('canvas.videoCanvas');
+            const t=(card.querySelector('.videoMessage .time')?.textContent||'').trim();
+            const m=t.match(/^(\\d{1,2}):(\\d{2})$/);
+            return {width:c?.width||0,height:c?.height||0,durationMs:m?Math.max(500,(Number(m[1])*60+Number(m[2]))*1000):1000};
+        }""")
+        fps = 15
+        wanted_duration = float(msg.get("media_duration_seconds") or 0)
+        duration_ms = round(wanted_duration * 1000) if wanted_duration > 0 else int(info.get("durationMs") or 1000)
+        duration_ms = max(1000, min(10000, duration_ms))
+        frame_count = max(15, min(150, round((duration_ms / 1000) * fps)))
+        frames = []
+        for _ in range(frame_count):
+            frames.append(canvas.screenshot(type="png", animations="allow", timeout=4000))
+            page.wait_for_timeout(round(1000 / fps))
+
+        distinct_visuals = []
+        for frame in frames:
+            visual = _image_visual_hash(frame)
+            if visual and not any(_same_visual_image(visual, previous) for previous in distinct_visuals):
+                distinct_visuals.append(visual)
+        if len(distinct_visuals) < 2:
+            debug_logger.warning(
+                "MAX_CANVAS_VIDEO_CAPTURE_REJECTED chat_id=%s source_id=%s reason=static_frame frames=%s distinct=%s duration_ms=%s",
+                chat_id, msg.get("source_id") or msg.get("idx"), len(frames), len(distinct_visuals), duration_ms
+            )
+            return []
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            try:
+                import imageio_ffmpeg
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg = None
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg отсутствует; кадры MAX есть, но MP4 собрать нечем")
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "image2pipe",
+            "-vcodec", "png", "-framerate", str(fps), "-i", "pipe:0", "-an",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4", "pipe:1",
+        ]
+        converted = subprocess.run(
+            command, input=b"".join(frames), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60, check=False,
+        )
+        data = converted.stdout
+        if converted.returncode == 0 and len(data) > 500 and b"ftyp" in data[:64]:
+            media = {
+                "url": "canvas-recording:max-video-note",
+                "bytes": data,
+                "type": "video_note",
+                "filename": "video_note.mp4",
+                "content_type": "video/mp4",
+                "hash": get_media_hash(data=data),
+            }
+            debug_logger.info(
+                "MAX_CANVAS_VIDEO_CAPTURED chat_id=%s source_id=%s bytes=%s duration_ms=%s frames=%s fps=%s size=%sx%s content_type=%s",
+                chat_id, msg.get("source_id") or msg.get("idx"), len(data), duration_ms,
+                len(frames), fps, info.get("width"), info.get("height"), media["content_type"]
+            )
+            return [media]
+        detail = converted.stderr.decode("utf-8", "replace")[-300:]
+        debug_logger.warning(
+            "MAX_CANVAS_VIDEO_CAPTURE_EMPTY chat_id=%s source_id=%s detail=%s",
+            chat_id, msg.get("source_id") or msg.get("idx"), log_preview(detail or f"bytes={len(data)}", 160)
+        )
+    except Exception as exc:
+        debug_logger.warning(
+            "MAX_CANVAS_VIDEO_CAPTURE_EMPTY chat_id=%s source_id=%s detail=%s",
+            chat_id, msg.get("source_id") or msg.get("idx"), log_preview(exc, 160)
+        )
+    return []
+
+
+def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
+    """Record a rendered sticker when MAX exposes only its first PNG frame."""
+    try:
+        card = _strict_message_card_locator(page, msg)
+        if card.count() == 0:
+            return []
+        selector = 'video,canvas,img,svg,[style*="background-image" i],[class*="sticker" i],[data-sticker],[data-testid*="sticker" i],[aria-label*="sticker" i],[aria-label*="стикер" i]'
+        nodes = card.locator(selector)
+        candidates = nodes.evaluate_all("""nodes => nodes.map((el,index) => {
+            const r=el.getBoundingClientRect();
+            const meta=[];
+            for(let n=el,d=0;n&&d<5;n=n.parentElement,d++) {
+                meta.push(n.className||'',n.getAttribute?.('data-testid')||'',n.getAttribute?.('data-sticker')||'',
+                    n.getAttribute?.('aria-label')||'',n.getAttribute?.('data-type')||'');
+            }
+            const text=meta.join(' ').toLowerCase();
+            const tag=String(el.tagName||'').toLowerCase();
+            let duration=tag==='video' && Number.isFinite(el.duration) ? el.duration : 0;
+            let animated=['video','canvas'].includes(tag) || /animated|lottie/.test(text);
+            try {
+                const style=getComputedStyle(el);
+                const cssDurations=String(style.animationDuration||'').split(',').map(value=>{
+                    const n=parseFloat(value)||0;
+                    return value.includes('ms') ? n/1000 : n;
+                });
+                const cssDuration=Math.max(0,...cssDurations);
+                if(!duration) duration=cssDuration;
+                if(cssDuration>0 && style.animationName!=='none') animated=true;
+            } catch(e) {}
+            const src=String(el.currentSrc||el.src||el.getAttribute?.('src')||'');
+            if(/\\.(?:gif|webp)(?:[?#]|$)/i.test(src)) animated=true;
+            return {index,tag,meta:text,width:r.width||0,height:r.height||0,duration,animated};
+        })""")
+        valid = [
+            item for item in (candidates or [])
+            if re.search(r"sticker|стикер", str(item.get("meta") or ""), re.I)
+            and float(item.get("width") or 0) >= 20
+            and float(item.get("height") or 0) >= 20
+        ]
+        if not valid:
+            return []
+        valid.sort(key=lambda item: (
+            0 if item.get("animated") else 1,
+            0 if item.get("tag") in {"video", "canvas", "img", "svg"} else 1,
+            float(item.get("width") or 0) * float(item.get("height") or 0),
+        ))
+        chosen = valid[0]
+        sticker = nodes.nth(int(chosen["index"]))
+        try:
+            sticker.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+        try:
+            sticker.evaluate("""el => {
+                if(String(el.tagName||'').toLowerCase()==='video') {
+                    el.muted=true;
+                    const p=el.play(); if(p && p.catch) p.catch(()=>{});
+                }
+            }""")
+        except Exception:
+            pass
+
+        fps = 12
+        duration = float(chosen.get("duration") or 0) or float(msg.get("media_duration_seconds") or 0) or 3.0
+        duration = min(10.0, max(1.0, duration))
+        frame_count = max(12, min(120, round(duration * fps)))
+        frames = []
+        distinct = []
+        for index in range(frame_count):
+            frame = sticker.screenshot(type="png", animations="allow", timeout=5000)
+            if not frame:
+                return []
+            frames.append(frame)
+            visual = _image_visual_hash(frame)
+            if visual and not any(_same_visual_image(visual, previous) for previous in distinct):
+                distinct.append(visual)
+            elif visual is None and frame != (frames[-2] if len(frames) > 1 else None):
+                distinct.append((index,))
+            if index == min(frame_count - 1, fps - 1) and len(distinct) < 2:
+                return []
+            if index + 1 < frame_count:
+                page.wait_for_timeout(round(1000 / fps))
+        if len(distinct) < 2:
+            return []
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            try:
+                import imageio_ffmpeg
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg = None
+        if not ffmpeg:
+            debug_logger.warning("MAX_STICKER_VIDEO_CAPTURE_FAILED chat_id=%s reason=ffmpeg_missing", chat_id)
+            return []
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(frames[0])) as image:
+                side = max(image.size)
+        except Exception:
+            side = max(int(chosen.get("width") or 0), int(chosen.get("height") or 0), 2)
+        side = max(2, side + side % 2)
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "image2pipe",
+            "-vcodec", "png", "-framerate", str(fps), "-i", "pipe:0", "-an",
+            "-vf", f"scale={side}:{side}:force_original_aspect_ratio=decrease,pad={side}:{side}:(ow-iw)/2:(oh-ih)/2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1",
+        ]
+        converted = subprocess.run(
+            command, input=b"".join(frames), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=60, check=False,
+        )
+        data = converted.stdout
+        if converted.returncode != 0 or len(data) <= 500 or b"ftyp" not in data[:64]:
+            debug_logger.warning(
+                "MAX_STICKER_VIDEO_CAPTURE_FAILED chat_id=%s source_id=%s detail=%s",
+                chat_id, msg.get("source_id") or msg.get("idx"),
+                log_preview(converted.stderr.decode("utf-8", "replace")[-240:], 160),
+            )
+            return []
+        media = {
+            "url": "sticker-recording:max-sticker",
+            "bytes": data,
+            "type": "video",
+            "filename": "animated_sticker.mp4",
+            "content_type": "video/mp4",
+            "hash": get_media_hash(data=data),
+        }
+        debug_logger.info(
+            "MAX_STICKER_VIDEO_CAPTURED chat_id=%s source_id=%s bytes=%s duration_seconds=%.2f frames=%s size=%sx%s",
+            chat_id, msg.get("source_id") or msg.get("idx"), len(data), duration,
+            len(frames), side, side,
+        )
+        return [media]
+    except Exception as exc:
+        debug_logger.warning(
+            "MAX_STICKER_VIDEO_CAPTURE_FAILED chat_id=%s source_id=%s error=%s",
+            chat_id, msg.get("source_id") or msg.get("idx"), log_preview(exc, 180),
+        )
+        return []
+
+
+def _record_animated_image_as_video(media: dict, chat_id: int = 0) -> dict:
+    """Convert animated sticker image payloads into an MP4 Telegram can play as video."""
+    if media.get("type") not in {"image", "sticker"}:
+        return media
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)):
+        return media
+    kind = _animated_image_kind(bytes(data))
+    if not kind:
+        return media
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    if not ffmpeg:
+        # GIF remains animated in Telegram when sent with send_animation.
+        if kind == "gif":
+            media["type"] = "animation"
+            media["filename"] = "animated_sticker.gif"
+        else:
+            print(f"[{chat_id}] ⚠️ Для преобразования анимированного WebP в MP4 нужен ffmpeg")
+        return media
+
+    if kind in {"webp", "apng"}:
+        output = _encode_animated_image_frames(bytes(data), ffmpeg, chat_id=chat_id)
+        if output:
+            media["bytes"] = output
+            media["type"] = "video"
+            media["filename"] = "animated_sticker.mp4"
+            media["content_type"] = "video/mp4"
+            media["hash"] = get_media_hash(data=output)
+        return media
+
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+    if kind == "gif":
+        command.extend(["-ignore_loop", "1"])
+    command.extend([
+        "-f", kind, "-i", "pipe:0", "-map", "0:v:0", "-an",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4", "pipe:1",
+    ])
+    try:
+        converted = subprocess.run(
+            command,
+            input=bytes(data),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+            check=False,
+        )
+        output = converted.stdout
+        if converted.returncode == 0 and output and b"ftyp" in output[:64]:
+            media["bytes"] = output
+            media["type"] = "video"
+            media["filename"] = "animated_sticker.mp4"
+            media["content_type"] = "video/mp4"
+            media["hash"] = get_media_hash(data=output)
+        else:
+            detail = converted.stderr.decode("utf-8", "replace")[-500:]
+            print(f"[{chat_id}] ⚠️ Не удалось записать анимированный стикер в MP4: {detail}")
+            if kind == "gif":
+                media["type"] = "animation"
+                media["filename"] = "animated_sticker.gif"
+    except Exception as exc:
+        print(f"[{chat_id}] ⚠️ Ошибка преобразования анимированного стикера: {exc}")
+        if kind == "gif":
+            media["type"] = "animation"
+            media["filename"] = "animated_sticker.gif"
+    return media
+
+
+def _prepare_video_note_for_telegram(media: dict, chat_id: int = 0) -> dict:
+    """Telegram video notes need MP4; transcode MAX WebM circles when needed."""
+    if media.get("type") != "video_note":
+        return media
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)):
+        return media
+    if len(data) > 12 and data[4:8] == b"ftyp":
+        media["filename"] = "video_note.mp4"
+        media["content_type"] = "video/mp4"
+        return media
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    if not ffmpeg:
+        media["type"] = "video"
+        media["filename"] = _media_filename("video_note.bin", media.get("url", ""), media.get("content_type", ""), bytes(data), "video")
+        print(f"[{chat_id}] ⚠️ Для кружка MAX без MP4 нужен ffmpeg; отправляю исходное видео")
+        return media
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-map", "0:v:0", "-an", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4", "pipe:1",
+    ]
+    try:
+        converted = subprocess.run(
+            command, input=bytes(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60, check=False,
+        )
+        output = converted.stdout
+        if converted.returncode == 0 and output and b"ftyp" in output[:64]:
+            media["bytes"] = output
+            media["filename"] = "video_note.mp4"
+            media["content_type"] = "video/mp4"
+            media["hash"] = get_media_hash(data=output)
+        else:
+            media["type"] = "video"
+            media["filename"] = _media_filename("video_note.bin", media.get("url", ""), media.get("content_type", ""), bytes(data), "video")
+            detail = converted.stderr.decode("utf-8", "replace")[-500:]
+            print(f"[{chat_id}] ⚠️ Не удалось подготовить MP4-кружок: {detail}")
+    except Exception as exc:
+        media["type"] = "video"
+        media["filename"] = _media_filename("video_note.bin", media.get("url", ""), media.get("content_type", ""), bytes(data), "video")
+        print(f"[{chat_id}] ⚠️ Ошибка подготовки MP4-кружка: {exc}")
+    return media
+
+def _strict_message_card_locator(page, msg: dict):
+    """Return only the exact DOM card tagged while parsing this message.
+
+    Media fallbacks must never guess a neighboring .item: MAX virtualizes the
+    feed and content-based matching can resolve the wrong message.
+    """
+    dom_id = str(msg.get("dom_id") or "").strip()
+    if dom_id:
+        loc = page.locator(f'[data-max-parser-message-id="{dom_id}"]').first
+        try:
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+    for key in ("data_message_id", "mid", "data_id"):
+        value = str(msg.get(key) or "").strip()
+        if not value:
+            continue
+        safe = value.replace("\\", "\\\\").replace('"', '\\"')
+        loc = page.locator(
+            f'.item[data-message-id="{safe}"],.item[data-mid="{safe}"],.item[data-id="{safe}"]'
+        ).first
+        try:
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+    source_id = str(msg.get("source_id") or "").strip()
+    if source_id and bool(msg.get("source_id_is_index")):
+        safe = source_id.replace("\\", "\\\\").replace('"', '\\"')
+        loc = page.locator(f'.item[data-index="{safe}"]').first
+        try:
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+    return page.locator('[data-max-parser-message-id="__max_parser_not_found__"]').first
+
+
+def _message_card_locator(page, msg: dict):
+    """Find a MAX .item for a parsed message, with stable fallbacks.
+
+    MAX virtualizes the message list, so the custom parser attribute may disappear
+    when the list is recycled.  Keep several local identifiers and fall back to
+    data-index / original DOM index instead of giving up on the media.
+    """
+    candidates = []
+    dom_id = str(msg.get("dom_id") or "").strip()
+    if dom_id:
+        candidates.append(page.locator(f'[data-max-parser-message-id="{dom_id}"]').first)
+
+    # data-index is much more stable in MAX than our temporary parser attribute.
+    source_id = str(msg.get("source_id") or "").strip()
+    if source_id and bool(msg.get("source_id_is_index")):
+        safe = source_id.replace("\\", "\\\\").replace('"', '\\"')
+        candidates.append(page.locator(f'.item[data-index="{safe}"]').first)
+
+    for key in ("data_message_id", "message_id", "mid", "data_id"):
+        value = str(msg.get(key) or "").strip()
+        if value:
+            safe = value.replace("\\", "\\\\").replace('"', '\\"')
+            candidates.append(page.locator(
+                f'.item[data-message-id="{safe}"],.item[data-mid="{safe}"],.item[data-id="{safe}"]'
+            ).first)
+
+    for loc in candidates:
+        try:
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            continue
+
+    # В виртуализированном списке data-index может меняться. Ищем карточку
+    # по содержимому конкретного сообщения, чтобы media fallback не попал
+    # в соседний .item.
+    try:
+        text_hint = " ".join(str(msg.get("text") or "").split()).strip().lower()
+        name_hint = " ".join(str(msg.get("name") or "").split()).strip().lower()
+        time_hint = " ".join(str(msg.get("time") or "").split()).strip().lower()
+        items = page.locator(".item")
+        matched = items.evaluate_all(
+            r"""(els, q) => {
+                const clean = s => String(s||'').replace(/\s+/g,' ').trim().toLowerCase();
+                for (let i=0;i<els.length;i++) {
+                    const row = els[i];
+                    const all = clean(row.innerText);
+                    const time = clean((row.querySelector('.meta .text,.meta time,time')||{}).textContent);
+                    const name = clean((row.querySelector('.bubbleContent .header .name .text,.bubbleContent .header .name,.header .name')||{}).textContent);
+                    const textOk = !q.text || all.includes(q.text);
+                    const timeOk = !q.time || all.includes(q.time) || time===q.time;
+                    const nameOk = !q.name || !name || name.includes(q.name) || all.includes(q.name);
+                    if (textOk && timeOk && nameOk) return i;
+                }
+                return -1;
+            }""",
+            {"text": text_hint, "name": name_hint, "time": time_hint},
+        )
+        if isinstance(matched, int) and matched >= 0:
+            return items.nth(matched)
+    except Exception:
+        pass
+
+    # Никогда не возвращаем произвольную .item: это могло отправить медиа
+    # соседнего сообщения.
+    return page.locator('[data-max-parser-message-id="__max_parser_not_found__"]').first
+
+
+def _download_document_to_memory(page, context, url: str, filename: str = "", chat_id: int = 0, media_type: str = "document") -> dict | None:
     """
     Downloads a MAX attachment directly into RAM.
     - blob: URLs are read inside the authenticated MAX page via fetch + FileReader.
@@ -714,17 +1789,20 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
             return None
         if not file_bytes:
             raise RuntimeError("получен пустой файл")
+        if media_type in {"voice", "audio", "video", "video_note", "animation"}:
+            final_name = _media_filename(final_name, url, content_type, file_bytes, media_type)
         return {
             "url": url,
             "bytes": file_bytes,
-            "type": "document",
+            "type": media_type,
             "filename": final_name,
+            "content_type": content_type,
         }
     except Exception as e:
         print(f"[{chat_id}] ❌ Не удалось получить документ в память: {e}")
         return None
 
-def _download_document_from_message_card(page, context, msg: dict, chat_id: int = 0) -> dict | None:
+def _download_document_from_message_card(page, context, msg: dict, chat_id: int = 0, media_type: str = "document") -> dict | None:
     """Find the visible MAX file card and obtain its attachment without saving it to disk."""
     dom_id = (msg.get("dom_id") or "").strip()
     if not dom_id:
@@ -762,6 +1840,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                             url=download_url,
                             filename=filename_hint or suggested,
                             chat_id=chat_id,
+                            media_type=media_type,
                         )
                         if media and media.get("bytes"):
                             return media
@@ -789,7 +1868,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                                 return media
                 except Exception:
                     pass
-        card = page.locator(f'[data-max-parser-message-id="{dom_id}"]').first
+        card = _message_card_locator(page, msg)
         if card.count() == 0:
             return None
         download_candidates = card.locator(
@@ -852,6 +1931,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                 url=url,
                 filename=filename_hint or item.get("download", "") or item.get("text", ""),
                 chat_id=chat_id,
+                media_type=media_type,
             )
             if media and media.get("bytes"):
                 return media
@@ -868,6 +1948,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                     url=download_url,
                     filename=filename_hint or suggested,
                     chat_id=chat_id,
+                    media_type=media_type,
                 )
         except Exception as e:
             print(f"[{chat_id}] ℹ️ Карточка файла не дала download event: {e}")
@@ -875,32 +1956,971 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
         print(f"[{chat_id}] ❌ Ошибка поиска карточки документа: {e}")
     return None
 
+def _refresh_card_image_urls(page, msg: dict, chat_id: int = 0) -> list[str]:
+    """Re-read image URLs from the live MAX card immediately before download."""
+    out=[]; seen=set()
+    try:
+        card=_strict_message_card_locator(page,msg)
+        if card.count()==0: return []
+        try:
+            card.scroll_into_view_if_needed(timeout=1500)
+            page.wait_for_timeout(140)
+            # Прогреваем каждое изображение внутри конкретной карточки. В MAX
+            # captioned-photo часто лениво получает src только при попадании
+            # самого img в viewport.
+            imgs=card.locator("img")
+            for i in range(min(imgs.count(), 12)):
+                try:
+                    imgs.nth(i).scroll_into_view_if_needed(timeout=700)
+                    page.wait_for_timeout(90)
+                except Exception:
+                    continue
+            card.evaluate("""card=>{
+                for(const img of card.querySelectorAll('img')){
+                    try{
+                        img.loading='eager';
+                        const attrs=['data-src','data-original','data-lazy-src','data-image','data-photo','data-image-url','data-photo-url','data-media-url','data-original-src','data-attachment-url','data-content-url'];
+                        const cur=img.currentSrc||img.getAttribute('src')||'';
+                        if(!cur || /^data:image/i.test(cur)){
+                            for(const a of attrs){ const v=img.getAttribute(a)||''; if(/^(https?:|blob:)/i.test(v)){ img.src=v; break; } }
+                        }
+                    }catch(e){}
+                }
+            }""")
+            page.wait_for_timeout(350)
+        except Exception: pass
+        values=card.locator("img, picture source, a[href]").evaluate_all(r"""els=>els.map(el=>{
+            const tag=(el.tagName||'').toLowerCase();
+            const meta=[el.className||'',el.getAttribute?.('data-testid')||'',el.getAttribute?.('aria-label')||'',el.getAttribute?.('alt')||'',el.getAttribute?.('title')||'',el.getAttribute?.('data-type')||'',el.parentElement?.className||''].join(' ').toLowerCase();
+            const attrs=['src','current-src','data-src','data-original','data-lazy-src','data-image','data-photo','data-image-url','data-photo-url','data-media-url','data-original-src','data-attachment-url','data-content-url','href'];
+            const urls=[];
+            for(const a of attrs){ let v=(a==='src'&&el.currentSrc)?el.currentSrc:(el.getAttribute?.(a)||''); if(v&&/^(https?:|blob:)/i.test(v)) urls.push(v); }
+            try{ const bg=getComputedStyle(el).backgroundImage||''; const m=bg.match(/url\([\"']?(.*?)[\"']?\)/i); if(m&&/^(https?:|blob:)/i.test(m[1])) urls.push(m[1]); }catch(e){}
+            const href=(el.getAttribute?.('href')||'');
+            const anchorLooksLikeImage=tag!=='a' || /(?:\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|$))|^blob:|photo|image|media|attachment|picture/i.test(href+' '+meta);
+            return {tag,meta,urls:anchorLooksLikeImage?urls:urls.filter(u=>u!==href)};
+        })""")
+        for item in values:
+            meta=str(item.get('meta') or '')
+            if re.search(r'avatar|userpic|profile|favicon|spacer|blank',meta,re.I): continue
+            if re.search(r'emoji|animated\s*emoji|эмодзи|emoticon|smiley',meta,re.I) and not re.search(r'sticker|стикер',meta,re.I): continue
+            for url in item.get('urls') or []:
+                url=str(url).strip()
+                if url and url not in seen:
+                    seen.add(url); out.append(url)
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Не удалось повторно получить URL фото из карточки: {exc}")
+    return out
+
+
+def _warmup_captioned_photo_card(page, msg: dict, chat_id: int = 0) -> None:
+    """Force only the current captioned-photo card to materialize its image."""
+    try:
+        card = _strict_message_card_locator(page, msg)
+        if card.count() == 0:
+            return
+        card.scroll_into_view_if_needed(timeout=1500)
+        page.wait_for_timeout(300)
+        card.evaluate("""card => {
+            const attrs = ['data-src','data-original','data-lazy-src','data-image','data-photo',
+                'data-image-url','data-photo-url','data-media-url','data-original-src',
+                'data-attachment-url','data-content-url'];
+            for (const img of card.querySelectorAll('img')) {
+                try {
+                    img.loading = 'eager';
+                    img.decoding = 'sync';
+                    if (!img.currentSrc || /^data:image/i.test(img.currentSrc)) {
+                        for (const a of attrs) {
+                            const v = img.getAttribute(a) || '';
+                            if (/^(https?:|blob:)/i.test(v)) {
+                                img.src = v;
+                                break;
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+            for (const el of card.querySelectorAll('img, [style*="background-image" i], [data-image-url], [data-photo-url], [data-media-url]')) {
+                try { el.scrollIntoView({block:'center', inline:'nearest'}); } catch(e) {}
+            }
+        }""")
+        page.wait_for_timeout(700)
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Не удалось прогреть фото с caption: {exc}")
+
+
+def _refresh_emoji_texts(page, msg: dict, chat_id: int = 0) -> list[str]:
+    """Refresh Unicode emoji from the exact card after MAX lazy-renders it."""
+    try:
+        card = _strict_message_card_locator(page, msg)
+        if card.count() == 0:
+            return []
+        try:
+            card.scroll_into_view_if_needed(timeout=1200)
+            page.wait_for_timeout(350)
+        except Exception:
+            pass
+        values = card.evaluate("""card => {
+            const out=[];
+            const add=(s,nodeSeen)=>{
+                s=String(s||'').trim(); if(!s) return;
+                let ms=[]; try{ms=s.match(/[\\p{Extended_Pictographic}](?:\\uFE0F|\\u200D[\\p{Extended_Pictographic}])*/gu)||[];}catch(e){}
+                for(const x of ms){if(!nodeSeen.has(x)){nodeSeen.add(x);out.push(x);}}
+            };
+            const cp=(s,nodeSeen)=>{
+                const raw=String(s||'');
+                const explicit=raw.match(/(?:U\\+|0x)[0-9a-f]{4,6}/gi)||[];
+                const parts=[...explicit.map(p=>p.replace(/^(?:U\\+|0x)/i,'')),...raw.split(/[^0-9a-f]+/i).filter(p=>/^[0-9a-f]{4,6}$/i.test(p)&&/\\d/.test(p))];
+                const chars=[]; for(const token of parts){try{if(!/\\d/.test(token))continue;const n=parseInt(token,16);if(n>=0x2000&&n<=0x1FAFF)chars.push(String.fromCodePoint(n));}catch(e){}}
+                if(chars.length)add(chars.join(''),nodeSeen);
+            };
+            const nodes=[card,...Array.from(card.querySelectorAll('*'))];
+            for(const el of nodes){
+                const nodeSeen=new Set();
+                const ancestorMeta=[]; for(let n=el;n&&ancestorMeta.length<20;n=n.parentElement) ancestorMeta.push(n.className||'',n.getAttribute?.('data-type')||'',n.getAttribute?.('data-testid')||'',n.getAttribute?.('aria-label')||'');
+                const meta=[...ancestorMeta,el.getAttribute?.('title')||'',el.getAttribute?.('role')||'',el.getAttribute?.('data-name')||'',el.getAttribute?.('data-icon')||'',el.getAttribute?.('data-emoji')||'',el.getAttribute?.('data-emoji-char')||'',el.getAttribute?.('data-emoji-text')||'',el.getAttribute?.('data-animated-emoji')||'',el.getAttribute?.('data-custom-emoji')||'',el.getAttribute?.('data-emoji-id')||'',el.getAttribute?.('data-emoji-name')||''].join(' ').toLowerCase();
+                if(/sticker|стикер/.test(meta)) continue;
+                if(!/(emoji|эмодзи|animated.?emoji|custom.?emoji|emoticon|smiley)/i.test(meta) && !/^(img|canvas|video)$/i.test(el.tagName||'') && !el.hasAttribute?.('data-custom-emoji') && !el.hasAttribute?.('data-emoji-id') && !el.hasAttribute?.('data-emoji-name')) continue;
+                const attrs=['aria-label','alt','title','data-emoji','data-emoji-char','data-emoji-text','data-text','data-character','data-name','data-custom-emoji','data-emoji-name','data-emoji-alias'];
+                for(const a of attrs) add(el.getAttribute?.(a),nodeSeen);
+                for(const a of ['data-codepoint','data-codepoints','data-unicode','data-emoji-code','data-emoji-codepoint','data-code','data-custom-emoji']) cp(el.getAttribute?.(a),nodeSeen);
+                add(el.textContent,nodeSeen);
+                try{cp(String(el.outerHTML||''),nodeSeen);}catch(e){}
+            }
+            return out;
+        }""")
+        return [str(x) for x in (values or []) if str(x).strip()]
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Не удалось обновить emoji из карточки: {exc}")
+        return []
+
+
+def _screenshot_card_images(page, msg: dict, chat_id: int = 0) -> list[dict]:
+    """Fallback for rendered photo nodes when MAX hides the original URL.
+    Sticker images remain allowed; emoji visual nodes are excluded.
+    """
+    dom_id = str(msg.get("dom_id") or "").strip()
+    if not dom_id:
+        return []
+    out=[]
+    try:
+        card=_strict_message_card_locator(page, msg)
+        if card.count()==0: return []
+        try:
+            card.scroll_into_view_if_needed(timeout=1500)
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+        imgs=card.locator("img, picture img")
+        for i in range(min(imgs.count(),20)):
+            img=imgs.nth(i)
+            try:
+                info=img.evaluate("""el => {
+                    const r=el.getBoundingClientRect();
+                    const parent=el.parentElement;
+                    const attrs={};
+                    for(const a of ['alt','aria-label','title','data-type','data-testid','data-emoji','data-emoji-char','data-sticker','data-codepoint','data-codepoints','data-unicode','data-emoji-id','data-custom-emoji','data-animated-emoji','data-smile','data-character']) attrs[a]=el.getAttribute(a)||'';
+                    const meta=[el.className||'',attrs['data-testid'],attrs['aria-label'],attrs['alt'],attrs['title'],attrs['data-type'],parent?.className||'',parent?.getAttribute?.('data-testid')||''].join(' ').toLowerCase();
+                    return {w:r.width||0,h:r.height||0,nw:el.naturalWidth||0,nh:el.naturalHeight||0,meta,attrs,visible:!!(r.width&&r.height)};
+                }""")
+            except Exception: continue
+            meta=str(info.get('meta') or '')
+            attrs=info.get('attrs') or {}
+            sticker_marker=bool(re.search(r'sticker|стикер',meta,re.I)) or bool(attrs.get('data-sticker'))
+            hint=' '.join(str(v) for v in attrs.values())
+            try:
+                pictographic=bool(re.search(r'[\u2600-\u27BF\U0001F000-\U0001FAFF]',hint))
+            except re.error:
+                pictographic=False
+            rw=max(float(info.get('w') or 0),float(info.get('nw') or 0)); rh=max(float(info.get('h') or 0),float(info.get('nh') or 0));
+            if rw<20 or rh<20: continue
+            if re.search(r'avatar|userpic|profile|favicon|spacer|blank',meta,re.I): continue
+            if not sticker_marker and (re.search(r'emoji|animated.?emoji|эмодзи|emoticon|smiley',meta,re.I) or pictographic): continue
+            if not sticker_marker and max(float(info.get('w') or 0),float(info.get('h') or 0)) <= 48 and not (msg.get('text') or '').strip().replace(' ',''):
+                continue
+            if not sticker_marker and re.search(r'file|document|attachment|download|pdf|docx?|xlsx?|pptx?|zip|rar',meta,re.I): continue
+            try: data=img.screenshot(type='png',animations='disabled',timeout=5000)
+            except Exception as exc:
+                print(f"[{chat_id}] ℹ️ Screenshot фото #{i} не получен: {exc}"); continue
+            if data and len(data)>200:
+                out.append({'url':f'screenshot:{dom_id}:{i}','bytes':data,'type':'image','hash':get_media_hash(data=data),'content_type':'image/png','visual_fallback':True})
+        # Второй fallback для captioned-photo в MAX: иногда фото хранится как CSS background-image
+        # у div/a, а не как <img>. Снимаем только сам визуальный контейнер.
+        try:
+            candidates=card.locator("[style*='background-image' i], [data-image-url], [data-photo-url], [data-media-url]")
+            for i in range(min(candidates.count(),20)):
+                el=candidates.nth(i)
+                try:
+                    info=el.evaluate("""el=>{
+                        const r=el.getBoundingClientRect();
+                        const meta=[el.className||'',el.getAttribute('data-testid')||'',el.getAttribute('aria-label')||'',el.getAttribute('alt')||'',el.getAttribute('title')||'',el.getAttribute('data-type')||''].join(' ').toLowerCase();
+                        return {w:r.width,h:r.height,meta};
+                    }""")
+                    meta=str(info.get('meta') or '')
+                    if float(info.get('w') or 0)<40 or float(info.get('h') or 0)<40: continue
+                    if re.search(r'avatar|userpic|profile|favicon|spacer|blank',meta,re.I): continue
+                    if re.search(r'emoji|animated.?emoji|эмодзи',meta,re.I) and not re.search(r'sticker|стикер',meta,re.I): continue
+                    data=el.screenshot(type='png',animations='disabled',timeout=5000)
+                    if data and len(data)>500:
+                        h=get_media_hash(data=data)
+                        if not any(x.get('hash')==h for x in out):
+                            out.append({'url':f'screenshot-bg:{dom_id}:{i}','bytes':data,'type':'image','hash':h,'content_type':'image/png','visual_fallback':True})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Третий fallback: lazy-photo может быть дочерним img без URL, но картинка уже
+        # реально отрисована. Берём screenshot ближайшего визуального контейнера с img.
+        try:
+            for i in range(min(imgs.count(), 20)):
+                img=imgs.nth(i)
+                try:
+                    info=img.evaluate("""el=>{
+                        const out=[]; let n=el;
+                        for(let d=0; d<4 && n; d++, n=n.parentElement){
+                            const r=n.getBoundingClientRect();
+                            const meta=[n.className||'',n.getAttribute?.('data-testid')||'',n.getAttribute?.('aria-label')||'',n.getAttribute?.('data-type')||''].join(' ').toLowerCase();
+                            out.push({w:r.width||0,h:r.height||0,meta});
+                        }
+                        return out;
+                    }""")
+                    for depth,inf in enumerate(info or []):
+                        w=float(inf.get('w') or 0); h=float(inf.get('h') or 0); meta=str(inf.get('meta') or '')
+                        if w<100 or h<80 or re.search(r'avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи',meta,re.I):
+                            continue
+                        parent=img
+                        for _ in range(depth):
+                            parent=parent.locator("xpath=..")
+                        try:
+                            data=parent.screenshot(type='png',animations='disabled',timeout=5000)
+                        except Exception:
+                            continue
+                        if data and len(data)>500:
+                            hsh=get_media_hash(data=data)
+                            if not any(x.get('hash')==hsh for x in out):
+                                out.append({'url':f'screenshot-parent:{dom_id}:{i}:{depth}','bytes':data,'type':'image','hash':hsh,'content_type':'image/png','visual_fallback':True})
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Fallback screenshot gallery: {exc}")
+    return out
+
+def _read_media_element_bytes(page, msg: dict, expected_type: str, chat_id: int = 0) -> list[dict]:
+    """Read bytes directly from the media element inside this exact MAX card."""
+    try:
+        card = _strict_message_card_locator(page, msg)
+        if card.count() == 0:
+            return []
+        selector = "video" if expected_type == "video_note" else "audio"
+        values = card.locator(selector).evaluate_all("""els => els.map((el,i)=>({
+            i,
+            src: el.currentSrc || el.src || el.getAttribute('src') || '',
+            readyState: el.readyState || 0,
+            duration: Number.isFinite(el.duration) ? el.duration : 0
+        }))""")
+        for item in values[:4]:
+            idx = int(item.get("i") or 0)
+            el = card.locator(selector).nth(idx)
+            try:
+                el.scroll_into_view_if_needed(timeout=1000)
+            except Exception:
+                pass
+            try:
+                result = el.evaluate("""async el => {
+                    const url = el.currentSrc || el.src || el.getAttribute('src') || '';
+                    if (!url) return {url:'',bytes:[],contentType:''};
+                    try {
+                        const r = await fetch(url, {credentials:'include'});
+                        if (!r.ok) return {url,bytes:[],contentType:''};
+                        const b = await r.arrayBuffer();
+                        return {url,bytes:Array.from(new Uint8Array(b)),contentType:r.headers.get('content-type')||''};
+                    } catch(e) {
+                        return {url,bytes:[],contentType:''};
+                    }
+                }""")
+            except Exception:
+                continue
+            data = bytes(result.get("bytes") or [])
+            if len(data) <= 300:
+                continue
+            ct = str(result.get("contentType") or "").lower()
+            ext = ".ogg" if expected_type == "voice" and ("ogg" in ct or "opus" in ct) else (".mp4" if expected_type == "video_note" and ("mp4" in ct or "mpeg" in ct) else (".webm" if "webm" in ct else ".bin"))
+            return [{
+                "url": str(result.get("url") or ""),
+                "bytes": data,
+                "type": expected_type,
+                "filename": ("voice" + ext if expected_type == "voice" else "video_note" + ext),
+                "hash": get_media_hash(data=data),
+                "content_type": ct,
+            }]
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Не удалось прочитать {expected_type} из media-element: {exc}")
+    return []
+
+
+def _activate_media_card(page, msg: dict, chat_id: int = 0, wait_after_click_ms: int = 450) -> None:
+    """Force MAX to materialize lazy voice/video-note sources."""
+    dom_id=str(msg.get('dom_id') or '').strip()
+    if not dom_id: return
+    try:
+        card=_strict_message_card_locator(page, msg)
+        if card.count()==0: return
+        selectors=[
+            "button[aria-label*='видео' i]","[role='button'][aria-label*='видео' i]",
+            "button[aria-label*='video' i]","[role='button'][aria-label*='video' i]",
+            "button[class*='video' i]","[class*='videoCanvas' i]",
+            "[class*='attachAudio' i] button","[class*='attach-audio' i] button",
+            "[class*='audio' i] button","[class*='wave' i] button",
+            "button[aria-label*='воспроизв' i]","[role='button'][aria-label*='воспроизв' i]",
+            "button[aria-label*='слушать' i]","[role='button'][aria-label*='слушать' i]",
+            "button[aria-label*='play' i]","[role='button'][aria-label*='play' i]",
+            "button[title*='воспроизв' i]","[role='button'][title*='воспроизв' i]",
+            "button[title*='слушать' i]","[role='button'][title*='слушать' i]",
+            "button[title*='play' i]","[role='button'][title*='play' i]",
+            "[data-testid*='play' i]","[class~='play' i]","[class*='playButton' i]",
+            'video','audio',
+            "[class*='voice-message' i]","[class*='voice' i]",
+            "[class*='video-note' i]","[class*='videonote' i]","[class*='круж' i]",
+            "[data-testid*='video-note' i]","[data-testid*='voice' i]"
+        ]
+        for sel in selectors:
+            loc=card.locator(sel)
+            for i in range(min(loc.count(),8)):
+                el=loc.nth(i)
+                try:
+                    if not el.is_visible(timeout=200): continue
+                    el.scroll_into_view_if_needed(timeout=1000)
+                    el.click(timeout=1200)
+                    page.wait_for_timeout(wait_after_click_ms)
+                    return
+                except Exception: continue
+        # MAX may expose only the 00:01 duration and make the real play button
+        # a parent element without a useful aria-label. Click the closest
+        # button/role=button inside the SAME already-classified media card.
+        try:
+            clicked = card.evaluate("""card => {
+                const nodes = Array.from(card.querySelectorAll('*'));
+                for (const n of nodes) {
+                    const t = String(n.textContent || '').trim();
+                    if (!/^\d{1,2}:\d{2}$/.test(t)) continue;
+                    let p = n;
+                    for (let d=0; p && d<5; d++, p=p.parentElement) {
+                        if ((p.matches && p.matches('button,[role=\"button\"]')) ||
+                            p.getAttribute?.('data-testid')?.toLowerCase().includes('play')) {
+                            try { p.click(); return true; } catch(e) {}
+                        }
+                    }
+                }
+                return false;
+            }""")
+            if clicked:
+                page.wait_for_timeout(700)
+                return
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Не удалось активировать lazy-media: {exc}")
+
+def _capture_media_after_click(page, msg: dict, expected_type: str, chat_id: int = 0) -> list[dict]:
+    """Capture a freshly fetched audio/video response triggered by MAX play control."""
+    dom_id=str(msg.get('dom_id') or '').strip()
+    if not dom_id: return []
+    captured=[]
+    def on_response(resp):
+        try:
+            ct=str(resp.headers.get('content-type','')).lower()
+            url=str(resp.url or '')
+            body=resp.body()
+            if not body or len(body) <= 300:
+                return
+            parsed_url=urlparse(url)
+            path=(parsed_url.netloc + parsed_url.path)[:180]
+            head=body[:16].hex()
+            if len(captured) < 20 and (
+                any(term in ct for term in ('audio','video','octet-stream','json','binary')) or
+                re.search(r'voice|audio|video|media|attachment|upload|file|message', path, re.I)
+            ):
+                debug_logger.info(
+                    "MAX_MEDIA_RESPONSE chat_id=%s source_id=%s expected=%s status=%s endpoint=%s content_type=%s bytes=%s head=%s",
+                    chat_id, msg.get("source_id") or msg.get("idx"), expected_type,
+                    getattr(resp, "status", "?"), path, ct or "<none>", len(body), head
+                )
+            obvious = ct.startswith('audio/') or ct.startswith('video/') or re.search(
+                r'\.(?:ogg|opus|mp3|m4a|aac|wav|webm|mp4|mov|m4v)(?:[?#]|$)', url, re.I
+            )
+            if not obvious and ('application/octet-stream' in ct or 'binary' in ct or not ct):
+                head=body[:64]
+                signature = (head.startswith(b'OggS') or head.startswith(b'ID3') or
+                             head.startswith(b'RIFF') or b'ftyp' in head[:32] or
+                             head.startswith(b'\x1aE\xdf\xa3'))
+                hinted = bool(re.search(r'voice|audio|video|media|attachment|upload|file|message', url, re.I))
+                # During a click inside an already identified voice/circle card,
+                # MAX often serves valid media as an opaque binary URL.
+                obvious = signature and (hinted or expected_type in ('voice','video_note'))
+            if not obvious:
+                return
+            kind = "audio" if (ct.startswith("audio/") or body.startswith((b"OggS", b"ID3", b"fLaC")) or (body.startswith(b"RIFF") and body[8:12] == b"WAVE")) else (
+                "video" if (ct.startswith("video/") or b"ftyp" in body[:32] or body.startswith(b"\x1aE\xdf\xa3")) else ""
+            )
+            wanted = "audio" if expected_type == "voice" else "video" if expected_type == "video_note" else ""
+            if wanted and kind != wanted:
+                debug_logger.warning(
+                    "MAX_MEDIA_RESPONSE_KIND_MISMATCH chat_id=%s source_id=%s expected=%s detected=%s content_type=%s bytes=%s head=%s",
+                    chat_id, msg.get("source_id") or msg.get("idx"), expected_type,
+                    kind or "unknown", ct or "<none>", len(body), head
+                )
+                return
+            captured.append((url,ct,body))
+        except Exception:
+            pass
+    try:
+        page.on('response',on_response)
+        _activate_media_card(
+            page, msg, chat_id=chat_id,
+            wait_after_click_ms=40 if expected_type == "video_note" else 450,
+        )
+        if expected_type == "video_note":
+            # Do not screen-record MAX's playback canvas: the result is not the
+            # original video note and changes on every parse, defeating dedupe.
+            page.wait_for_timeout(200)
+            if not captured:
+                debug_logger.warning(
+                    "MAX_CANVAS_VIDEO_CAPTURE_SKIPPED chat_id=%s source_id=%s reason=original_video_unavailable",
+                    chat_id, msg.get("source_id") or msg.get("idx"),
+                )
+        else:
+            page.wait_for_timeout(1600)
+    finally:
+        try: page.remove_listener('response',on_response)
+        except Exception: pass
+    out=[]
+    seen_hashes=set()
+    for url,ct,body in captured[-12:]:
+        typ=expected_type if expected_type in ('voice','video_note') else ('voice' if ct.startswith('audio/') else 'video_note' if ct.startswith('video/') else expected_type)
+        ext='.ogg' if typ=='voice' and ('ogg' in ct or 'opus' in ct) else ('.mp4' if typ=='video_note' and ('mp4' in ct or 'mpeg' in ct) else ('.webm' if 'webm' in ct else '.bin'))
+        h=get_media_hash(data=body)
+        if h in seen_hashes: continue
+        seen_hashes.add(h)
+        out.append({'url':url,'bytes':body,'type':typ,'filename':('voice'+ext if typ=='voice' else 'video_note'+ext),'hash':h,'content_type':ct})
+    if expected_type == "voice" and len(out) > 1:
+        wanted_duration = float(msg.get("media_duration_seconds") or 0)
+        if wanted_duration:
+            measured = [(_probe_media_duration(item["bytes"]), item) for item in out]
+            known = [(abs(duration-wanted_duration), item, duration) for duration,item in measured if duration is not None]
+            if known:
+                difference, selected, actual_duration = min(known, key=lambda pair: pair[0])
+                if difference <= max(1.25, wanted_duration*0.75):
+                    debug_logger.warning(
+                        "MAX_MEDIA_CAPTURE_DISAMBIGUATED chat_id=%s source_id=%s candidates=%s wanted_seconds=%.2f selected_seconds=%.2f selected_bytes=%s",
+                        chat_id, msg.get("source_id") or msg.get("idx"), len(out),
+                        wanted_duration, actual_duration, len(selected.get("bytes") or b"")
+                    )
+                    out=[selected]
+    if out:
+        debug_logger.info(
+            "MAX_MEDIA_CAPTURED chat_id=%s source_id=%s expected=%s count=%s types=%s sizes=%s content_types=%s",
+            chat_id, msg.get("source_id") or msg.get("idx"), expected_type, len(out),
+            [item.get("type") for item in out], [len(item.get("bytes") or b"") for item in out],
+            [item.get("content_type") or "<none>" for item in out]
+        )
+    else:
+        debug_logger.warning(
+            "MAX_MEDIA_CAPTURE_EMPTY chat_id=%s source_id=%s expected=%s",
+            chat_id, msg.get("source_id") or msg.get("idx"), expected_type
+        )
+    return out
+
+
+def _extract_live_rich_media(page, msg: dict, chat_id: int = 0) -> list[dict]:
+    """Read live video/audio DOM sources after lazy-loading/activation."""
+    dom_id=str(msg.get('dom_id') or '').strip()
+    if not dom_id: return []
+    out=[]
+    try:
+        card=_strict_message_card_locator(page, msg)
+        if card.count()==0: return []
+        selector=(
+            'video,audio,source,'
+            "[data-video-url],[data-audio-url],[data-voice-url],[data-video-note],[data-voice-message],"
+            "[data-video],[data-audio],[data-voice],[data-media],"
+            "[class*='voice' i],[class*='video-note' i],[class*='videonote' i],[class*='videoMessage' i],"
+            "[class*='videoCanvas' i],[class*='attachAudio' i],[class*='attach-audio' i],"
+            "[class*='waveform' i],[class*='круж' i],[class*='голос' i]"
+        )
+        values=card.locator(selector).evaluate_all("""els=>els.map(el=>{
+            const attrs=['src','current-src','data-video-url','data-audio-url','data-voice-url','data-video-note','data-voice-message','data-video','data-audio','data-voice','data-media','data-url','data-href','data-media-url','data-src','href','data-attachment-url','data-content-url'];
+            let url='';
+            for(const a of attrs){
+                let v=(a==='src'&&typeof el.currentSrc==='string'&&el.currentSrc)?el.currentSrc:(el.getAttribute?el.getAttribute(a):'');
+                if(v&&/^(https?:|blob:)/i.test(v)){url=v;break;}
+            }
+            if(!url&&typeof el.src==='string'&&/^(https?:|blob:)/i.test(el.src)) url=el.src;
+            let meta=[el.className||'',el.getAttribute?.('data-testid')||'',el.getAttribute?.('aria-label')||'',el.getAttribute?.('data-type')||'',el.getAttribute?.('role')||''];
+            let parent=el.parentElement;
+            for(let d=0;parent&&d<4;d++,parent=parent.parentElement){
+                meta.push(parent.className||'',parent.getAttribute?.('data-testid')||'',parent.getAttribute?.('aria-label')||'',parent.getAttribute?.('data-type')||'');
+                if(!url){for(const a of attrs){const v=parent.getAttribute?parent.getAttribute(a):''; if(v&&/^(https?:|blob:)/i.test(v)){url=v;break;}}}
+            }
+            if(!url&&el.querySelectorAll){for(const s of el.querySelectorAll('source')){const v=s.src||s.getAttribute('src')||s.getAttribute('data-src')||'';if(/^(https?:|blob:)/i.test(v)){url=v;break;}}}
+            const r=el.getBoundingClientRect?el.getBoundingClientRect():{width:0,height:0};
+            return {url,meta:meta.join(' '),tag:(el.tagName||'').toLowerCase(),width:r.width||0,height:r.height||0};
+        }).filter(x=>x.url)""")
+        seen=set()
+        for item in values:
+            url=str(item.get('url') or '').strip()
+            if not url or url in seen: continue
+            seen.add(url)
+            low=str(item.get('meta') or '').lower()
+            w=float(item.get('width') or 0); h=float(item.get('height') or 0)
+            square=item.get('tag') in ('video','canvas') and w>20 and h>20 and abs(w-h)<=24
+            if re.search(r'video.?note|videonote|video[_ -]?message|кружок|circle|round.?video|roundvideo',low,re.I) or square: typ='video_note'
+            elif re.search(r'voice|voice.?message|voice_message|attach.?audio|waveform|голосов(?:ое|ая|ым|ого)|аудиосообщ',low,re.I): typ='voice'
+            elif item.get('tag')=='video': typ='video'
+            else: typ='audio'
+            media=_download_document_to_memory(page=page,context=page.context,url=url,filename='',chat_id=chat_id,media_type=typ)
+            if media and media.get('bytes'):
+                media['type']=typ; out.append(media)
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Live rich-media fallback: {exc}")
+    return out
+
+
+def _normalize_contact_phone(value: str, allow_bare: bool = False) -> str:
+    """Accept actual phone-shaped values and reject short MAX user identifiers."""
+    raw = unquote(str(value or "")).replace("%2B", "+").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not 10 <= len(digits) <= 15:
+        return ""
+    if not allow_bare and not raw.startswith("+") and not re.search(r"[\s().-]", raw):
+        return ""
+    return ("+" if raw.startswith("+") else "") + digits
+
+
+def _phone_from_labeled_text(value: str) -> str:
+    text = str(value or "")
+    candidate = r"(\+?\d[\d\s().-]{8,}\d)"
+    labeled = re.search(
+        rf"(?:phone(?:\s*number)?|mobile(?:\s*phone)?|telephone|tel|msisdn|телефон|мобильный)\s*[:=]?\s*{candidate}",
+        text,
+        re.I,
+    )
+    if labeled:
+        phone = _normalize_contact_phone(labeled.group(1), allow_bare=True)
+        if phone:
+            return phone
+    for match in re.finditer(r"(?<!\w)\+?\d[\d\s().-]{8,}\d(?!\w)", text):
+        phone = _normalize_contact_phone(match.group(0))
+        if phone:
+            return phone
+    return ""
+
+
+def _phone_from_contact_payload(value) -> str:
+    """Read phone fields from MAX JSON/vCard without mistaking adjacent IDs for phones."""
+    if isinstance(value, (bytes, bytearray)):
+        text = bytes(value).decode("utf-8", "ignore")
+    else:
+        text = str(value or "")
+    phone_keys = {
+        "phone", "phonenumber", "contactphone", "userphone", "telephone",
+        "tel", "mobile", "mobilephone", "msisdn", "dataphone",
+        "datacontactphone", "datauserphone", "datamobile", "dataphonenumber",
+    }
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+
+    def scan(item):
+        if isinstance(item, dict):
+            for key, raw in item.items():
+                normalized_key = re.sub(r"[^a-z]", "", str(key).lower())
+                if normalized_key in phone_keys and isinstance(raw, (str, int, float)):
+                    phone = _normalize_contact_phone(str(raw), allow_bare=True)
+                    if phone:
+                        return phone
+            for raw in item.values():
+                phone = scan(raw)
+                if phone:
+                    return phone
+        elif isinstance(item, list):
+            for raw in item:
+                phone = scan(raw)
+                if phone:
+                    return phone
+        return ""
+
+    phone = scan(payload)
+    if phone:
+        return phone
+    field_pattern = re.compile(
+        r"[\"']?(?:data[-_])?(?:phone(?:number)?|contactphone|userphone|telephone|tel|mobile(?:phone)?|msisdn)"
+        r"[\"']?\s*[:=]\s*[\"']?(\+?\d[\d\s().-]{8,}\d)",
+        re.I,
+    )
+    match = field_pattern.search(text)
+    if match:
+        phone = _normalize_contact_phone(match.group(1), allow_bare=True)
+        if phone:
+            return phone
+    vcard = re.search(r"TEL(?:;[^:\r\n]*)?:\s*(?:tel:)?([+\d][\d ()+.-]{8,}\d)", text, re.I)
+    return _normalize_contact_phone(vcard.group(1), allow_bare=True) if vcard else ""
+
+
+def _resolve_contact_phone_from_card(page, msg: dict, chat_id: int = 0, group_url: str = "") -> str:
+    """Ищет номер только в явно распознанной карточке контакта."""
+    dom_id=str(msg.get("dom_id") or "").strip()
+    if not dom_id: return ""
+    def norm(v, allow_bare=False): return _normalize_contact_phone(v, allow_bare=allow_bare)
+    def scan_scope(scope):
+        try:
+            info=scope.evaluate("""el=>{
+                const fields=[];
+                for(const n of [el,...Array.from(el.querySelectorAll('*'))]){
+                    for(const a of Array.from(n.attributes||[])){
+                        const key=String(a.name||'').toLowerCase();
+                        if(/(?:^|[-_])(phone|telephone|tel|mobile|msisdn)(?:$|[-_])/.test(key) && !/(^|[-_])(?:id|identifier)(?:$|[-_])/.test(key)) fields.push(a.value||'');
+                    }
+                }
+                const links=Array.from(el.querySelectorAll("a[href^='tel:' i],[href^='tel:' i]")).map(a=>a.getAttribute('href')||'');
+                return {fields,links,text:el.innerText||el.textContent||''};
+            }""")
+            for value in (info or {}).get('fields',[]):
+                phone=norm(value,allow_bare=True)
+                if phone: return phone
+            for href in (info or {}).get('links',[]):
+                m=re.search(r'tel:([^?#]+)',str(href),re.I)
+                if m:
+                    phone=norm(m.group(1),allow_bare=True)
+                    if phone: return phone
+            phone=_phone_from_labeled_text((info or {}).get('text',''))
+            if phone: return phone
+        except Exception:
+            pass
+        return ''
+    try:
+        card=_strict_message_card_locator(page, msg)
+        if card.count()==0: return ''
+        phone=scan_scope(card)
+        if phone: return phone
+
+        # Самый надёжный доступ в web MAX к данным контакта — штатная кнопка
+        # "Перейти к диалогу" внутри уже подтверждённой contact-card. Никаких
+        # кликов по медиа/аудио здесь нет.
+        try:
+            dialog_btn = card.locator(
+                "button[aria-label*='Перейти к диалогу' i],"
+                "[role='button'][aria-label*='Перейти к диалогу' i],"
+                "button[title*='Перейти к диалогу' i],"
+                "button:has-text('Перейти к диалогу'),"
+                "[role='button']:has-text('Перейти к диалогу'),"
+                "button[aria-label*='open chat' i],"
+                "[role='button'][aria-label*='open chat' i],"
+                "button[aria-label*='go to conversation' i],"
+                "[role='button'][aria-label*='go to conversation' i],"
+                "button[title*='go to conversation' i],"
+                "button:has-text('Go to conversation'),"
+                "[role='button']:has-text('Go to conversation')"
+            ).first
+            if dialog_btn.count() and dialog_btn.is_visible(timeout=300):
+                old_url = page.url
+                captured_api = []
+                def on_contact_response(resp):
+                    try:
+                        u=str(resp.url or '')
+                        ct=str(resp.headers.get('content-type','')).lower()
+                        if ('json' not in ct and 'vcard' not in ct and 'contact' not in ct
+                                and 'api' not in u.lower() and 'graphql' not in u.lower()
+                                and 'contact' not in u.lower() and 'vcard' not in u.lower()):
+                            return
+                        if resp.status >= 400:
+                            return
+                        body=resp.body()
+                        if body and len(body) < 2_000_000:
+                            low=body.lower()
+                            if any(k in low for k in (b'phone', b'tel', b'mobile', b'telephone', b'msisdn', b'vcard')):
+                                captured_api.append(body)
+                    except Exception:
+                        pass
+                try: page.on('response', on_contact_response)
+                except Exception: pass
+                try:
+                    dialog_btn.scroll_into_view_if_needed(timeout=1000)
+                    dialog_btn.click(timeout=2500)
+                    page.wait_for_timeout(1800)
+                finally:
+                    try: page.remove_listener('response', on_contact_response)
+                    except Exception: pass
+
+                phone_from_api=''
+                for raw in captured_api:
+                    try:
+                        phone_from_api=_phone_from_contact_payload(raw)
+                        if phone_from_api: break
+                    except Exception:
+                        continue
+                if phone_from_api:
+                    try:
+                        if group_url and page.url != group_url:
+                            page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                            page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                    return phone_from_api
+
+                # 0) Некоторые сборки MAX меняют содержимое SPA без смены URL.
+                # Сразу сканируем body, но только после нажатия кнопки контакта.
+                try:
+                    body_text = page.locator("body").inner_text(timeout=1000)
+                    phone = _phone_from_labeled_text(str(body_text or ""))
+                    if phone:
+                        if phone:
+                            if group_url and page.url != group_url:
+                                try:
+                                    page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                                    page.wait_for_timeout(500)
+                                except Exception: pass
+                            return phone
+                except Exception:
+                    pass
+
+                # Открываем информацию о человеке в 1:1 чате, если она представлена
+                # отдельной кнопкой/аватаром.
+                try:
+                    name_hint = str(msg.get('contact_name') or (msg.get('contact') or {}).get('first_name') or '').strip()
+                    controls = page.locator("button, [role='button'], a")
+                    for ci in range(min(120, controls.count())):
+                        el = controls.nth(ci)
+                        try:
+                            if not el.is_visible(timeout=80): continue
+                            label = ((el.get_attribute('aria-label') or '')+' '+(el.get_attribute('title') or '')+' '+(el.inner_text(timeout=100) or '')).strip()
+                            low = label.lower()
+                            if not re.search(r'профил|profile|информац|information|details|подробнее|о пользовател|contact', low):
+                                if name_hint and name_hint.lower() not in low:
+                                    continue
+                            if re.search(r'назад|back|закрыть|close|вызов|call|video|микроф', low): continue
+                            el.click(timeout=1000)
+                            page.wait_for_timeout(500)
+                            phone = scan_scope(page.locator("body"))
+                            if phone:
+                                if group_url and page.url != group_url:
+                                    try:
+                                        page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                                        page.wait_for_timeout(500)
+                                    except Exception: pass
+                                return phone
+                            try: page.keyboard.press('Escape')
+                            except Exception: pass
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # 1) Видимые окна/панели.
+                scopes = page.locator(
+                    "[role='dialog'], [class*='drawer' i], [class*='profile' i],"
+                    "[class*='user-card' i], [class*='chat-info' i]"
+                )
+                for i in range(max(0, scopes.count()-12), scopes.count()):
+                    sc=scopes.nth(i)
+                    try:
+                        if not sc.is_visible(timeout=150): continue
+                        phone=scan_scope(sc)
+                        if phone:
+                            if group_url and page.url != group_url:
+                                try:
+                                    page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                                    page.wait_for_timeout(500)
+                                except Exception: pass
+                            return phone
+                    except Exception: continue
+
+                # 2) Если кнопка перевела в отдельный 1:1 диалог — ищем номер
+                # только при реально изменившемся route либо внутри открытого окна.
+                if page.url != old_url:
+                    phone = scan_scope(page.locator("body"))
+                    if not phone:
+                        phone = _phone_from_contact_payload(page.content())
+                    if phone:
+                        if group_url:
+                            try:
+                                page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                                page.wait_for_timeout(500)
+                            except Exception: pass
+                        return phone
+
+                    # Открываем профиль/информацию только в этом 1:1 диалоге.
+                    controls=page.locator("button[aria-label], [role='button'][aria-label], button[title], [role='button'][title]")
+                    for i in range(min(80, controls.count())):
+                        el=controls.nth(i)
+                        try:
+                            if not el.is_visible(timeout=80): continue
+                            a=((el.get_attribute('aria-label') or '')+' '+(el.get_attribute('title') or '')).lower()
+                            if not re.search(r'профил|profile|информац|information|info|подробнее|details|о пользовател',a): continue
+                            el.click(timeout=1200)
+                            page.wait_for_timeout(400)
+                            scopes=page.locator("[role='dialog'], [class*='modal' i], [class*='drawer' i], [class*='profile' i]")
+                            for j in range(max(0,scopes.count()-8), scopes.count()):
+                                sc=scopes.nth(j)
+                                try:
+                                    if sc.is_visible(timeout=100):
+                                        phone=scan_scope(sc)
+                                        if phone:
+                                            if group_url and page.url != group_url:
+                                                try:
+                                                    page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                                                    page.wait_for_timeout(500)
+                                                except Exception: pass
+                                            return phone
+                                except Exception: continue
+                            try: page.keyboard.press('Escape')
+                            except Exception: pass
+                        except Exception: continue
+        except Exception:
+            pass
+
+        # Открываем только имя/карточку уже подтверждённого контакта.
+        name_hint=str(msg.get('contact_name') or (msg.get('contact') or {}).get('first_name') or '').strip()
+        sels=["[data-contact-name]","[data-display-name]","[data-testid*='contact-name' i]","[class*='contact-name' i]","[class*='display-name' i]",".name"]
+        clicked=False
+        for sel in sels:
+            loc=card.locator(sel)
+            for i in range(min(loc.count(),10)):
+                el=loc.nth(i)
+                try:
+                    if not el.is_visible(timeout=200): continue
+                    txt=' '.join((el.inner_text(timeout=200) or '').split()).strip()
+                    if name_hint and name_hint.lower() not in txt.lower(): continue
+                    aria=((el.get_attribute('aria-label') or '')+' '+(el.get_attribute('title') or '')).lower()
+                    if re.search(r'call|позвон|video|видео|mic|микрофон',aria): continue
+                    el.click(timeout=1500); clicked=True; break
+                except Exception: continue
+            if clicked: break
+        if clicked:
+            page.wait_for_timeout(600)
+            scopes=page.locator("[role='dialog'],[class*='modal' i],[class*='drawer' i],[class*='profile' i]")
+            for i in range(max(0,scopes.count()-8),scopes.count()):
+                sc=scopes.nth(i)
+                try:
+                    if not sc.is_visible(timeout=200): continue
+                    phone=scan_scope(sc)
+                    if phone:
+                        try: page.keyboard.press('Escape')
+                        except Exception: pass
+                        return phone
+                except Exception: continue
+            try: page.keyboard.press('Escape')
+            except Exception: pass
+        # Узкий HTML fallback: ключ phone рядом с именем контакта.
+        html=page.content()
+        if name_hint:
+            pos=html.lower().find(name_hint.lower())
+            if pos>=0:
+                window=html[max(0,pos-10000):min(len(html),pos+20000)]
+                phone=_phone_from_contact_payload(window)
+                if phone: return phone
+        if group_url and page.url != group_url:
+            try:
+                page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                page.wait_for_timeout(500)
+            except Exception: pass
+        return ''
+    except Exception as exc:
+        print(f"[{chat_id}] ℹ️ Не удалось получить номер контакта: {exc}")
+        if group_url:
+            try:
+                if page.url != group_url:
+                    page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                    page.wait_for_timeout(500)
+            except Exception: pass
+        return ''
+
+
+def _resolve_contact_link_via_dialog(page, msg: dict, group_url: str, chat_id: int = 0) -> str:
+    """Для подтверждённого контакта нажимает ровно 'Перейти к диалогу',
+    затем ищет share-link /c/ в открытом диалоге/профиле и возвращается в группу.
+    """
+    dom_id=str(msg.get('dom_id') or '').strip()
+    if not dom_id or not group_url:
+        return ''
+    pat=re.compile(r"https?://max\.ru/c/[^\s\"'<>]+", re.I)
+    try:
+        card=_message_card_locator(page, msg)
+        if card.count()==0: return ''
+        btn=card.locator("button[aria-label*='Перейти к диалогу' i], [role='button'][aria-label*='Перейти к диалогу' i]").first
+        if btn.count()==0 or not btn.is_visible(timeout=300): return ''
+        try: btn.scroll_into_view_if_needed(timeout=1000)
+        except Exception: pass
+        btn.click(timeout=2500)
+        page.wait_for_timeout(1200)
+        # Прямой поиск /c/ на странице/в атрибутах.
+        try:
+            vals=page.locator("a[href], [data-url], [data-href], [data-link], [data-share-url], [data-profile-url]").evaluate_all("""els=>els.flatMap(el=>[el.getAttribute('href')||'',el.getAttribute('data-url')||'',el.getAttribute('data-href')||'',el.getAttribute('data-link')||'',el.getAttribute('data-share-url')||'',el.getAttribute('data-profile-url')||''])""")
+            for v in vals:
+                m=pat.search(str(v or ''))
+                if m: return m.group(0)
+        except Exception: pass
+        try:
+            m=pat.search(page.content())
+            if m: return m.group(0)
+        except Exception: pass
+        # Попытка открыть только профиль/info в новом диалоге.
+        controls=page.locator("button[aria-label], [role='button'][aria-label], button[title], [role='button'][title]")
+        for i in range(min(70,controls.count())):
+            el=controls.nth(i)
+            try:
+                if not el.is_visible(timeout=100): continue
+                a=((el.get_attribute('aria-label') or '')+' '+(el.get_attribute('title') or '')).lower()
+                if not re.search(r'профил|profile|информац|information|info|подробнее|details',a): continue
+                el.click(timeout=1200); page.wait_for_timeout(500)
+                m=pat.search(page.content())
+                if m: return m.group(0)
+                try: page.keyboard.press('Escape')
+                except Exception: pass
+            except Exception: continue
+        return ''
+    except Exception as e:
+        print(f"[{chat_id}] ℹ️ Не удалось открыть диалог контакта: {e}")
+        return ''
+    finally:
+        try:
+            if page.url != group_url:
+                page.goto(group_url, timeout=30000, wait_until='domcontentloaded')
+                page.wait_for_timeout(1000)
+        except Exception: pass
+
 def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
+    debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
     if not isinstance(chat_id, int):
         raise Exception(f"Некорректный chat_id: {chat_id} (должен быть int)")
     session_file = f"{SESSIONS_DIR}/{chat_id}.json"
     if not os.path.exists(session_file):
         raise Exception("NO_SESSION")
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-    )
-    context = browser.new_context(
-        storage_state=session_file,
-        viewport={"width": 1280, "height": 800},
-    )
-    page = context.new_page()
+    pw = browser = context = page = None
     try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            storage_state=session_file,
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
+        _install_max_media_response_cache(page, chat_id)
         print(f"[{chat_id}] Переход на главную MAX...")
-        page.goto("https://web.max.ru", timeout=60000, wait_until="domcontentloaded")
+        _goto_max_with_retry(page, "https://web.max.ru", chat_id, "главная страница MAX")
         page.wait_for_timeout(3000)
         if not _is_logged_in(page):
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"SESSION_EXPIRED|{debug_path}")
-        page.goto(group_url, timeout=60000, wait_until="domcontentloaded")
+        _goto_max_with_retry(page, group_url, chat_id, "переход в чат MAX")
         page.wait_for_timeout(4000)
         current_url = page.url
         if group_url not in current_url:
@@ -911,16 +2931,45 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"EMPTY_PAGE|{debug_path}")
-        print(f"[{chat_id}] Ожидание загрузки изображений...")
-        for _ in range(40):
+        debug_logger.info("MAX_CHAT_OPENED chat_id=%s route=%s", chat_id, urlparse(current_url).path)
+        print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
+        try:
             page.keyboard.press("End")
-            page.wait_for_timeout(200)
-        page.wait_for_timeout(2000)
+            page.wait_for_timeout(700)
+            last_marker=""
+            stable=0
+            for _ in range(12):
+                page.wait_for_timeout(250)
+                try:
+                    marker=page.locator(".item").last.evaluate("""el => ({
+                        id: el.getAttribute('data-message-id') || el.getAttribute('data-mid') || el.getAttribute('data-id') || '',
+                        index: el.getAttribute('data-index') || '', text: (el.innerText||'').slice(0,180)
+                    })""")
+                    marker_key=json.dumps(marker,ensure_ascii=False,sort_keys=True)
+                except Exception:
+                    marker_key=""
+                if marker_key and marker_key==last_marker: stable+=1
+                else: stable=0
+                last_marker=marker_key
+                if stable>=2: break
+            page.evaluate("""async maxMessagesToParse => {
+                const allRows=Array.from(document.querySelectorAll('.item'));
+                const rowLimit=Math.max(0,Math.floor(Number(maxMessagesToParse)||0));
+                const rows=rowLimit ? allRows.slice(-rowLimit) : [];
+                for(const row of rows){try{row.scrollIntoView({block:'center',inline:'nearest'});}catch(e){} await new Promise(r=>setTimeout(r,45));}
+                window.scrollTo(0,document.body.scrollHeight);
+            }""", MAX_MESSAGES_TO_PARSE)
+            page.wait_for_timeout(700)
+        except Exception as e:
+            print(f"[{chat_id}] ⚠️ Не удалось загрузить/прогреть последние сообщения: {e}")
         raw_messages = page.evaluate(
             r"""
-            () => {
+            maxMessagesToParse => {
                 const results = [];
-                const rows = Array.from(document.querySelectorAll('.item[data-index]'));
+                const allRows = Array.from(document.querySelectorAll('.item'));
+                const rowLimit = Math.max(0, Math.floor(Number(maxMessagesToParse) || 0));
+                const firstSelectedIndex = Math.max(0, allRows.length - rowLimit);
+                const rows = rowLimit ? allRows.slice(firstSelectedIndex) : [];
 
                 function clean(value) {
                     return String(value || "")
@@ -942,7 +2991,10 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     if (!el) return "";
                     const attrs = [
                         "href", "src", "currentSrc", "data-url", "data-href",
-                        "data-download-url", "data-file-url", "data-src", "data-link"
+                        "data-download-url", "data-file-url", "data-src", "data-link",
+                        "data-media-url", "data-video-url", "data-audio-url", "data-voice-url",
+                        "data-video", "data-audio", "data-voice", "data-media", "data-voice-message",
+                        "data-video-note", "data-content-url", "data-attachment-url", "data-original", "data-original-src"
                     ];
                     for (const attr of attrs) {
                         let value = "";
@@ -963,15 +3015,12 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                             return value;
                         }
                     }
-                    // MAX иногда отдаёт href как нестандартный объект.
+                    // MAX/Chromium может держать реальный media URL только как DOM property.
+                    const mediaProperty = (typeof el.src === "string" ? el.src : "") ||
+                                          (typeof el.currentSrc === "string" ? el.currentSrc : "");
+                    if (/^(?:https?:|blob:)/i.test(mediaProperty)) return mediaProperty;
                     const propertyHref = typeof el.href === "string" ? el.href : "";
-                    if (
-                        propertyHref.startsWith("http://") ||
-                        propertyHref.startsWith("https://") ||
-                        propertyHref.startsWith("blob:")
-                    ) {
-                        return propertyHref;
-                    }
+                    if (/^(?:https?:|blob:)/i.test(propertyHref)) return propertyHref;
                     return "";
                 }
 
@@ -1043,175 +3092,309 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 }
 
                 function getTime(row) {
+                    // Берём только время сообщения из meta. Нельзя использовать любой
+                    // [class*=time]: у кружка/видео там часто находится ДЛИТЕЛЬНОСТЬ.
                     const selectors = [
                         ".bubbleContent .meta .text",
+                        ".bubbleContent .meta time",
                         ".meta .text",
-                        '[class*="time" i]'
+                        ".meta time",
+                        "time[datetime]"
                     ];
                     for (const selector of selectors) {
                         try {
                             const element = row.querySelector(selector);
                             if (!element) continue;
-                            const value = clean(element.textContent);
-                            const match = value.match(/\b\d{1,2}:\d{2}\s*(?:AM|PM)?\b/i);
+                            const visibleValue = clean(element.textContent);
+                            const datetimeValue = safeAttr(element, "datetime");
+                            const value = visibleValue || clean(datetimeValue);
+                            if (!visibleValue && /^\d{4}-\d{2}-\d{2}T/.test(datetimeValue)) {
+                                const absoluteTime = new Date(datetimeValue);
+                                if (!Number.isNaN(absoluteTime.getTime())) {
+                                    return `${String(absoluteTime.getHours()).padStart(2,"0")}:${String(absoluteTime.getMinutes()).padStart(2,"0")}`;
+                                }
+                            }
+                            const match = value.match(/\b(\d{1,2}:\d{2})(?:\s*(AM|PM))?\b/i);
                             if (match) return match[0].trim();
                         } catch (e) {}
                     }
+                    // Fallback: ищем timestamp/time в атрибутах meta, но не duration.
+                    try {
+                        const nodes = row.querySelectorAll("[data-time],[data-timestamp],[data-created-at],[datetime]");
+                        for (const el of nodes) {
+                            const v = safeAttr(el,"data-time") || safeAttr(el,"data-timestamp") || safeAttr(el,"data-created-at") || safeAttr(el,"datetime");
+                            if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
+                                const isoDate = new Date(v);
+                                if (!Number.isNaN(isoDate.getTime())) return `${String(isoDate.getHours()).padStart(2,"0")}:${String(isoDate.getMinutes()).padStart(2,"0")}`;
+                            }
+                            const m = String(v).match(/\b(\d{1,2}:\d{2})(?:\s*(AM|PM))?\b/i);
+                            if (m) return m[0];
+                            const n = Number(v);
+                            if (Number.isFinite(n) && n > 1000000000) {
+                                const d = new Date(n < 10000000000 ? n * 1000 : n);
+                                if (!Number.isNaN(d.getTime())) return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+                            }
+                        }
+                    } catch(e) {}
                     return "";
                 }
 
                 function getDate(row) {
-                    // Определяем дату сообщения по РЕАЛЬНОМУ разделителю дня в DOM.
-                    // В MAX дата часто находится не внутри .item сообщения, а отдельным
-                    // элементом между сообщениями. Поэтому искать её только в row или
-                    // у ближайших siblings недостаточно.
                     const months = {
-                        "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-                        "мая": 5, "июня": 6, "июля": 7, "августа": 8,
-                        "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+                        "января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
+                        "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12,
+                        "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                        "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+                        "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12
+                    };
+                    const withDateSource = (value, source) => {
+                        try { row.setAttribute("data-max-parser-date-source", source); } catch(e) {}
+                        return value;
                     };
 
-                    function localDateString(d) {
-                        return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}.${d.getFullYear()}`;
-                    }
-
-                    function fromTimestamp(value) {
-                        if (value === null || value === undefined || value === "") return "";
-                        const raw = String(value).trim();
-                        if (!/^\d{10,13}$/.test(raw)) return "";
-                        let n = Number(raw);
-                        if (!Number.isFinite(n)) return "";
-                        if (raw.length === 10) n *= 1000;
-                        const d = new Date(n);
-                        if (Number.isNaN(d.getTime())) return "";
-                        return localDateString(d);
-                    }
-
-                    function normalizeDate(value) {
+                    function dateText(value) {
                         const text = clean(value);
-                        if (!text) return "";
-
-                        // Сначала проверяем явные календарные даты.
-                        let match = text.match(/\b(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})\b/);
-                        if (match) {
-                            return `${match[1].padStart(2, "0")}.${match[2].padStart(2, "0")}.${match[3]}`;
+                        if (!text || text.length > 40) return "";
+                        let m = text.match(/^\s*(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})\s*$/);
+                        if (m) return `${m[1].padStart(2,"0")}.${m[2].padStart(2,"0")}.${m[3]}`;
+                        if (/^\d{4}-\d{2}-\d{2}T/.test(text)) {
+                            const absoluteDate = new Date(text);
+                            if (!Number.isNaN(absoluteDate.getTime())) return `${String(absoluteDate.getDate()).padStart(2,"0")}.${String(absoluteDate.getMonth()+1).padStart(2,"0")}.${absoluteDate.getFullYear()}`;
                         }
-
-                        match = text.match(/\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?\b/i);
-                        if (match) {
-                            const year = match[3] || String(new Date().getFullYear());
-                            return `${match[1].padStart(2, "0")}.${String(months[match[2].toLowerCase()]).padStart(2, "0")}.${year}`;
-                        }
-
-                        const iso = text.match(/\b(\d{4})-(\d{2})-(\d{2})(?:[T\s]|$)/);
-                        if (iso) return `${iso[3]}.${iso[2]}.${iso[1]}`;
-
+                        m = text.match(/^\s*(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?\s*$/i);
+                        if (m) return `${m[1].padStart(2,"0")}.${String(months[m[2].toLowerCase()]).padStart(2,"0")}.${m[3] || new Date().getFullYear()}`;
+                        m = text.match(/^\s*(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:,?\s+(\d{4}))?\s*$/i);
+                        if (m) return `${m[1].padStart(2,"0")}.${String(months[m[2].toLowerCase()]).padStart(2,"0")}.${m[3] || new Date().getFullYear()}`;
+                        m = text.match(/^\s*(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:,?\s+(\d{4}))?\s*$/i);
+                        if (m) return `${String(m[2]).padStart(2,"0")}.${String(months[m[1].toLowerCase()]).padStart(2,"0")}.${m[3] || new Date().getFullYear()}`;
+                        m = text.match(/^\s*(\d{4})-(\d{2})-(\d{2})(?:T.*)?\s*$/);
+                        if (m) return `${m[3]}.${m[2]}.${m[1]}`;
                         if (/^(сегодня|today)$/i.test(text)) {
-                            return localDateString(new Date());
+                            const d = new Date(); return `${String(d.getDate()).padStart(2,"0")}.${String(d.getMonth()+1).padStart(2,"0")}.${d.getFullYear()}`;
                         }
-
                         if (/^(вчера|yesterday)$/i.test(text)) {
-                            const d = new Date();
-                            d.setDate(d.getDate() - 1);
-                            return localDateString(d);
+                            const d = new Date(); d.setDate(d.getDate()-1);
+                            return `${String(d.getDate()).padStart(2,"0")}.${String(d.getMonth()+1).padStart(2,"0")}.${d.getFullYear()}`;
                         }
-
-                        // Timestamp используем только для атрибутов, а не для обычного
-                        // текста. Это предотвращает случайное превращение data-index в дату.
-                        const timestampDate = fromTimestamp(text);
-                        if (timestampDate) return timestampDate;
-
+                        const numeric = Number(text);
+                        if (Number.isFinite(numeric) && numeric >= 1000000000 && numeric <= 2000000000000) {
+                            const d = new Date(numeric < 10000000000 ? numeric * 1000 : numeric);
+                            if (!Number.isNaN(d.getTime())) return `${String(d.getDate()).padStart(2,"0")}.${String(d.getMonth()+1).padStart(2,"0")}.${d.getFullYear()}`;
+                        }
                         return "";
                     }
 
-                    // 1. Если дата действительно записана в самой карточке сообщения —
-                    // используем её.
-                    const ownCandidates = [];
-                    const attrs = [
-                        "data-date", "data-day", "datetime", "data-timestamp",
-                        "data-created-at", "title", "aria-label"
-                    ];
-
-                    function collectAttributes(element, target) {
-                        if (!element) return;
-                        for (const attr of attrs) {
-                            try {
-                                const value = safeAttr(element, attr);
-                                if (value) target.push(value);
-                            } catch (e) {}
+                    // Абсолютная метка времени конкретного сообщения точнее общего
+                    // date-separator ленты: после подгрузки истории separator может
+                    // относиться к соседнему дню или остаться от виртуализированной карточки.
+                    const absoluteTimestampFallback = [];
+                    const addAbsoluteTimestamp = value => {
+                        const text = String(value || "").trim();
+                        if (/^\d{4}-\d{2}-\d{2}T/.test(text) || /^\d{10,13}$/.test(text)) {
+                            absoluteTimestampFallback.push(text);
                         }
-                    }
-
-                    collectAttributes(row, ownCandidates);
-
+                    };
+                    ["datetime","data-timestamp","data-created-at","data-time"].forEach(a => {
+                        addAbsoluteTimestamp(safeAttr(row,a));
+                    });
                     try {
-                        row.querySelectorAll("time[datetime], [data-date], [data-day], [datetime], [data-timestamp], [data-created-at]").forEach(el => {
-                            collectAttributes(el, ownCandidates);
-                            const text = clean(el.textContent);
-                            if (text) ownCandidates.push(text);
+                        row.querySelectorAll("time[datetime],[data-timestamp],[data-created-at],[data-time]").forEach(el => {
+                            ["datetime","data-timestamp","data-created-at","data-time"].forEach(a => {
+                                addAbsoluteTimestamp(safeAttr(el,a));
+                            });
                         });
-                    } catch (e) {}
-
-                    for (const value of ownCandidates) {
-                        const parsed = normalizeDate(value);
-                        if (parsed) return parsed;
+                    } catch(e) {}
+                    for (const v of absoluteTimestampFallback) {
+                        const d = dateText(v);
+                        if (d) return withDateSource(d,"message_timestamp");
                     }
 
-                    // 2. Основной способ: один раз строим карту разделителей дней.
-                    // Берём только элементы, чей СОБСТВЕННЫЙ текст является датой.
-                    // Текст всей карточки сообщения здесь никогда не рассматривается.
+                    // Some MAX builds place the date capsule inside the .item, while
+                    // its data-date attribute can describe a stale recycled element.
+                    try {
+                        for (const el of row.querySelectorAll('[class*="date" i],[class*="day" i],[class*="capsule" i]')) {
+                            if (el.closest && el.closest(".bubbleContent")) continue;
+                            const rect=el.getBoundingClientRect();
+                            const style=getComputedStyle(el);
+                            if(!rect.width||!rect.height||style.display==="none"||style.visibility==="hidden") continue;
+                            const d=dateText(clean(el.textContent));
+                            if (d) return withDateSource(d,"message_date_capsule");
+                        }
+                    } catch(e) {}
+
+                    // Prefer the closest visible timeline separator over generic
+                    // row attributes, which React can leave behind when recycling
+                    // the last message card.
+                    try {
+                        let capsuleFeed=row.parentElement;
+                        for(let i=0;capsuleFeed&&i<10;i++,capsuleFeed=capsuleFeed.parentElement){
+                            if(capsuleFeed.querySelectorAll(".item").length>=3) break;
+                        }
+                        if(capsuleFeed){
+                            const rowTop=row.getBoundingClientRect().top;
+                            let nearestCapsule=null,nearestCapsuleTop=-Infinity;
+                            capsuleFeed.querySelectorAll("*").forEach(el=>{
+                                if(row.contains(el)||el.closest?.(".bubbleContent")) return;
+                                const value=clean(el.textContent);
+                                const parsed=dateText(value);
+                                if(!parsed||value.length>40) return;
+                                let rect,style;
+                                try{style=getComputedStyle(el);if(style.position==="fixed"||style.position==="sticky"||style.display==="none"||style.visibility==="hidden")return;rect=el.getBoundingClientRect();if(!rect.width||!rect.height)return;}catch(e){return;}
+                                if(el.parentElement&&clean(el.parentElement.textContent)===value) return;
+                                try{
+                                    const pos=el.compareDocumentPosition(row);
+                                    if(!(pos&Node.DOCUMENT_POSITION_FOLLOWING)) return;
+                                    if(rect.bottom<=rowTop+4&&rect.top>nearestCapsuleTop){
+                                        nearestCapsule={date:parsed};nearestCapsuleTop=rect.top;
+                                    }
+                                }catch(e){}
+                            });
+                            if(nearestCapsule) return withDateSource(nearestCapsule.date,"nearest_date_separator");
+                        }
+                    } catch(e) {}
+
+                    // Дата внутри самой карточки имеет приоритет над separator-ом.
+                    const own = [];
+                    const timestampFallback = [];
+                    ["data-date","data-day","data-message-date"].forEach(a => {
+                        const v = safeAttr(row,a); if (v) own.push(v);
+                    });
+                    ["datetime","data-created-at","data-timestamp","data-time"].forEach(a => {
+                        const v = safeAttr(row,a); if (v) timestampFallback.push(v);
+                    });
+                    try {
+                        row.querySelectorAll("time[datetime],[data-date],[data-day],[data-message-date]").forEach(el => {
+                            ["data-date","data-day","data-message-date"].forEach(a => {
+                                const v=safeAttr(el,a); if(v) own.push(v);
+                            });
+                            ["datetime","data-created-at","data-timestamp","data-time"].forEach(a => {
+                                const timestamp=safeAttr(el,a); if(timestamp) timestampFallback.push(timestamp);
+                            });
+                            const t=clean(el.textContent); if(t) own.push(t);
+                        });
+                    } catch(e) {}
+                    for (const v of own) { const d=dateText(v); if(d) return withDateSource(d,"message_date_attribute"); }
+
+                    // Некоторые версии MAX не используют class=data-date у разделителя.
+                    // Проверяем атрибуты ближайших элементов на реальную календарную дату.
+                    try {
+                        const attrs = ["data-date","data-day","data-message-date","title","aria-label"];
+                        for (const el of row.querySelectorAll("*")) {
+                            for (const a of attrs) {
+                                const v = safeAttr(el,a);
+                                const d = dateText(v);
+                                if (d) return withDateSource(d,"message_date_label");
+                            }
+                        }
+                    } catch(e) {}
+
+                    // Находим именно контейнер ленты, а не body. Это критично:
+                    // sticky-копия текущей даты в шапке больше не сможет заменить дату
+                    // старого сообщения.
+                    let feed = row.parentElement;
+                    for (let i=0; feed && i<10; i++, feed=feed.parentElement) {
+                        try {
+                            if (feed.querySelectorAll(".item").length >= 3) break;
+                        } catch(e) {}
+                    }
+                    if (!feed) feed = row.parentElement || document.body;
+
                     const markers = [];
                     try {
-                        const all = document.querySelectorAll("body *");
-                        all.forEach(el => {
-                            if (!el || el === row || row.contains(el)) return;
-
+                        feed.querySelectorAll("*").forEach(el => {
+                            if (!el || row.contains(el)) return;
+                            // Дата-разделитель MAX может быть капсулой внутри собственного
+                            // .item. Отбрасываем текстовые пузырьки, но сохраняем такие метки.
+                            if (el.closest && el.closest(".bubbleContent")) return;
                             const text = clean(el.textContent);
-                            if (!text || text.length > 40) return;
+                            const parsed = dateText(text);
+                            if (!parsed || text.length > 40) return;
 
-                            const parsed = normalizeDate(text);
-                            if (!parsed) return;
+                            // Отбрасываем sticky/fixed элементы и элементы шапки.
+                            try {
+                                const pos = getComputedStyle(el).position;
+                                if (pos === "fixed" || pos === "sticky") return;
+                            } catch(e) {}
 
-                            // Если это вложенный элемент того же разделителя, оставляем
-                            // самый компактный элемент с датой.
-                            const parent = el.parentElement;
-                            if (parent && clean(parent.textContent) === text) return;
-
+                            // Оставляем только самый внутренний узел с датой.
+                            if (el.parentElement && clean(el.parentElement.textContent) === text) return;
                             markers.push({el, date: parsed});
                         });
-                    } catch (e) {}
+                    } catch(e) {}
 
-                    if (markers.length) {
-                        let nearestBefore = null;
+                    // Выбираем ближайший видимый разделитель по вертикальной позиции.
+                    // Это защищает от sticky-копий даты и от DOM-обёрток, где порядок узлов
+                    // не совпадает с визуальным порядком сообщений.
+                    let nearest = null;
+                    let nearestTop = -Infinity;
+                    let rowTop = 0;
+                    try { rowTop = row.getBoundingClientRect().top; } catch(e) {}
+                    for (const marker of markers) {
+                        try {
+                            const pos = marker.el.compareDocumentPosition(row);
+                            if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+                            const r = marker.el.getBoundingClientRect();
+                            if (r.bottom <= rowTop + 4 && r.top > nearestTop) {
+                                nearest = marker;
+                                nearestTop = r.top;
+                            }
+                        } catch(e) {}
+                    }
+                    if (nearest) return withDateSource(nearest.date,"nearest_date_separator");
+                    // Fallback: если карточка вне viewport, используем DOM-порядок,
+                    // но только среди не-sticky маркеров.
+                    for (const marker of markers) {
+                        try {
+                            const pos = marker.el.compareDocumentPosition(row);
+                            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) nearest = marker;
+                        } catch(e) {}
+                    }
+                    if (nearest) return withDateSource(nearest.date,"dom_order_date_separator");
 
-                        for (const marker of markers) {
+                    // Иногда разделитель является дочерним элементом wrapper-а,
+                    // а wrapper располагается перед row. Поднимаемся по DOM.
+                    let node = row;
+                    for (let depth=0; node && depth<12; depth++, node=node.parentElement) {
+                        let prev = node.previousElementSibling;
+                        for (let n=0; prev && n<30; n++, prev=prev.previousElementSibling) {
+                            const direct = dateText(clean(prev.textContent));
+                            if (direct) return withDateSource(direct,"previous_sibling_date_separator");
                             try {
-                                const pos = marker.el.compareDocumentPosition(row);
-                                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
-                                    // marker находится перед row.
-                                    nearestBefore = marker;
+                                const found = prev.querySelector(
+                                    '[data-date],[data-day],[data-message-date],' +
+                                    '[class*="date" i],[class*="day" i],[class*="capsule" i]'
+                                );
+                                if (found) {
+                                    const d=dateText(clean(found.textContent));
+                                    if(d) return withDateSource(d,"previous_sibling_date_capsule");
                                 }
-                            } catch (e) {}
-                        }
-
-                        if (nearestBefore) return nearestBefore.date;
-
-                        // Редкий случай: DOM отрисован в обратном порядке.
-                        // Тогда берём ближайший следующий разделитель.
-                        for (const marker of markers) {
-                            try {
-                                const pos = marker.el.compareDocumentPosition(row);
-                                if (pos & Node.DOCUMENT_POSITION_PRECEDING) {
-                                    return marker.date;
-                                }
-                            } catch (e) {}
+                            } catch(e) {}
                         }
                     }
-
-                    return "";
+                    for (const v of timestampFallback) { const d=dateText(v); if(d) return withDateSource(d,"timestamp_fallback"); }
+                    return withDateSource("","unresolved");
                 }
 
                 function getOwnText(row) {
+                    const pollSelector = "[data-testid*='poll' i],[class*='poll' i],[data-type='poll'],[class*='survey' i]";
+                    // The poll widget contains answer labels and empty-state text, not the
+                    // message comment. Remove that widget before using bubble text as a caption.
+                    try {
+                        const bubble = row.querySelector(".bubbleContent");
+                        if (bubble && bubble.querySelector(pollSelector)) {
+                            const clone = bubble.cloneNode(true);
+                            [
+                                ".header", ".meta", ".link", "button.mark",
+                                '[class*="reply" i]', '[class*="quoted" i]',
+                                '[class*="quote" i]', pollSelector
+                            ].forEach(selector => {
+                                try {
+                                    clone.querySelectorAll(selector).forEach(el => el.remove());
+                                } catch (e) {}
+                            });
+                            return clean(clone.textContent);
+                        }
+                    } catch (e) {}
                     // Самый надёжный вариант: только непосредственный .text внутри bubbleContent.
                     try {
                         const direct = row.querySelector(".bubbleContent > .text");
@@ -1236,68 +3419,251 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     }
                 }
 
+                function getEmojiTexts(row) {
+                    const out = [];
+                    const seenElements = new WeakSet();
+                    function add(value, nodeSeen) {
+                        const s = clean(value);
+                        if (!s) return;
+                        let matches = [];
+                        try { matches = s.match(/[\p{Extended_Pictographic}](?:\uFE0F|\u200D[\p{Extended_Pictographic}])*/gu) || []; } catch(e) {}
+                        for (const emoji of matches) {
+                            if (!nodeSeen.has(emoji)) { nodeSeen.add(emoji); out.push(emoji); }
+                        }
+                    }
+                    function addCodepoints(value, nodeSeen) {
+                        const raw=String(value||'').trim(); if(!raw) return;
+                        const explicit=raw.match(/(?:U\+|0x)[0-9a-f]{4,6}/gi)||[];
+                        const parts=[...explicit.map(p=>p.replace(/^(?:U\+|0x)/i,'')),...raw.split(/[^0-9a-f]+/i).filter(p=>/^[0-9a-f]{4,6}$/i.test(p)&&/\d/.test(p))]; if(!parts.length) return;
+                        const chars=[];
+                        for(const token of parts){ try { if(!/\d/.test(token)) continue; const n=parseInt(token,16); if(n>=0x2000&&n<=0x1FAFF) chars.push(String.fromCodePoint(n)); } catch(e){} }
+                        if(chars.length) add(chars.join(''), nodeSeen);
+                    }
+
+                    const selectors = ['[class*="emoji" i]','[class*="animated" i]','[data-animated-emoji]','[data-custom-emoji]','[data-emoji-id]','[data-emoji-name]','[data-emoji-code]','[data-emoji-codepoint]','[data-codepoint]','[data-codepoints]','[data-unicode]','[data-type*="emoji" i]','[data-testid*="emoji" i]','[aria-label*="emoji" i]','[title*="emoji" i]','[role="img"]','canvas','video','img[alt]','img[aria-label]','[data-emoji]','[data-emoji-char]','[data-emoji-text]','[data-character]','[data-name]','[data-icon]'];
+                    const selectorText = selectors.join(",");
+                    function hasNestedEmojiNode(el) {
+                        try {
+                            return Array.from(el.querySelectorAll(selectorText)).some(child => {
+                                const meta = `${safeAttr(child,"class")} ${safeAttr(child,"data-type")} ${safeAttr(child,"data-testid")} ${safeAttr(child,"aria-label")} ${safeAttr(child,"title")} ${safeAttr(child,"data-emoji")} ${safeAttr(child,"data-emoji-char")} ${safeAttr(child,"data-emoji-name")} ${safeAttr(child,"data-custom-emoji")}`.toLowerCase();
+                                const hint = `${safeAttr(child,"alt")} ${safeAttr(child,"aria-label")} ${safeAttr(child,"title")} ${safeAttr(child,"data-emoji")} ${safeAttr(child,"data-emoji-char")} ${safeAttr(child,"data-emoji-text")}`;
+                                if (/sticker|стикер/.test(meta)) return false;
+                                return /emoji|эмодзи|animated|emoticon|smiley|custom.?emoji/.test(meta) ||
+                                    /[\u2600-\u27BF\u{1F000}-\u{1FAFF}]/u.test(hint);
+                            });
+                        } catch(e) { return false; }
+                    }
+                    function insideSticker(el) {
+                        for (let node=el; node; node=node.parentElement) {
+                            const meta=`${safeAttr(node,"class")} ${safeAttr(node,"data-type")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"title")}`;
+                            if (/sticker|стикер/i.test(meta)) return true;
+                        }
+                        return false;
+                    }
+                    for (const selector of selectors) {
+                        try {
+                            row.querySelectorAll(selector).forEach(el => {
+                                if (seenElements.has(el)) return;
+                                if (insideSticker(el)) return;
+                                // MAX renders one emoji as nested .emojis/.emoji/image nodes.
+                                // Read the innermost matching node once; separate sibling emoji
+                                // nodes remain separate so intentional repeats are preserved.
+                                if (hasNestedEmojiNode(el)) return;
+                                seenElements.add(el);
+                                const nodeSeen = new Set();
+                                const emeta = `${safeAttr(el,"class")} ${safeAttr(el,"data-type")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"title")} ${safeAttr(el,"data-custom-emoji")} ${safeAttr(el,"data-emoji-id")} ${safeAttr(el,"data-emoji-name")}`.toLowerCase();
+                                if (/sticker|стикер/.test(emeta)) return;
+                                add(safeAttr(el,"alt"),nodeSeen); add(safeAttr(el,"aria-label"),nodeSeen); add(safeAttr(el,"title"),nodeSeen);
+                                add(safeAttr(el,"data-emoji"),nodeSeen); add(safeAttr(el,"data-emoji-char"),nodeSeen); add(safeAttr(el,"data-emoji-text"),nodeSeen); add(safeAttr(el,"data-emoji-name"),nodeSeen); add(safeAttr(el,"data-emoji-alias"),nodeSeen); add(safeAttr(el,"data-custom-emoji"),nodeSeen); add(safeAttr(el,"data-text"),nodeSeen); addCodepoints(safeAttr(el,"data-codepoint"),nodeSeen); addCodepoints(safeAttr(el,"data-codepoints"),nodeSeen); addCodepoints(safeAttr(el,"data-unicode"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-code"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-codepoint"),nodeSeen); addCodepoints(safeAttr(el,"data-code"),nodeSeen); addCodepoints(safeAttr(el,"data-custom-emoji"),nodeSeen); add(el.textContent,nodeSeen);
+                                const emeta2 = `${safeAttr(el,"class")} ${safeAttr(el,"data-type")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"role")} ${safeAttr(el,"data-name")} ${safeAttr(el,"data-icon")} ${safeAttr(el,"data-custom-emoji")} ${safeAttr(el,"data-emoji-id")} ${safeAttr(el,"data-emoji-name")}`.toLowerCase();
+                                if (/emoji|эмодзи|animated/.test(emeta2) || el.hasAttribute("data-custom-emoji") || el.hasAttribute("data-emoji-id") || el.hasAttribute("data-emoji-name")) {
+                                    add(el.textContent,nodeSeen);
+                                    try {
+                                        const html = String(el.outerHTML || "");
+                                        add(html,nodeSeen);
+                                        const mediaNodes = [el, ...Array.from(el.querySelectorAll("img,video,canvas,source"))];
+                                        for (const mediaNode of mediaNodes) {
+                                            let mediaSrc = (mediaNode.currentSrc || mediaNode.src || "") || safeAttr(mediaNode,"src") || safeAttr(mediaNode,"current-src") || safeAttr(mediaNode,"data-src") || safeAttr(mediaNode,"data-image-url") || safeAttr(mediaNode,"data-media-url") || safeAttr(mediaNode,"data-emoji-url") || safeAttr(mediaNode,"data-animation-url") || "";
+                                            if (!mediaSrc) {
+                                                try {
+                                                    const bg=getComputedStyle(mediaNode).backgroundImage||"";
+                                                    const bgMatch=bg.match(/url\(["']?(.*?)["']?\)/i);
+                                                    if(bgMatch) mediaSrc=bgMatch[1];
+                                                } catch(e) {}
+                                            }
+                                            if (!mediaSrc) continue;
+                                            const tokens = mediaSrc.match(/(?:u[+_-]|emoji[_-]?|codepoint[_-]?)([0-9a-f]{4,6})(?:[_-]([0-9a-f]{4,6}))?|(?:^|[\/_-])((?:1f|26|27)[0-9a-f]{2,4})(?:[_-]((?:1f|26|27)[0-9a-f]{2,4}))?/gi) || [];
+                                            for (const token of tokens) {
+                                                const cleaned = token.replace(/^[^0-9a-f]+/i, "");
+                                                addCodepoints(cleaned,nodeSeen);
+                                            }
+                                        }
+                                        const hexes = html.match(/(?:U\\+|0x|\\\\u\\{|&#x)([0-9a-f]{4,6})\\}?;?/gi) || [];
+                                        for (const token of hexes) addCodepoints(token,nodeSeen);
+                                        const decs = html.match(/&#(\\d{4,7});/g) || [];
+                                        for (const token of decs) {
+                                            const m = token.match(/\\d+/);
+                                            if (m) { try { const n=Number(m[0]); if(n>=0x2000&&n<=0x1FAFF) add(String.fromCodePoint(n),nodeSeen); } catch(e) {} }
+                                        }
+                                    } catch(e) {}
+                                }
+                            });
+                        } catch(e) {}
+                    }
+                    return out;
+                }
+
+                function getImageCandidateCount(row) {
+                    let count = 0;
+                    const seen = new Set();
+                    function isEmoji(el) {
+                        const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el,"data-type")}`;
+                        if (/sticker|стикер/i.test(meta)) return false;
+                        if (/(^|[ _:-])emoji([ _:-]|$)|animated.?emoji|эмодзи|emoticon|smiley|custom.?emoji/i.test(meta)) return true;
+                        try { const cp=[safeAttr(el,"data-codepoint"),safeAttr(el,"data-codepoints"),safeAttr(el,"data-unicode")].join(' '); if(/^(?:U\+|0x)?[0-9a-f]{4,6}(?:[-,\s]+(?:U\+|0x)?[0-9a-f]{4,6})*$/i.test(cp.trim())) return true; } catch(e) {}
+                        try { return /[\u2600-\u27BF\u{1F000}-\u{1FAFF}]/u.test(safeAttr(el,"alt") || safeAttr(el,"aria-label") || ""); } catch(e) { return false; }
+                    }
+                    try {
+                        row.querySelectorAll("img,picture source").forEach(img => {
+                            const meta = `${safeAttr(img,"class")} ${safeAttr(img,"data-testid")} ${safeAttr(img,"aria-label")} ${safeAttr(img,"alt")} ${safeAttr(img,"title")} ${safeAttr(img,"data-type")}`.toLowerCase();
+                            if (/avatar|userpic|profile|favicon|spacer|blank/.test(meta) || isEmoji(img)) return;
+                            const r = img.getBoundingClientRect();
+                            if (r.width >= 20 && r.height >= 20) {
+                                const key=`${Math.round(r.left)}:${Math.round(r.top)}:${Math.round(r.width)}:${Math.round(r.height)}`;
+                                if (!seen.has(key)) {seen.add(key);count++;}
+                            }
+                        });
+                    } catch(e) {}
+                    try {
+                        row.querySelectorAll("a[href],div[data-image-url],div[data-photo-url],div[data-media-url],[style*='background-image' i]").forEach(el=>{
+                            const meta=`${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el,"data-type")}`;
+                            if (/avatar|userpic|profile|favicon|spacer|blank/i.test(meta) || isEmoji(el)) return;
+                            const url=safeAttr(el,"href")||safeAttr(el,"data-image-url")||safeAttr(el,"data-photo-url")||safeAttr(el,"data-media-url");
+                            let bg=""; try{bg=getComputedStyle(el).backgroundImage||"";}catch(e){}
+                            if(url||/^url\(/i.test(bg)) count++;
+                        });
+                    } catch(e) {}
+                    return count;
+                }
+
+                function getEmojiImageUrls(row) {
+                    const out=[]; const seen=new Set();
+                    const add=u=>{ if(!u||typeof u!=='string'||u.startsWith('data:')) return; if(!seen.has(u)){seen.add(u);out.push(u);} };
+                    const emojiMeta = el => {
+                        const parts=[]; let n=el;
+                        for(let d=0;n&&d<4;d++,n=n.parentElement){
+                            parts.push(safeAttr(n,'class'),safeAttr(n,'data-testid'),safeAttr(n,'aria-label'),safeAttr(n,'alt'),
+                                safeAttr(n,'title'),safeAttr(n,'data-type'),safeAttr(n,'role'),safeAttr(n,'data-emoji'),
+                                safeAttr(n,'data-emoji-char'),safeAttr(n,'data-emoji-text'),safeAttr(n,'data-animated-emoji'),
+                                safeAttr(n,'data-custom-emoji'),safeAttr(n,'data-emoji-id'),safeAttr(n,'data-emoji-name'));
+                        }
+                        return parts.join(' ').toLowerCase();
+                    };
+                    row.querySelectorAll('img,video,canvas,[role="img"],[class*="emoji" i],[class*="animated" i],[data-type*="emoji" i],[data-testid*="emoji" i],[data-emoji],[data-emoji-char],[data-animated-emoji],[data-custom-emoji],[data-emoji-id],[data-emoji-name],[data-emoji-code],[data-emoji-codepoint]').forEach(el=>{
+                        const meta=emojiMeta(el);
+                        if(/sticker|стикер/.test(meta)) return;
+                        if(!/(emoji|эмодзи|animated.?emoji|custom.?emoji|emoticon|smiley)/i.test(meta)) return;
+                        const attrs=['src','current-src','data-src','data-image-url','data-media-url','data-emoji-url','data-animation-url','data-original','data-original-src'];
+                        for(const a of attrs){ const v=(a==='src'&&el.currentSrc)?el.currentSrc:safeAttr(el,a); if(/^(https?:|blob:)/i.test(v)) add(v); }
+                        try{ const bg=getComputedStyle(el).backgroundImage||''; const m=bg.match(/url\(["']?(.*?)["']?\)/i); if(m) add(m[1]); }catch(e){}
+                    });
+                    return out;
+                }
+
                 function getImageUrls(row) {
                     const images = [];
                     const seen = new Set();
+                    function add(src) {
+                        if (!src || typeof src !== "string") return;
+                        src = src.trim();
+                        if (!src || src.startsWith("data:")) return;
+                        try {
+                            if (src.startsWith("//")) src = location.protocol + src;
+                            else if (src.startsWith("/")) src = new URL(src, location.href).href;
+                        } catch(e) {}
+                        if (!seen.has(src)) { seen.add(src); images.push(src); }
+                    }
+                    function metaOf(el) {
+                        return `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`.toLowerCase();
+                    }
+                    function isEmojiNode(el) {
+                        let node = el;
+                        let stickerSeen = false;
+                        for (let depth=0; node && depth<4; depth++, node=node.parentElement) {
+                            const meta = metaOf(node);
+                            if (/sticker|стикер/.test(meta)) stickerSeen = true;
+                            if (!stickerSeen && /(^|[ _:-])emoji([ _:-]|$)|animated.?emoji|эмодзи|emoticon|smiley|custom.?emoji/.test(meta)) return true;
+                            try {
+                                const hint = safeAttr(node,"alt")||safeAttr(node,"aria-label")||safeAttr(node,"title")||safeAttr(node,"data-text")||safeAttr(node,"data-emoji")||"";
+                                if (!stickerSeen && /[\u2600-\u27BF\u{1F000}-\u{1FAFF}]/u.test(hint)) return true;
+                            } catch(e) {}
+                        }
+                        if (stickerSeen) return false;
+                        // Маленькая картинка без caption чаще всего является визуальным emoji.
+                        try {
+                            const r=el.getBoundingClientRect();
+                            if (r.width>0 && r.height>0 && r.width<=96 && r.height<=96) return true;
+                        } catch(e) {}
+                        return false;
+                    }
                     try {
                         row.querySelectorAll("img").forEach(img => {
-                            let src = "";
-                            try {
-                                src =
-                                    (typeof img.currentSrc === "string" && img.currentSrc) ||
-                                    safeAttr(img, "src") ||
-                                    safeAttr(img, "data-src") ||
-                                    safeAttr(img, "data-original") ||
-                                    safeAttr(img, "data-lazy-src") ||
-                                    "";
-                            } catch (e) {}
-                            if (!src || src.startsWith("data:")) return;
-                            const lower = src.toLowerCase();
-                            if (
-                                lower.includes("avatar") ||
-                                lower.includes("userpic") ||
-                                lower.includes("profile") ||
-                                lower.includes("icon") ||
-                                lower.includes("emoji") ||
-                                lower.includes("sticker") ||
-                                lower.includes("spacer") ||
-                                lower.includes("blank")
-                            ) return;
+                            const meta = metaOf(img);
+                            if (/avatar|userpic|profile|favicon|spacer|blank/.test(meta)) return;
+                            if (isEmojiNode(img)) return;
+                            // Сначала собираем реальный URL. У lazy-photo MAX размер img
+                            // иногда временно равен 0x0, хотя src/data-* уже заполнены.
+                            const before = images.length;
+                            add((typeof img.currentSrc === "string" && img.currentSrc) || safeAttr(img,"src"));
+                            if (typeof img.src === "string") add(img.src);
+                            ["data-src","data-original","data-lazy-src","data-image","data-photo","data-image-url","data-photo-url","data-media-url","data-original-src","data-attachment-url","data-content-url","data-file-url"].forEach(a => add(safeAttr(img,a)));
+                            const srcset = safeAttr(img,"srcset") || safeAttr(img,"data-srcset");
+                            if (srcset) srcset.split(",").map(x=>x.trim().split(/\s+/)[0]).forEach(add);
+                            // Если URL нет, только тогда требуем заметный размер.
                             const rect = img.getBoundingClientRect();
-                            const width = Math.max(img.naturalWidth || 0, rect.width || 0);
-                            const height = Math.max(img.naturalHeight || 0, rect.height || 0);
-                            if (width < 40 || height < 40) return;
-                            if (!seen.has(src)) {
-                                seen.add(src);
-                                images.push(src);
+                            if (images.length === before && (rect.width < 12 || rect.height < 12)) return;
+                        });
+                    } catch(e) {}
+                    try {
+                        row.querySelectorAll("picture source, source").forEach(el => {
+                            const meta = metaOf(el);
+                            if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи/.test(meta)) return;
+                            const srcset = safeAttr(el,"srcset") || safeAttr(el,"data-srcset");
+                            if (srcset) srcset.split(",").map(x=>x.trim().split(/\s+/)[0]).forEach(add);
+                            ["src","data-src","data-original","data-image-url","data-photo-url","data-media-url","data-attachment-url","data-content-url"].forEach(a=>add(safeAttr(el,a)));
+                            if (typeof el.src === "string") add(el.src);
+                        });
+                    } catch(e) {}
+                    try {
+                        row.querySelectorAll("*").forEach(el => {
+                            const meta = metaOf(el);
+                            if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи/.test(meta)) return;
+                            ["data-image-url","data-photo-url","data-media-url","data-image","data-photo","data-original","data-original-src","data-src","data-lazy-src","data-attachment-url","data-content-url","data-file-url"].forEach(a=>add(safeAttr(el,a)));
+                            let candidates = [];
+                            const style = safeAttr(el,"style");
+                            const sm = style && style.match(/url\([\"']?(.*?)[\"']?\)/i);
+                            if (sm) candidates.push(sm[1]);
+                            try {
+                                const bg = getComputedStyle(el).backgroundImage || "";
+                                const bm = bg.match(/url\([\"']?(.*?)[\"']?\)/i);
+                                if (bm) candidates.push(bm[1]);
+                            } catch(e) {}
+                            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : {width:0,height:0};
+                            // У MAX анимированный стикер может быть CSS background-image, без img/src.
+                            if (rect.width >= 40 && rect.height >= 40 &&
+                                /(photo|image|media|attachment|picture|sticker|стикер|фото|изображ|картин)/i.test(meta)) {
+                                candidates.forEach(v => { if (/^(?:https?:|blob:)/i.test(String(v||""))) add(v); });
                             }
                         });
-                    } catch (e) {}
-                    // Фотографии в MAX могут быть background-image.
+                    } catch(e) {}
                     try {
-                        row.querySelectorAll("div, span, a, picture").forEach(el => {
-                            try {
-                                const bg = getComputedStyle(el).backgroundImage;
-                                const match = bg && bg.match(/url\(["']?(.*?)["']?\)/);
-                                if (!match) return;
-                                const src = match[1];
-                                if (!src || src.startsWith("data:") || src.length < 30) return;
-                                const lower = src.toLowerCase();
-                                if (
-                                    lower.includes("avatar") ||
-                                    lower.includes("userpic") ||
-                                    lower.includes("profile") ||
-                                    lower.includes("icon") ||
-                                    lower.includes("emoji") ||
-                                    lower.includes("sticker")
-                                ) return;
-                                if (!seen.has(src)) {
-                                    seen.add(src);
-                                    images.push(src);
-                                }
-                            } catch (e) {}
+                        row.querySelectorAll("a[href]").forEach(a => {
+                            const href = safeAttr(a,"href");
+                            const meta = metaOf(a);
+                            if (/avatar|userpic|profile|favicon/.test(meta) || isEmojiNode(a)) return;
+                            if (/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#].*)?$/i.test(href) || /^blob:/i.test(href) || /(photo|image|media|attachment|picture|фото|изображ|картин)/i.test(meta)) add(href);
                         });
-                    } catch (e) {}
+                    } catch(e) {}
                     return images;
                 }
 
@@ -1320,8 +3686,575 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     );
                 }
 
+
+                function getRichAttachments(row) {
+                    const out = [];
+                    const seen = new Set();
+                    function push(type, url, filename, extra = {}) {
+                        if (!url) return;
+                        url = String(url).trim();
+                        if (!url || url.startsWith("data:")) return;
+                        const key = `${type}|${url}`;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push({type, url, filename: filename || "", ...extra});
+                    }
+                    function classify(meta, tag) {
+                        meta = String(meta || "").toLowerCase();
+                        if (/video.?note|videonote|video[_ -]?message|кружок|circle|round.?video|roundvideo/.test(meta)) return "video_note";
+                        if (/voice|voice.?message|voice_message|голосов|аудиосообщ/.test(meta)) return "voice";
+                        if (/emoji|эмодзи|animated.?emoji/.test(meta) && !/sticker|стикер/.test(meta)) return "emoji";
+                        if (tag === "video" || /(^|[ _-])video([ _-]|$)|movie|mp4/.test(meta)) return "video";
+                        if (tag === "audio" || /(^|[ _-])audio([ _-]|$)|ogg|opus|m4a|mp3/.test(meta)) return "audio";
+                        if (/sticker/.test(meta)) return "image";
+                        return "document";
+                    }
+                    function candidate(el) {
+                        let u = getCandidateUrl(el);
+                        if (!u) u = safeAttr(el,"src") || safeAttr(el,"current-src") || safeAttr(el,"data-src") ||
+                            safeAttr(el,"data-video-url") || safeAttr(el,"data-audio-url") || safeAttr(el,"data-voice-url") ||
+                            safeAttr(el,"data-media-url") || safeAttr(el,"data-sticker-url") || safeAttr(el,"data-url") || safeAttr(el,"data-href");
+                        return u;
+                    }
+                    const elements = row.querySelectorAll(
+                        "video, audio, source, [data-video-url], [data-audio-url], [data-voice-url], [data-media-url], [data-sticker-url], " +
+                        "[data-video], [data-audio], [data-voice], [data-media], [data-voice-message], [data-video-note]"
+                    );
+                    elements.forEach(el => {
+                        const tagName = String(el.tagName || "").toLowerCase();
+                        let mediaTag = tagName;
+                        let ancestorMeta = "";
+                        let ancestorUrl = "";
+                        for (let node = el, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
+                            const nodeTag = String(node.tagName || "").toLowerCase();
+                            if (nodeTag === "video" || nodeTag === "audio") mediaTag = nodeTag;
+                            ancestorMeta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
+                            if (!ancestorUrl) ancestorUrl = candidate(node);
+                        }
+                        let shapeHint = "";
+                        try {
+                            const mediaElement = el.closest("video,audio") || el;
+                            const r = mediaElement.getBoundingClientRect();
+                            if (mediaTag === "video" && r.width > 0 && r.height > 0 && Math.abs(r.width-r.height) <= 8) shapeHint = " roundvideo";
+                        } catch(e) {}
+                        const meta = `${ancestorMeta}${shapeHint}`;
+                        const url = candidate(el) || ancestorUrl;
+                        if (url) push(classify(meta, mediaTag), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || safeAttr(el.parentElement || el,"data-filename") || "");
+                    });
+                    // Некоторые версии MAX держат медиа в div/span как background-image.
+                    row.querySelectorAll("div,span,a,canvas").forEach(el => {
+                        const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
+                        if (!/(video|voice|audio|круж|голос|sticker|media)/i.test(meta)) return;
+                        let url = candidate(el);
+                        if (!url) {
+                            try {
+                                const bg = getComputedStyle(el).backgroundImage;
+                                const m = bg && bg.match(/url\(["']?(.*?)["']?\)/);
+                                if (m) url = m[1];
+                            } catch(e) {}
+                        }
+                        if (url) push(classify(meta, String(el.tagName || "").toLowerCase()), url, safeAttr(el,"data-filename") || "");
+                    });
+                    // Sticker/emoji-картинки теперь обрабатываются как image в getImageUrls.
+                    // Не добавляем их вторично как sticker, чтобы не получить дубль.
+                    // Дополнительный fallback: некоторые MAX-карточки хранят видео/voice URL
+                    // в произвольных data-* атрибутах контейнера.
+                    row.querySelectorAll("*").forEach(el => {
+                        const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
+                        if (!/(video|voice|audio|круж|голос|media|videonote|video-note)/i.test(meta)) return;
+                        const url = candidate(el);
+                        if (url) push(classify(meta, String(el.tagName || "").toLowerCase()), url, safeAttr(el,"data-filename") || "");
+                    });
+                    // MAX может показывать только длительность 00:01, а URL видео/voice
+                    // лежит у одного из ближайших родителей. Ищем такой URL до 6 уровней вверх.
+                    try {
+                        row.querySelectorAll("*").forEach(el => {
+                            const t = clean(el.textContent);
+                            if (!/^\d{1,2}:\d{2}$/.test(t)) return;
+                            let node = el;
+                            for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+                                const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
+                                const url = candidate(node);
+                                if (url && /(video|voice|audio|круж|голос|message)/i.test(meta)) {
+                                    push(classify(meta, String(node.tagName || "").toLowerCase()), url, safeAttr(node,"data-filename") || "");
+                                    break;
+                                }
+                            }
+                        });
+                    } catch(e) {}
+                    return out;
+                }
+
+                function getSpecialContent(row, messageRow=null) {
+                    const result = {location:null, poll:null, contact:null};
+                    const outerRow = messageRow || row.closest(".item") || row;
+
+                    // Геопозиция.
+                    try {
+                        const nodes = row.querySelectorAll(
+                            "[data-latitude][data-longitude],[data-lat][data-lng]," +
+                            "[data-latitude][data-long],[class*='location' i],[class*='map' i]"
+                        );
+                        for (const el of nodes) {
+                            const lat = safeAttr(el,"data-latitude") || safeAttr(el,"data-lat");
+                            const lon = safeAttr(el,"data-longitude") || safeAttr(el,"data-long") || safeAttr(el,"data-lng");
+                            if (lat && lon && isFinite(Number(lat)) && isFinite(Number(lon))) {
+                                result.location = {latitude:Number(lat), longitude:Number(lon), title:"", url:""};
+                                break;
+                            }
+                        }
+                        if (!result.location) {
+                            for (const a of row.querySelectorAll("a[href]")) {
+                                const href = safeAttr(a,"href");
+                                if (!/yandex\.(?:ru|com)\/maps|maps\.google|2gis/i.test(href)) continue;
+                                let m = href.match(/[?&]ll=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/i);
+                                if (!m) m = href.match(/(?:lat|latitude)=(-?\d+(?:\.\d+)?).*?(?:lon|lng|longitude)=(-?\d+(?:\.\d+)?)/i);
+                                if (m) {
+                                    if (/yandex\.(?:ru|com)\/maps/i.test(href) && /[?&]ll=/i.test(href)) {
+                                        result.location = {latitude:Number(m[2]), longitude:Number(m[1]), title:"", url:href};
+                                    } else {
+                                        result.location = {latitude:Number(m[1]), longitude:Number(m[2]), title:"", url:href};
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        // MAX иногда оставляет только ссылку/атрибут без явных data-lat/data-lng.
+                        if (!result.location) {
+                            const attrNames = ["href","data-url","data-href","data-map-url","data-location","data-coordinates","aria-label","title"];
+                            for (const el of row.querySelectorAll("*") ) {
+                                for (const an of attrNames) {
+                                    const v = safeAttr(el, an);
+                                    if (!v) continue;
+                                    let m = String(v).match(/[?&]ll=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/i);
+                                    if (m) { result.location={latitude:Number(m[2]),longitude:Number(m[1]),title:"",url:(an === "href" ? String(v) : "")}; break; }
+                                    m = String(v).match(/(?:lat|latitude)[=:](-?\d+(?:\.\d+)?)[^\d-]+(?:lon|lng|longitude)[=:](-?\d+(?:\.\d+)?)/i);
+                                    if (m) { result.location={latitude:Number(m[1]),longitude:Number(m[2]),title:"",url:(an === "href" ? String(v) : "")}; break; }
+                                    m = String(v).match(/geo:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/i);
+                                    if (m) { result.location={latitude:Number(m[1]),longitude:Number(m[2]),title:"",url:""}; break; }
+                                }
+                                if (result.location) break;
+                            }
+                        }
+                        if (!result.location && /open yandex maps|открыть yandex maps/i.test(clean(row.innerText))) {
+                            for (const el of row.querySelectorAll("*")) {
+                                const values = [safeAttr(el,"href"), safeAttr(el,"data-url"), safeAttr(el,"data-href"), safeAttr(el,"data-map-url"), safeAttr(el,"data-location"), safeAttr(el,"data-coordinates")];
+                                for (const v of values) {
+                                    const m = String(v || "").match(/[?&]ll=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/i);
+                                    if (m) { result.location={latitude:Number(m[2]),longitude:Number(m[1]),title:"",url:String(v)}; break; }
+                                }
+                                if (result.location) break;
+                            }
+                        }
+                        // Даже без координат сохраняем прямую ссылку на Yandex Maps.
+                        if (!result.location && /open yandex maps|открыть yandex maps/i.test(clean(row.innerText))) {
+                            for (const el of row.querySelectorAll("a[href],button,[role='button'],[data-url],[data-href],[data-map-url]")) {
+                                const values = [safeAttr(el,"href"),safeAttr(el,"data-url"),safeAttr(el,"data-href"),safeAttr(el,"data-map-url")];
+                                for (const v of values) {
+                                    if (/https?:\/\/yandex\.(?:ru|com)\/maps/i.test(String(v || ""))) {
+                                        result.location={latitude:null,longitude:null,title:"",url:String(v)};
+                                        break;
+                                    }
+                                }
+                                if (result.location) break;
+                            }
+                        }
+                    } catch(e) {}
+
+                    // Опрос. Название определяем отдельно от вариантов и служебных чисел MAX.
+                    try {
+                        const poll = row.querySelector("[data-testid*='poll' i],[class*='poll' i],[data-type='poll'],[class*='survey' i]");
+                        if (poll) {
+                            const cleanPollLine = s => clean(String(s || "")).replace(/^[⚪⚫▫•]+\s*/u, "").replace(/\s+/g, " ").trim();
+                            const multiSelectMeta = /^(?:select one or multiple answers|select one or more answers|select multiple answers|выберите один или несколько (?:вариантов )?ответов)(?:\s*[:.]?\s*\d+)?$/i;
+                            const isPollMetaLine = s => multiSelectMeta.test(cleanPollLine(s)) || /^(?:select an answer|выберите(?:\s+вариант)?\s+ответ(?:а)?|голосовать|vote|ответить|проголосовать|show results|показать результаты(?: опроса)?|poll ended\b.*|опрос заверш[её]н\b.*|total votes?\b.*|всего голосов?\b.*)$/i.test(cleanPollLine(s));
+                            const serviceOnly = /^(?:select one or multiple answers|select one or more answers|select multiple answers|выберите один или несколько (?:вариантов )?ответов|select an answer|выберите(?:\s+вариант)?\s+ответ(?:а)?|голосовать|vote|ответить|проголосовать|show results|показать результаты(?: опроса)?)(?:\b|$)/i;
+                            const rawPollText = String(poll.innerText || poll.textContent || "");
+                            const activePoll = /select\s+an\s+answer|choose\s+an\s+answer|выберите\s+(?:вариант\s+)?ответ(?:а)?/i.test(rawPollText);
+                            const flatPollVotesMatch = rawPollText.match(/(?:^|\s)(\d+)\s*(?:votes?|голос(?:а|ов)?)(?=$|[\s.,;])/i);
+                            const options = [];
+                            const addOption = (rawValue, attrVoteValue="", isExplicitOption=false) => {
+                                let value = cleanPollLine(rawValue);
+                                if (!value || serviceOnly.test(value) || isPollMetaLine(value)) return;
+                                let votes = null;
+                                // Результат MAX иногда склеен в одну строку:
+                                // "Вариант . 2 votes, 100%. Ваш выбор".
+                                // Число перед процентом — голоса; отметки выбора/победителя не часть названия.
+                                value = value.replace(/\s+(?:your choice|ваш выбор|winner|победитель|you voted|вы проголосовали|selected)(?=$|[\s.,;:]).*$/i, "");
+                                let result = value.match(/^(.*?)\s*[.,]\s*(\d+)\s*[,;]\s*\d+(?:[.,]\d+)?\s*%.*$/i);
+                                if (result) {
+                                    value = cleanPollLine(result[1]);
+                                    votes = Number(result[2]);
+                                }
+                                // Убираем процент/полосу результата прежде, чем разбираем
+                                // счетчик "2 votes", иначе хвост процента мешает распознаванию.
+                                value = value.replace(/\s*[,;·|]?\s*\d+(?:[.,]\d+)?\s*%.*$/, "").trim();
+                                // Сначала явный формат "Название: 2" или "Название . 2 votes".
+                                let m = value.match(/^(.*?)\s*:\s*(\d+)\s*$/);
+                                if (votes == null && m) {
+                                    value = cleanPollLine(m[1]);
+                                    votes = Number(m[2]);
+                                } else if (votes == null) {
+                                    m = value.match(/^(.*?)[\s.,]+(\d+)\s*(?:votes?|голос(?:а|ов)?)$/i);
+                                    if (m) {
+                                        value = cleanPollLine(m[1]);
+                                        votes = Number(m[2]);
+                                    } else {
+                                        const av = String(attrVoteValue || "");
+                                        const avm = av.match(/(?:^|\s)(\d+)\s*(?:votes?|голос(?:а|ов)?)?/i);
+                                        if (avm) votes = Number(avm[1]);
+                                    }
+                                }
+                                value = value.replace(/[\s.,;:]+$/, "").trim();
+                                value = value.replace(/^\s*[-•▫]+\s*/, "").trim();
+                                if (!value || serviceOnly.test(value)) return;
+                                const numberedAnswerSequence = value.match(/((?:(?:ответ|answer)\s+\d+)(?:\s+(?:ответ|answer)\s+\d+)+)$/i);
+                                if (numberedAnswerSequence) {
+                                    const labels = numberedAnswerSequence[1].match(/(?:ответ|answer)\s+\d+/gi) || [];
+                                    labels.forEach((label, index) => {
+                                        const optionVotes = index === labels.length - 1 && votes != null ? votes : 0;
+                                        const existing = options.find(x => String(x.text || "").toLowerCase() === label.toLowerCase());
+                                        if (!existing) {
+                                            options.push({text:label, votes:optionVotes, explicit:isExplicitOption});
+                                        } else {
+                                            existing.votes = Math.max(Number(existing.votes) || 0, optionVotes);
+                                            existing.explicit = existing.explicit || isExplicitOption;
+                                        }
+                                    });
+                                    return;
+                                }
+                                const capitalizedChoices = value.split(/\s+(?=[A-ZА-ЯЁ])/u);
+                                if (capitalizedChoices.length >= 4) {
+                                    capitalizedChoices.forEach((rawLabel, index) => {
+                                        let label = cleanPollLine(rawLabel).replace(/^[\s.,;:]+|[\s.,;:]+$/g, "");
+                                        let optionVotes = index === capitalizedChoices.length - 1 && votes != null ? votes : 0;
+                                        const inlineCount = label.match(/^(.*?)\s*:\s*(\d+)$/);
+                                        if (inlineCount) {
+                                            label = cleanPollLine(inlineCount[1]);
+                                            optionVotes = Number(inlineCount[2]);
+                                        }
+                                        if (!label) return;
+                                        const existing = options.find(x => String(x.text || "").toLowerCase() === label.toLowerCase());
+                                        if (!existing) {
+                                            options.push({text:label, votes:optionVotes, explicit:isExplicitOption});
+                                        } else {
+                                            existing.votes = Math.max(Number(existing.votes) || 0, optionVotes);
+                                            existing.explicit = existing.explicit || isExplicitOption;
+                                        }
+                                    });
+                                    return;
+                                }
+                                if (/^\d+$/.test(value) && !isExplicitOption) return;
+                                if (/^(option|вариант|вариант ответа|название)$/i.test(value)) return;
+                                const existing = options.find(x => String(x.text || "").toLowerCase() === value.toLowerCase());
+                                if (!existing) {
+                                    options.push({text:value, votes, explicit:isExplicitOption});
+                                } else {
+                                    if (votes != null) existing.votes = votes;
+                                    existing.explicit = existing.explicit || isExplicitOption;
+                                }
+                            };
+
+                            const optionSelector = "[data-option],[class*='option' i],[class*='answer' i],[data-testid*='option' i],[role='radio'],[role='option'],button,[role='button']";
+                            const explicitNodes = Array.from(poll.querySelectorAll(optionSelector)).filter(node => {
+                                const ownText = cleanPollLine(node.innerText || node.textContent);
+                                if (!ownText) return false;
+                                const semanticOption = node.matches("[data-option],[class*='option' i],[class*='answer' i],[data-testid*='option' i],[role='radio'],[role='option']");
+                                if (isPollMetaLine(ownText) || (!semanticOption && /^\d+(?:\s+(?:votes?|голос(?:а|ов)?))?$/i.test(ownText))) return false;
+                                if (!semanticOption && !/[\p{L}\p{Extended_Pictographic}]/u.test(ownText)) return false;
+                                // Prefer the innermost option node when MAX nests label spans
+                                // inside a clickable answer; this avoids parsing the same row twice.
+                                return !Array.from(node.querySelectorAll(optionSelector)).some(child =>
+                                    cleanPollLine(child.innerText || child.textContent) === ownText
+                                );
+                            });
+                            explicitNodes.forEach(node => addOption(node.innerText || node.textContent, safeAttr(node,"data-votes") || safeAttr(node,"data-count") || safeAttr(node,"aria-label"), true));
+
+                            const pollStateNodes = [poll, outerRow, ...Array.from(outerRow.querySelectorAll(
+                                "[data-status],[data-state],[data-poll-status],[class*='closed' i],[class*='ended' i],[class*='finished' i]"
+                            ))];
+                            const pollStateMetadata = pollStateNodes.map(el => [
+                                safeAttr(el,"data-status"), safeAttr(el,"data-state"),
+                                safeAttr(el,"data-poll-status"), safeAttr(el,"class"),
+                                safeAttr(el,"data-testid"), safeAttr(el,"aria-label"), safeAttr(el,"title")
+                            ].join(" ")).join(" ");
+                            // "Show results" is not a closed state; require an explicit end marker.
+                            const closedText = /(?:poll|survey)\s+(?:is\s+)?(?:closed|ended|finished)|(?:опрос\s+(?:закрыт|заверш[её]н)|голосование\s+(?:закрыто|завершено))/i
+                                .test(`${rawPollText} ${outerRow.innerText || ""}`);
+                            const closedState = /(?:^|[\s_-])(?:closed|ended|finished|completed|закрыт|закрыто|заверш[её]н|завершено)(?:$|[\s_-])/i
+                                .test(pollStateMetadata);
+                            const isClosed = closedText || closedState;
+                            const rawLines = rawPollText.split(/\n+/).map(cleanPollLine).filter(Boolean);
+                            let aggregateVotes = null;
+                            for (const line of rawLines) {
+                                // A flattened MAX result line contains every option. It is
+                                // parsed as a whole below; never treat it as one option here.
+                                if (/\d+\s*(?:votes?|голос(?:а|ов)?)\s*[,;]\s*\d+(?:[.,]\d+)?\s*%/iu.test(line)) continue;
+                                if (/^\d+$/.test(line)) {
+                                    const n=Number(line);
+                                    if (n>=0 && n<=1000000) aggregateVotes=n;
+                                }
+                                if (/votes?|голос(?:а|ов)/i.test(line)) {
+                                    const aggregateMatch=line.match(/^(\d+)\s*(?:votes?|голос(?:а|ов)?)$/i);
+                                    if (aggregateMatch) {
+                                        aggregateVotes=Number(aggregateMatch[1]);
+                                    } else {
+                                        const vm=line.match(/^(.*?)\s+(?:\d+\s+)?(\d+)\s*(?:votes?|голос(?:а|ов)?)$/i);
+                                        if (vm) addOption(vm[1], vm[2]);
+                                    }
+                                } else if (/^(.*?)\s*:\s*\d+$/.test(line)) {
+                                    addOption(line, line);
+                                }
+                            }
+                            for (const a of ["data-total-votes","data-total-vote-count"]) {
+                                const v=safeAttr(poll,a); const m=String(v).match(/\d+/);
+                                if (m) aggregateVotes=Number(m[0]);
+                            }
+                            if (aggregateVotes == null) {
+                                const aria=safeAttr(poll,"aria-label");
+                                const m=aria.match(/(\d+)\s*(?:votes?|голос(?:а|ов)?)/i);
+                                if (m) aggregateVotes=Number(m[1]);
+                            }
+
+                            // Название: data-question -> question-node -> первая осмысленная строка,
+                            // причём чистое число и служебный UI никогда не становятся названием.
+                            let question=cleanPollLine(poll.getAttribute("data-question") || "");
+                            if (!question) {
+                                const qnode=poll.querySelector("[class*='question' i],[class*='poll-question' i]");
+                                if (qnode) question=cleanPollLine(qnode.textContent);
+                            }
+                            if (!question) {
+                                const serviceMarker=rawPollText.match(/select\s+one\s+or\s+(?:multiple|more)\s+answers|select\s+multiple\s+answers|choose\s+one\s+or\s+(?:multiple|more)\s+answers|select\s+an\s+answer|choose\s+an\s+answer|выберите\s+один\s+или\s+несколько\s+(?:вариантов\s+)?ответов|выберите\s+(?:вариант\s+)?ответ(?:а)?/i);
+                                if (serviceMarker) question=cleanPollLine(rawPollText.slice(0,serviceMarker.index));
+                            }
+                            const meaningful=rawLines.filter(line =>
+                                !/^\d+$/.test(line) &&
+                                !serviceOnly.test(line) && !isPollMetaLine(line) &&
+                                !/^\d+\s*(?:votes?|голос(?:а|ов)?)$/i.test(line)
+                            );
+                            if (!question && meaningful.length) {
+                                question=meaningful[0].replace(/\s*:\s*\d+\s*$/," ").trim();
+                                question=question.replace(/\s+(?:\d+)\s*$/," ").trim();
+                            }
+
+                            // Когда отдельные option-node существуют, rawLines только дополняют их.
+                            // Когда их нет, после названия остальные строки являются вариантами.
+                            if (!options.length || (options.length===1 && question && String(options[0].text||"").toLowerCase()===question.toLowerCase())) {
+                                const qIdx=meaningful.findIndex(line => question && line.toLowerCase()===question.toLowerCase());
+                                meaningful.slice(qIdx>=0?qIdx+1:1).forEach(line => {
+                                    if (/^\d+$/.test(line)) return;
+                                    addOption(line, line);
+                                });
+                            }
+
+                            // Иногда option-node ошибочно включает название. Удаляем точное совпадение.
+                            if (question) {
+                                for (let i=options.length-1;i>=0;i--) {
+                                    if (!options[i].explicit && String(options[i].text||"").toLowerCase()===question.toLowerCase()) options.splice(i,1);
+                                }
+                            }
+                            if (!question || /^\d+$/.test(question) || serviceOnly.test(question)) question="Опрос";
+
+                            // MAX can expose a whole active poll's choices as one option node.
+                            // Recover only the observed flat shapes, after all DOM and text sources
+                            // have been combined and the poll-level vote count is available.
+                            if (activePoll && options.length===1) {
+                                const flatValue=cleanPollLine(options[0].text);
+                                const flatTwoChoiceSequence=flatValue.match(/^([a-zа-яё][a-zа-яё0-9_-]*)\s+([a-zа-яё][a-zа-яё0-9_-]*)$/u);
+                                const flatThreeZeroVoteChoices=flatValue.match(/^([a-zа-яё][a-zа-яё0-9_-]*)\s+([a-zа-яё][a-zа-яё0-9_-]*)\s+([a-zа-яё][a-zа-яё0-9_-]*)$/u);
+                                const pollVoteCount=flatPollVotesMatch
+                                    ? Number(flatPollVotesMatch[1])
+                                    : (options[0].votes==null ? null : Number(options[0].votes));
+                                let recoveredLabels=null;
+                                let recoveredVotes=[];
+                                if (pollVoteCount!=null && pollVoteCount>0 && flatTwoChoiceSequence) {
+                                    recoveredLabels=flatTwoChoiceSequence.slice(1);
+                                    recoveredVotes=[0,pollVoteCount];
+                                } else if ((pollVoteCount==null || pollVoteCount===0) &&
+                                    /no\s+answers\s+yet/i.test(rawPollText) && flatThreeZeroVoteChoices) {
+                                    recoveredLabels=flatThreeZeroVoteChoices.slice(1);
+                                    recoveredVotes=recoveredLabels.map(()=>0);
+                                }
+                                if (recoveredLabels) {
+                                    options.splice(0,1,...recoveredLabels.map((label,index)=>({
+                                        text:label, votes:recoveredVotes[index], explicit:true,
+                                    })));
+                                }
+                            }
+
+                            // MAX can render every answer and its vote count inside one
+                            // text node. Recover each "... N votes, P%" segment from that
+                            // flattened text so zero-vote options are not lost.
+                            const resultPattern=/(\d+)\s*(?:votes?|голос(?:а|ов)?)\s*[,;]\s*\d+(?:[.,]\d+)?\s*%/giu;
+                            const serviceMarker=rawPollText.match(/select\s+one\s+or\s+(?:multiple|more)\s+answers|select\s+multiple\s+answers|choose\s+one\s+or\s+(?:multiple|more)\s+answers|select\s+an\s+answer|choose\s+an\s+answer|выберите\s+один\s+или\s+несколько\s+(?:вариантов\s+)?ответов|выберите\s+(?:вариант\s+)?ответ(?:а)?/i);
+                            let segmentStart=serviceMarker
+                                ? serviceMarker.index + serviceMarker[0].length
+                                : (question!=="Опрос" ? Math.max(0,rawPollText.toLowerCase().indexOf(question.toLowerCase()) + question.length) : 0);
+                            let previousEnd=segmentStart;
+                            let previousVotes=null;
+                            let resultMatch;
+                            const resultOptionLabels=[];
+                            while ((resultMatch=resultPattern.exec(rawPollText)) !== null) {
+                                if (resultMatch.index < segmentStart) continue;
+                                let label=rawPollText.slice(previousEnd,resultMatch.index);
+                                label=label.replace(/(?:your choice|ваш выбор|you voted|вы проголосовали|selected)(?=$|[\s.,;:])/ig," ");
+                                label=label.replace(/(?:winner|победитель)(?=$|[\s.,:;])\s*[.,:;]?\s*\d*/ig," ");
+                                label=label.replace(/(?:select\s+an\s+answer|choose\s+an\s+answer|выберите\s+(?:вариант\s+)?ответ(?:а)?|выбор\s+сразу\s+отправит\s+голос)(?=$|[\s.,;:])/ig," ");
+                                if (previousVotes !== null) {
+                                    const leadingCount=label.match(/^[\s.,;:]*(\d+)\s+/);
+                                    if (leadingCount && Number(leadingCount[1])===previousVotes) {
+                                        label=label.slice(leadingCount[0].length);
+                                    }
+                                }
+                                label=cleanPollLine(label).replace(/^[\s.,;:]+|[\s.,;:]+$/g,"").trim();
+                                if (question!=="Опрос" && label.toLowerCase().startsWith(question.toLowerCase())) {
+                                    label=label.slice(question.length).trim();
+                                }
+                                if (label) {
+                                    addOption(label,resultMatch[1]);
+                                    resultOptionLabels.push(label.toLowerCase());
+                                }
+                                previousVotes=Number(resultMatch[1]);
+                                previousEnd=resultPattern.lastIndex;
+                            }
+
+                            // A generic MAX button can wrap several result labels into one
+                            // pseudo-option. When the percentage rows split those labels,
+                            // discard only that composite wrapper and keep each real answer.
+                            if (resultOptionLabels.length > 1) {
+                                for (let i=options.length-1;i>=0;i--) {
+                                    const existing=cleanPollLine(options[i].text).toLowerCase();
+                                    if (!resultOptionLabels.includes(existing) && resultOptionLabels.every(label=>existing.includes(label))) {
+                                        options.splice(i,1);
+                                    }
+                                }
+                            }
+
+                            // Ключевой случай MAX: отдельное число сверху = общее число ответов.
+                            // Если остался один реальный вариант без собственного счётчика, оно относится к нему.
+                            if (options.length===1 && (options[0].votes==null || Number(options[0].votes)===0) && aggregateVotes!=null) {
+                                options[0].votes=aggregateVotes;
+                            }
+                            const normalizedOptions=options
+                                // A standalone number is a vote/count control in MAX's
+                                // poll DOM, not an answer option (for example "1: 0").
+                                .filter(item=>!/^[+-]?\d+(?:[.,]\d+)?$/.test(String(item.text||"").trim()))
+                                .map(item=>({
+                                    text:String(item.text||"").trim(),
+                                    votes:Number.isFinite(Number(item.votes))?Math.max(0,Number(item.votes)):0,
+                                    explicit:Boolean(item.explicit)
+                                }));
+                            const totalVotes=normalizedOptions.reduce((sum,item)=>sum+item.votes,0);
+                            if (options.length || question!=="Опрос") {
+                                result.poll={question:question.slice(0,255),options:normalizedOptions,total_votes:totalVotes,raw_text:cleanPollLine(rawPollText),is_closed:isClosed};
+                            }
+                        }
+                    } catch(e) {}
+
+                    // Контакт.
+                    try {
+                        const rowText = clean(outerRow.innerText);
+                        const visibleContactText = clean(getOwnText(outerRow));
+                        const phonePattern = /(?<!\w)\+?\d[\d\s().-]{8,}\d(?!\w)/;
+                        const validPhoneText = value => {
+                            const digitCount = String(value || "").replace(/\D/g, "").length;
+                            return digitCount >= 10 && digitCount <= 15;
+                        };
+                        const contactPhoneText = (rowText.match(/(?<!\w)\+?\d[\d\s().-]{8,}\d(?!\w)/g) || []).find(validPhoneText) || "";
+                        const contactAction = Array.from(outerRow.querySelectorAll("button,[role='button'],a")).some(el =>
+                            /go to conversation|open chat|перейти к диалогу|перейти в чат|открыть чат/i.test(
+                                `${clean(el.innerText)} ${safeAttr(el,"aria-label")} ${safeAttr(el,"title")} ${safeAttr(el,"class")}`
+                            )
+                        );
+                        const messageBlock=outerRow.querySelector(".block") || row;
+                        const contactVisual = Array.from(messageBlock.querySelectorAll(
+                            "[data-contact-avatar],[class*='contact' i] img,img,canvas,[style*='background-image' i],[data-image-url],[data-photo-url]"
+                        )).some(el => {
+                            const meta=`${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el.parentElement || el,"class")} ${safeAttr(el.parentElement || el,"data-testid")}`;
+                            if (/data-contact-avatar|contact-avatar|contact-photo/i.test(meta)) return true;
+                            if (/avatar|userpic|profile|author|sender/i.test(meta)) return false;
+                            try {
+                                const rect=el.getBoundingClientRect();
+                                const largest=Math.max(rect.width,rect.height);
+                                return rect.width>=24 && rect.height>=24 && largest<=220 &&
+                                    Math.abs(rect.width-rect.height)<=Math.max(24,largest*0.2);
+                            } catch(e) { return false; }
+                        });
+                        const contactSelector="[data-testid*='contact' i],[class*='contact-card' i],[class*='contact-message' i],[data-contact],[data-vcard],[data-phone],[data-contact-phone],[data-contact-phone-number]";
+                        const contact = row.querySelector(contactSelector) || outerRow.querySelector(contactSelector) ||
+                            (contactAction || (contactPhoneText && contactVisual) ? row : null);
+                        const explicitContactText = /already in your contacts|уже в ваших контактах/i.test(rowText) ||
+                            contactAction || Boolean(contactPhoneText && contactVisual);
+                        // Обычное сообщение не считается контактом. Нужен явный DOM-маркер,
+                        // реальный телефон/vCard или точный служебный текст MAX о контакте.
+                        if (!contact && !explicitContactText) {
+                            // Обычное сообщение/имя — не контакт. Ничего не добавляем.
+                        } else {
+                        const scope = contact || row;
+                        let phone = "";
+                        const normalizePhone = (raw, allowBare=false) => {
+                            const value=String(raw||"").replace(/%2B/ig,"+").trim();
+                            const digits=value.replace(/\D/g,"");
+                            if(digits.length<10 || digits.length>15) return "";
+                            if(!allowBare && !value.startsWith("+") && !/[\s().-]/.test(value)) return "";
+                            return (value.startsWith("+")?"+":"")+digits;
+                        };
+                        const phoneAttrs = ["data-phone","data-contact-phone","data-phone-number","data-user-phone","data-mobile","phone","tel","mobile","telephone","msisdn"];
+                        for (const el of [scope, ...Array.from(scope.querySelectorAll("*")).slice(0,500)]) {
+                            for (const a of phoneAttrs) {
+                                const v = safeAttr(el,a);
+                                if (v) { phone = normalizePhone(v,true); if(phone) break; }
+                            }
+                            if (phone) break;
+                        }
+                        if (!phone) {
+                            const tel=scope.querySelector("a[href^='tel:' i],[href^='tel:' i]");
+                            if(tel) phone=normalizePhone((safeAttr(tel,"href")||"").replace(/^tel:/i,""),true);
+                        }
+                        if (!phone) {
+                            const labeled=clean(scope.textContent).match(/(?:phone(?:\s*number)?|mobile(?:\s*phone)?|telephone|tel|msisdn|телефон|мобильный)\s*[:=]?\s*(\+?\d[\d\s().-]{8,}\d)/i);
+                            if(labeled) phone=normalizePhone(labeled[1],true);
+                        }
+                        if (!phone) {
+                            const visible=clean(scope.textContent);
+                            const formatted=(visible.match(/(?<!\w)\+?\d[\d\s().-]{8,}\d(?!\w)/g) || []).find(validPhoneText);
+                            if(formatted) phone=normalizePhone(formatted);
+                        }
+                        if (!phone) {
+                            const vcard=String(safeAttr(scope,"data-vcard")||safeAttr(scope,"data-contact")||"");
+                            const tel=vcard.match(/TEL(?:;[^:\r\n]*)?:\s*(?:tel:)?([+\d][\d ()+.-]{8,}\d)/i);
+                            if(tel) phone=normalizePhone(tel[1],true);
+                        }
+                        let contactName = "";
+                        if (visibleContactText) {
+                            const cleanedVisible = visibleContactText.replace(/already in your contacts|уже в ваших контактах/ig," ").trim();
+                            const nameVisible = phone ? cleanedVisible
+                                .replace(phonePattern, " ")
+                                .replace(/\b(?:phone(?:\s*number)?|mobile(?:\s*phone)?|telephone|tel|телефон|мобильный)\b\s*[:=]?/ig, " ")
+                                .replace(/go to conversation|open chat|перейти к диалогу|перейти в чат|открыть чат/ig, " ")
+                                .replace(/\s+/g, " ").trim() : cleanedVisible;
+                            const lines = nameVisible.split(/\n+/).map(x=>x.trim()).filter(Boolean);
+                            contactName = lines.find(x => !/\d{5,}/i.test(x)) || "";
+                        }
+                        if (!contactName && contact) {
+                            const nameNode = scope.querySelector("[data-contact-name],[data-display-name],[class*='contact-name' i],[class*='display-name' i]");
+                            if (nameNode) contactName = clean(nameNode.textContent);
+                        }
+                        if (!contactName) {
+                            const lines = rowText.split(/\n+/).map(x=>x.trim()).filter(Boolean);
+                            contactName = lines.find(x => !/already in your contacts|уже в ваших контактах|\d{5,}/i.test(x)) || "";
+                        }
+                        contactName = contactName.replace(/already in your contacts|уже в ваших контактах/ig,"").trim();
+                        if (phone || contactName) result.contact = {phone: phone.slice(0,64), first_name: (contactName || "").slice(0,64), last_name: "", is_contact: true};
+                        }
+                    } catch(e) {}
+
+                    return result;
+                }
+
                 rows.forEach((row, index) => {
                     try {
+                        const domIndex = firstSelectedIndex + index;
                         const fullRowText = clean(row.innerText);
                         const isSystemEvent = /(?:изменил(?:а)?(?:\s+[^.!?]{0,80})?(?:название|имя)|добавил(?:а)?[^.!?]{0,80}(?:в чат|в группу)|удалил(?:а)?[^.!?]{0,80}(?:из чата|из группы)|исключил(?:а)?[^.!?]{0,80}(?:из чата|из группы)|пригласил(?:а)?[^.!?]{0,80}(?:в чат|в группу)|вошел(?:\s+в)?\s+чат|вошла(?:\s+в)?\s+чат|покинул(?:а)?\s+чат|создал(?:а)?\s+чат|вернулся(?:\s+в)?\s+чат|вернулась(?:\s+в)?\s+чат)/i.test(fullRowText);
 
@@ -1330,11 +4263,11 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                             safeAttr(row, "data-mid") ||
                             safeAttr(row, "data-id") ||
                             safeAttr(row, "data-index") ||
-                            String(index);
+                            String(domIndex);
 
                         if (isSystemEvent) {
                             results.push({
-                                idx: index,
+                                idx: domIndex,
                                 source_id: String(sourceId),
                                 source_id_is_index: !Boolean(
                                     safeAttr(row, "data-message-id") ||
@@ -1360,16 +4293,121 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
 
                         const name = getAuthor(row);
                         const role = getRole(row, name);
+                        // Сначала получаем emoji из DOM, затем используем их как fallback
+                        // для emoji-only сообщений. В v10 переменная emojiTexts объявлялась
+                        // ПОСЛЕ первого обращения к ней, из-за чего каждый обычный .item
+                        // падал с ReferenceError и в итоге парсер видел 0 сообщений.
+                        const emojiTexts = getEmojiTexts(bubble);
                         let text = getOwnText(row);
+                        // Emoji-only сообщения часто не имеют отдельного .text в MAX.
+                        // Сохраняем сами эмодзи, не превращая время/служебный текст в сообщение.
+                        if (!text) {
+                            try {
+                                const emojiMatches = fullRowText.match(/[\p{Extended_Pictographic}](?:\uFE0F|\u200D[\p{Extended_Pictographic}])*/gu) || [];
+                                if (emojiMatches.length) text = emojiMatches.join("");
+                            } catch(e) {}
+                            if (!text && emojiTexts.length) text = emojiTexts.join("");
+                        }
+                        if (emojiTexts.length) {
+                            try {
+                                const present = new Set(text.match(/[\p{Extended_Pictographic}](?:\uFE0F|\u200D[\p{Extended_Pictographic}])*/gu) || []);
+                                const missing = emojiTexts.filter(e => !present.has(e));
+                                if (missing.length) text = (text || "") + missing.join("");
+                            } catch(e) {}
+                        }
                         const time = getTime(row);
                         const date = getDate(row);
                         const replyBlock = getReplyBlock(row);
                         const replyText = getReplyText(replyBlock);
-                        const images = getImageUrls(block);
+                        // Media and special-card selectors are scoped to this message's bubble.
+                        // The outer .item can also contain nested/replied cards and UI controls.
+                        const images = getImageUrls(bubble);
+                        const emojiImageUrls = getEmojiImageUrls(bubble);
+                        const imageCandidateCount = getImageCandidateCount(bubble);
+                        let photoVisualHint = Boolean(bubble.querySelector("img, picture source, canvas, [data-image-url], [data-photo-url], [data-media-url], [style*='background-image' i]"));
+                        if (!photoVisualHint) {
+                            try {
+                                const visualNodes = bubble.querySelectorAll("div,span,a,button,figure");
+                                for (const el of visualNodes) {
+                                    const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")}`;
+                                    if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи|sticker|стикер/i.test(meta)) continue;
+                                    const rect = el.getBoundingClientRect();
+                                    const bg = getComputedStyle(el).backgroundImage || "";
+                                    if (rect.width >= 100 && rect.height >= 80 && /^url\(/i.test(bg) && /(photo|image|media|picture|attachment|gallery|фото|изображ|картин)/i.test(meta)) {
+                                        photoVisualHint = true;
+                                        break;
+                                    }
+                                    if (rect.width >= 120 && rect.height >= 90 && /^url\(/i.test(bg)) { photoVisualHint = true; break; }
+                                }
+                            } catch(e) {}
+                        }
+                        const richAttachments = getRichAttachments(bubble);
+                        const stickerHint = Boolean(bubble.querySelector("[class*='sticker' i],[data-testid*='sticker' i],[aria-label*='sticker' i],[aria-label*='стикер' i],[data-sticker]"));
+                        const mediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("video,audio,source,button,[role='button'],[aria-label],[data-testid]")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')} ${el.tagName||''}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
+                        const deepMediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("*")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
+                        const callLike = /звонок|вызов|call|calling|ringing|incoming call|outgoing call/.test(`${fullRowText} ${mediaMeta}`.toLowerCase());
+                        // time в шапке .item — время сообщения, а не длительность
+                        // вложения. Берём длительность только из самой bubbleContent.
+                        const bubbleText = clean(bubble.innerText);
+                        // Bubble text also contains the message timestamp (for example 11:12 PM).
+                        // Only MAX's dedicated media duration nodes can mark audio/video.
+                        const mediaDurationText = Array.from(bubble.querySelectorAll("[class~='duration'],[class~='time']"))
+                            .map(el=>clean(el.textContent)).filter(value=>/^\d{1,2}:\d{2}$/.test(value)).join(" ");
+                        const hasDuration = Boolean(mediaDurationText);
+                        const durationMatch = mediaDurationText.match(/^(\d{1,2}):(\d{2})/);
+                        const mediaDurationSeconds = durationMatch ? Number(durationMatch[1])*60 + Number(durationMatch[2]) : 0;
+                        const hasSquareMediaBox = !callLike && Array.from(bubble.querySelectorAll("video,[class*='video' i],[class*='круж' i],[data-testid*='video' i]")).some(el=>{
+                            try {
+                                const r=el.getBoundingClientRect();
+                                return r.width>55 && r.height>55 && Math.abs(r.width-r.height)<=24;
+                            } catch(e) { return false; }
+                        });
+                        const durationWithSquareParent = !callLike && hasDuration && Array.from(bubble.querySelectorAll("*"))
+                            .filter(el=>String(el.textContent||'').trim().match(/^\d{1,2}:\d{2}$/))
+                            .some(el=>{
+                                let n=el;
+                                for(let d=0; n && d<5; d++, n=n.parentElement){
+                                    try {
+                                        const r=n.getBoundingClientRect();
+                                        if(r.width>70 && r.height>70 && Math.abs(r.width-r.height)<=28) return true;
+                                    } catch(e) {}
+                                }
+                                return false;
+                            });
+                        let videoNoteHint = !callLike && (/video.?note|videonote|video[_ -]?message|кружок|кружочек|round.?video|roundvideo/.test(mediaMeta) || richAttachments.some(a=>a.type==="video_note") || hasSquareMediaBox || durationWithSquareParent || !!Array.from(bubble.querySelectorAll('video')).some(el=>{try{const r=el.getBoundingClientRect();return r.width>30&&r.height>30&&Math.abs(r.width-r.height)<=18;}catch(e){return false;}}));
+                        let voiceHint = !videoNoteHint && !callLike && (/(?:voice|voice.?message|voice_message|attach.?audio|waveform|голосов(?:ое|ая|ым|ого)(?:\s+(?:сообщение|запись|файл))?|аудиосообщ)/.test(deepMediaMeta) || richAttachments.some(a=>a.type==="voice") || bubble.querySelector('audio')!=null || (hasDuration && /audio|attach.?audio|waveform|голосов(?:ое|ая)/.test(deepMediaMeta)));
+                        const special = getSpecialContent(bubble, row);
+                        // Vote controls include the Russian word "голосовать"; they must
+                        // never turn a completed poll into a voice-message candidate.
+                        if (special.poll) {
+                            voiceHint = false;
+                            videoNoteHint = false;
+                        }
+                        // На некоторых сборках MAX строка статуса контакта находится рядом
+                        // с bubbleContent. Используем только точную системную фразу как маркер.
+                        if (!special.contact && /already in your contacts|уже в ваших контактах/i.test(fullRowText)) {
+                            const contactName = clean(text.replace(/already in your contacts|уже в ваших контактах/ig, " "));
+                            if (contactName) special.contact = {phone:"", first_name:contactName.slice(0,64), last_name:"", is_contact:true};
+                        }
+                        const pollServiceOnly = !special.poll &&
+                            /poll|survey|option|answer|vote|опрос|голос/i.test(`${safeAttr(row,"class")} ${safeAttr(row,"data-testid")} ${fullRowText}`) &&
+                            /^(.*?)\s+\d+(?:\s+\d+)?\s+(?:votes?|голос(?:а|ов)?)$/i.test(fullRowText);
+                        // Не выбрасываем такую строку здесь: Python объединит её с основным
+                        // опросом и удалит после переноса количества голосов.
+                        // Длительность кружка/голосового не является текстом сообщения.
+                        if (videoNoteHint || voiceHint || richAttachments.some(a => a.type === "video_note" || a.type === "voice")) {
+                            if (/^\s*\d{1,2}:\d{2}\s*$/.test(text)) text = "";
+                        }
+                        if (special.location) {
+                            text = text.replace(/(?:open yandex maps|открыть yandex maps|открыть карту)/ig, "").trim();
+                        }
+                        if (special.contact) {
+                            text = text.replace(/already in your contacts|уже в ваших контактах/ig, "").trim();
+                        }
                         const documents = [];
                         const filenameHint = extractFilename(fullRowText);
 
-                        getFileNodes(block).forEach((el, nodeIndex) => {
+                        getFileNodes(bubble).forEach((el, nodeIndex) => {
                             try {
                                 const href = getCandidateUrl(el);
                                 const downloadAttr = safeAttr(el, "download");
@@ -1393,7 +4431,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                                     }
                                 }
                                 if (!href && /скачать|download/i.test(hint)) {
-                                    const clickId = `max-parser-download-${index}-${nodeIndex}`;
+                                    const clickId = `max-parser-download-${domIndex}-${nodeIndex}`;
                                     try {
                                         el.setAttribute("data-max-parser-download-id", clickId);
                                     } catch (e) {}
@@ -1408,7 +4446,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
 
                         // Ключевой fallback: если у карточки нет URL, Python будет нажимать "Скачать".
                         let downloadClickId = "";
-                        const clickControls = block.querySelectorAll(
+                        const clickControls = bubble.querySelectorAll(
                             "a, button, [role='button'], span, div"
                         );
                         for (let nodeIndex = 0; nodeIndex < clickControls.length; nodeIndex++) {
@@ -1421,7 +4459,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                                 /^(скачать|download)$/i.test(ownText) ||
                                 /скачать|download/i.test(aria + " " + title + " " + cls)
                             ) {
-                                downloadClickId = `max-parser-download-${index}-final-${nodeIndex}`;
+                                downloadClickId = `max-parser-download-${domIndex}-final-${nodeIndex}`;
                                 try {
                                     el.setAttribute("data-max-parser-download-id", downloadClickId);
                                 } catch (e) {}
@@ -1429,7 +4467,8 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                             }
                         }
 
-                        const hasSomething = Boolean(text || images.length || documents.length || filenameHint || downloadClickId);
+                        const bareMediaCard = Boolean(bubble.querySelector("video,audio,canvas,[class*='voice' i],[class*='video-note' i],[class*='videonote' i],[class*='круж' i],[class*='голос' i]"));
+                        const hasSomething = Boolean(text || emojiTexts.length || emojiImageUrls.length || images.length || documents.length || richAttachments.length || stickerHint || special.location || special.poll || special.contact || filenameHint || downloadClickId || bareMediaCard);
                         if (!hasSomething) return;
 
                         // Защита от ситуации, когда MAX случайно записал текст сообщения в поле имени.
@@ -1445,29 +4484,47 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                         }
 
                         results.push({
-                            idx: index,
+                            idx: domIndex,
                             source_id: String(sourceId),
+                            data_message_id: safeAttr(row, "data-message-id"),
+                            mid: safeAttr(row, "data-mid"),
+                            data_id: safeAttr(row, "data-id"),
                             source_id_is_index: !Boolean(
                                 safeAttr(row, "data-message-id") ||
                                 safeAttr(row, "data-mid") ||
                                 safeAttr(row, "data-id")
                             ),
-                            dom_id: `max-parser-message-${index}`,
+                            dom_id: `max-parser-message-${domIndex}`,
                             download_click_id: downloadClickId,
                             download_click_filename: filenameHint,
                             name: finalName || "Аноним",
                             text,
                             time,
                             date,
+                            date_source: safeAttr(row,"data-max-parser-date-source") || "unresolved",
                             images,
+                            emoji_image_urls: emojiImageUrls,
+                            image_candidate_count: imageCandidateCount,
+                            photo_visual_hint: photoVisualHint,
+                            emoji_texts: emojiTexts,
                             documents,
+                            attachments: richAttachments,
+                            sticker_hint: stickerHint,
+                            location: special.location,
+                            poll: special.poll,
+                            contact: special.contact,
+                            video_note_hint: Boolean(videoNoteHint),
+                            voice_hint: Boolean(voiceHint),
+                            media_duration_seconds: mediaDurationSeconds,
+                            media_hint_debug: `${mediaDurationText} | ${mediaMeta}`.slice(0,500),
                             is_reply: Boolean(replyBlock),
                             reply_text: replyText,
                             is_system_event: isSystemEvent,
+                            is_poll_service: Boolean(pollServiceOnly),
                         });
 
                         try {
-                            row.setAttribute("data-max-parser-message-id", `max-parser-message-${index}`);
+                            row.setAttribute("data-max-parser-message-id", `max-parser-message-${domIndex}`);
                         } catch (e) {}
 
                     } catch (e) {
@@ -1477,23 +4534,35 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
 
                 return results;
             }
-            """
+            """,
+            MAX_MESSAGES_TO_PARSE,
         )
+        if raw_messages is None:
+            print(f"[{chat_id}] ⚠️ MAX не вернул список сообщений; считаю ленту пустой")
+            raw_messages = []
+        elif not isinstance(raw_messages, list):
+            raise TypeError(
+                f"MAX вернул неожиданный тип списка сообщений: {type(raw_messages).__name__}"
+            )
+        debug_logger.info(
+            "MAX_DOM_EXTRACTED chat_id=%s raw_cards=%s max_messages=%s",
+            chat_id, len(raw_messages), MAX_MESSAGES_TO_PARSE,
+        )
+        if len(raw_messages) > MAX_MESSAGES_TO_PARSE:
+            raise RuntimeError(
+                f"MAX извлёк {len(raw_messages)} карточек при установленном лимите "
+                f"{MAX_MESSAGES_TO_PARSE}; отправка остановлена"
+            )
 
         # Системные события MAX (переименование чата, вход/выход участника и т.п.)
         # могут на мгновение перестроить DOM и изменить data-index у старых сообщений.
         # Ничего из этого цикла не отправляем. На следующем цикле сообщения будут
         # проверены по стабильной сигнатуре содержимого и уже отправленные не уйдут повторно.
-        if any(msg.get("is_system_event") for msg in raw_messages):
-            print(
-                f"[{chat_id}] Обнаружено системное событие MAX — цикл пропущен "
-                "для защиты от переиндексации")
-            return []
-
         cleaned = []
         seen_ids = set()
         for msg in raw_messages:
             text = " ".join((msg.get("text") or "").split()).strip()
+            text = _strip_browser_video_fallback(text)
             name = " ".join((msg.get("name") or "").split()).strip()
             source_id = str(msg.get("source_id") or "").strip()
             reply_text = " ".join((msg.get("reply_text") or "").split()).strip()
@@ -1512,23 +4581,144 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
             if reply_text and text.casefold().startswith(reply_text.casefold()):
                 text = text[len(reply_text):].strip()
             msg["name"] = name or "Аноним"
+            if re.fullmatch(r"\d{1,2}:\d{2}", text) and (msg.get("attachments") or re.search(r"voice|audio|video|круж|голос", json.dumps(msg, ensure_ascii=False), re.I)):
+                text = ""
             msg["text"] = text
             msg["source_id"] = source_id
             if not is_human_message(msg):
                 continue
             if source_id:
                 if source_id in seen_ids:
-                    continue
+                    existing = next((x for x in cleaned if str(x.get("source_id") or "") == source_id), None)
+                    if existing and existing.get("_pre_signature") == msg.get("_pre_signature"):
+                        continue
                 seen_ids.add(source_id)
             cleaned.append(msg)
 
-        last_10 = cleaned[-10:]
-        print(f"[{chat_id}] После фильтрации: {len(last_10)} сообщений")
+        # В режиме тестирования отправляем ВСЕ найденные сообщения, которые
+        # реально присутствуют в загруженной ленте MAX. DOM-порядок MAX —
+        # от старых к новым, поэтому ничего не переворачиваем.
+        all_messages = cleaned
+
+        # MAX иногда выводит количество голосов отдельной соседней .item, например
+        # "Название 1 1 vote". Это не отдельное сообщение — переносим его в poll.
+        consumed_poll_service = set()
+        for i, poll_msg in enumerate(all_messages):
+            poll = poll_msg.get("poll") or {}
+            if not poll:
+                continue
+            for j in range(i + 1, min(i + 6, len(all_messages))):
+                if j in consumed_poll_service:
+                    continue
+                candidate = " ".join((all_messages[j].get("text") or "").split()).strip()
+                m = re.match(r"^(.*?)\s+(\d+)\s+(?:votes?|голос(?:а|ов))$", candidate, re.I)
+                if not m:
+                    if j > i + 2:
+                        break
+                    continue
+                label = re.sub(r"\s+\d+\s*$", "", m.group(1)).strip(" -–—")
+                if not label or re.fullmatch(r"\d+", label):
+                    continue
+                votes = int(m.group(2))
+                options = poll.setdefault("options", [])
+                found = None
+                for opt in options:
+                    if isinstance(opt, dict) and str(opt.get("text") or "").casefold() == label.casefold():
+                        found = opt
+                        break
+                if found is not None:
+                    found["votes"] = votes
+                else:
+                    options.append({"text": label, "votes": votes})
+                consumed_poll_service.add(j)
+            poll["total_votes"] = sum(max(0, int(o.get("votes") or 0)) for o in poll.get("options", []) if isinstance(o, dict))
+        all_messages = [m for idx, m in enumerate(all_messages) if idx not in consumed_poll_service]
+        all_messages = all_messages[-MAX_MESSAGES_TO_PARSE:] if MAX_MESSAGES_TO_PARSE else []
+        print(f"[{chat_id}] После фильтрации: {len(all_messages)} сообщений (от старых к новым)")
 
         human_posts = []
-        for msg in last_10:
+        for msg in all_messages:
+            if not (msg.get("emoji_texts") or "") and bool(msg.get("emoji_image_urls")):
+                refreshed_emoji = _refresh_emoji_texts(page, msg, chat_id=chat_id)
+                if refreshed_emoji:
+                    msg["emoji_texts"] = refreshed_emoji
+                    if not str(msg.get("text") or "").strip():
+                        msg["text"] = "".join(refreshed_emoji)
+            if (msg.get("contact") or {}).get("is_contact"):
+                contact_obj=msg.setdefault("contact", {})
+                if not str(contact_obj.get("phone") or "").strip():
+                    resolved_phone = _resolve_contact_phone_from_card(page, msg, chat_id=chat_id, group_url=group_url)
+                    if resolved_phone:
+                        contact_obj["phone"] = resolved_phone
+                if not str(contact_obj.get("phone") or "").strip() and not str(contact_obj.get("url") or "").strip():
+                    resolved_link = _resolve_contact_link_via_dialog(page, msg, group_url=group_url, chat_id=chat_id)
+                    if resolved_link:
+                        contact_obj["url"] = resolved_link
             media_files = []
-            for img_url in msg.get("images", []):
+            def has_expected_rich_media():
+                if msg.get("video_note_hint") or msg.get("voice_hint"):
+                    return any(_media_satisfies_hint(m, msg) for m in media_files)
+                return any(m.get("type") in ("voice", "video_note", "video", "audio") for m in media_files)
+            image_urls = []
+            seen_image_urls = set()
+            rich_media_types = {"voice", "audio", "video", "video_note", "animation", "emoji"}
+            rich_media_urls = {
+                str(a.get("url") or "").strip()
+                for a in (msg.get("attachments") or [])
+                if isinstance(a, dict) and a.get("type") in rich_media_types and str(a.get("url") or "").strip()
+            }
+            rich_media_hint = bool(rich_media_urls) or any(
+                isinstance(a, dict) and a.get("type") in rich_media_types
+                for a in (msg.get("attachments") or [])
+            )
+            emoji_image_urls = {str(u).strip() for u in (msg.get("emoji_image_urls") or []) if str(u).strip()}
+            emoji_fallback_urls = set()
+            if not (msg.get("emoji_texts") or []):
+                # A custom MAX emoji can hide its Unicode value. Preserve its visual
+                # instead of silently dropping the message; animated assets are reduced
+                # to a static emoji photo below, while sticker animations stay videos.
+                emoji_fallback_urls = set(emoji_image_urls)
+                image_urls.extend(sorted(emoji_fallback_urls))
+                seen_image_urls.update(emoji_fallback_urls)
+            for u in (msg.get("images", []) or []):
+                u=str(u or "").strip()
+                if not u or (u in emoji_image_urls and u not in emoji_fallback_urls):
+                    continue
+                if u not in seen_image_urls:
+                    seen_image_urls.add(u); image_urls.append(u)
+            # Повторно читаем живую карточку: именно captioned-photo часто получает
+            # настоящий src только после того, как карточка попала в viewport.
+            for u in _refresh_card_image_urls(page, msg, chat_id=chat_id):
+                if u in emoji_image_urls and u not in emoji_fallback_urls:
+                    continue
+                if u not in seen_image_urls:
+                    seen_image_urls.add(u); image_urls.append(u)
+            rich_url_overlaps = {u for u in image_urls if u in rich_media_urls}
+            image_urls = [u for u in image_urls if u not in rich_media_urls]
+            try:
+                raw_candidate_count = max(0, int(msg.get("image_candidate_count") or 0))
+            except Exception:
+                raw_candidate_count = 0
+            candidate_count = max(
+                len(image_urls),
+                max(0, raw_candidate_count - len(rich_url_overlaps)),
+            )
+            photo_visual_hint = bool(msg.get("photo_visual_hint")) and not (
+                rich_media_hint and not image_urls
+            )
+
+            # Captioned-photo is warmed up before reading its URL. A screenshot is a
+            # fallback only: adding it alongside a successfully downloaded image creates
+            # visually identical duplicates with different byte hashes.
+            emoji_only = bool(msg.get("emoji_texts")) and not bool((msg.get("text") or "").strip().replace(" ", ""))
+            has_captioned_photo_hint = bool((msg.get("text") or "").strip()) and bool(
+                image_urls or (photo_visual_hint and not rich_media_hint)
+            )
+            if has_captioned_photo_hint and not rich_media_hint and not emoji_only and not (msg.get("contact") or {}).get("is_contact") and not msg.get("location") and not msg.get("poll"):
+                _warmup_captioned_photo_card(page, msg, chat_id=chat_id)
+
+            non_image_urls = set()
+            for img_url in image_urls:
                 media = get_media_bytes(
                     img_url,
                     media_type="image",
@@ -1537,6 +4727,22 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     page=page,
                 )
                 if media and media.get("bytes"):
+                    if img_url in emoji_fallback_urls:
+                        media["_emoji_fallback"] = True
+                    detected_type = media.get("type")
+                    if detected_type in {"video", "audio"}:
+                        non_image_urls.add(img_url)
+                        if detected_type == "video" and msg.get("video_note_hint"):
+                            media["type"] = "video_note"
+                        elif detected_type == "audio" and msg.get("voice_hint"):
+                            media["type"] = "voice"
+                        media["filename"] = _media_filename(
+                            media.get("filename", ""),
+                            img_url,
+                            media.get("content_type", ""),
+                            media["bytes"],
+                            media["type"],
+                        )
                     media_files.append(media)
             for doc in msg.get("documents", []):
                 doc_url = (doc.get("url") or "").strip()
@@ -1548,6 +4754,102 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     url=doc_url,
                     filename=doc.get("filename", ""),
                     chat_id=chat_id,
+                )
+                if media and media.get("bytes"):
+                    media_files.append(media)
+            candidate_count = max(0, candidate_count - len(non_image_urls))
+            if non_image_urls and candidate_count == 0:
+                photo_visual_hint = False
+                has_captioned_photo_hint = False
+            downloaded_image_count = sum(1 for m in media_files if m.get("type") == "image")
+            should_visual_fallback = (
+                ((candidate_count and downloaded_image_count < candidate_count) or
+                 (photo_visual_hint and downloaded_image_count == 0) or
+                 (has_captioned_photo_hint and downloaded_image_count == 0))
+                and not emoji_only and not msg.get("voice_hint") and not msg.get("video_note_hint")
+            )
+            if should_visual_fallback:
+                debug_logger.warning(
+                    "MAX_VISUAL_FALLBACK_SKIPPED chat_id=%s source_id=%s reason=screenshot_fallback_disabled",
+                    chat_id, msg.get("source_id") or msg.get("idx"),
+                )
+
+            for attachment in msg.get("attachments", []) or []:
+                att_url = (attachment.get("url") or "").strip()
+                if not att_url:
+                    continue
+                att_type = attachment.get("type") or "document"
+                if att_type == "emoji":
+                    if msg.get("emoji_texts"):
+                        continue
+                    att_type = "image"
+                if att_type == "video" and msg.get("video_note_hint"):
+                    att_type = "video_note"
+                elif att_type == "audio" and msg.get("voice_hint"):
+                    att_type = "voice"
+                media = _download_document_to_memory(
+                    page=page,
+                    context=context,
+                    url=att_url,
+                    filename=attachment.get("filename", ""),
+                    chat_id=chat_id,
+                    media_type=att_type,
+                )
+                if media and media.get("bytes"):
+                    if attachment.get("type") == "emoji":
+                        media["_emoji_fallback"] = True
+                    media_kind = _media_payload_kind(media)
+                    expected_type = "video" if msg.get("video_note_hint") else "audio" if msg.get("voice_hint") else ""
+                    if expected_type and media_kind != expected_type:
+                        debug_logger.warning(
+                            "MAX_MEDIA_ATTACHMENT_KIND_MISMATCH chat_id=%s source_id=%s expected=%s detected=%s content_type=%s bytes=%s",
+                            chat_id, msg.get("source_id") or msg.get("idx"), expected_type,
+                            media_kind or "unknown", media.get("content_type") or "<none>", len(media.get("bytes") or b"")
+                        )
+                        continue
+                    if not expected_type and att_type in {"image", "sticker"} and media_kind == "video":
+                        # MAX animated stickers can be exposed by a sticker card
+                        # instead of a <video> node. Trust the downloaded container
+                        # signature so WebM/MP4 reaches Telegram as a video.
+                        att_type = "video"
+                        media["filename"] = _media_filename(
+                            media.get("filename", ""), att_url,
+                            media.get("content_type", ""), media["bytes"], "video",
+                        )
+                    media["type"] = "video_note" if expected_type == "video" else "voice" if expected_type == "audio" else att_type
+                    media_files.append(media)
+            # Exact media element fallback: read bytes from the <audio>/<video>
+            # belonging to this message card only. No page-wide resource scan.
+            if not has_expected_rich_media():
+                expected_direct = "video_note" if msg.get("video_note_hint") else "voice" if msg.get("voice_hint") else ""
+                if expected_direct:
+                    media_files.extend(_read_media_element_bytes(page, msg, expected_direct, chat_id=chat_id))
+            if not has_expected_rich_media():
+                media_files.extend(_extract_live_rich_media(page, msg, chat_id=chat_id))
+            if not has_expected_rich_media() and (msg.get("voice_hint") or msg.get("video_note_hint")):
+                expected_type = "video_note" if msg.get("video_note_hint") else "voice"
+                media_files.extend(_take_preloaded_media(page, msg, expected_type, chat_id))
+            if not has_expected_rich_media() and (
+                bool(msg.get("voice_hint")) or bool(msg.get("video_note_hint")) or
+                (re.search(r"^\d{1,2}:\d{2}$", str(msg.get("text") or "").strip()) and
+                 (msg.get("attachments") or msg.get("voice_hint") or msg.get("video_note_hint")))
+            ):
+                expected_type = "video_note" if bool(msg.get("video_note_hint")) else "voice"
+                clicked_media = _capture_media_after_click(page,msg,expected_type=expected_type,chat_id=chat_id)
+                media_files.extend(clicked_media)
+                _claim_preloaded_media(page, clicked_media)
+                if not has_expected_rich_media():
+                    _activate_media_card(page, msg, chat_id=chat_id)
+                    page.wait_for_timeout(500)
+                    media_files.extend(_extract_live_rich_media(page, msg, chat_id=chat_id))
+            if msg.get("download_click_id") and not media_files:
+                click_type = msg.get("download_click_type") or "document"
+                media = _download_document_from_message_card(
+                    page=page,
+                    context=context,
+                    msg=msg,
+                    chat_id=chat_id,
+                    media_type=click_type,
                 )
                 if media and media.get("bytes"):
                     media_files.append(media)
@@ -1570,58 +4872,226 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     )
                     if media and media.get("bytes"):
                         media_files.append(media)
+            if msg.get("sticker_hint"):
+                has_animation_payload = any(
+                    media.get("type") in {"video", "animation"}
+                    or _animated_image_kind(bytes(media.get("bytes") or b""))
+                    for media in media_files
+                )
+                can_replace_still = not media_files or (
+                    len(media_files) == 1 and media_files[0].get("type") in {"image", "sticker"}
+                )
+                if not has_animation_payload and can_replace_still:
+                    recorded_sticker = _capture_animated_sticker(page, msg, chat_id=chat_id)
+                    if recorded_sticker:
+                        media_files = recorded_sticker
             unique_media = []
             seen_media_hashes = set()
+            seen_direct_visual_hashes = []
+            duplicate_media_count = 0
+            visual_duplicate_count = 0
+            if msg.get("sticker_hint"):
+                for media in media_files:
+                    if media.get("type") in {"image", "sticker"} and not media.get("_emoji_fallback"):
+                        media["_sticker_fallback"] = True
             for media in media_files:
+                if (msg.get("video_note_hint") or msg.get("voice_hint")) and not _media_satisfies_hint(media, msg):
+                    debug_logger.warning(
+                        "MAX_MEDIA_PAYLOAD_KIND_MISMATCH chat_id=%s source_id=%s expected=%s detected=%s content_type=%s bytes=%s",
+                        chat_id, msg.get("source_id") or msg.get("idx"),
+                        "video" if msg.get("video_note_hint") else "audio",
+                        _media_payload_kind(media) or "unknown", media.get("content_type") or "<none>",
+                        len(media.get("bytes") or b"")
+                    )
+                    continue
+                if msg.get("video_note_hint") and media.get("type") == "video":
+                    media["type"] = "video_note"
+                elif msg.get("voice_hint") and media.get("type") == "audio":
+                    media["type"] = "voice"
+                if media.get("_emoji_fallback"):
+                    media = _prepare_static_emoji_image(media, chat_id=chat_id)
+                elif media.get("_sticker_fallback"):
+                    media = _record_animated_image_as_video(media, chat_id=chat_id)
+                    if media.get("type") in {"image", "sticker"}:
+                        media = _prepare_static_sticker_image(media, chat_id=chat_id)
+                else:
+                    media = _record_animated_image_as_video(media, chat_id=chat_id)
+                media = _prepare_video_note_for_telegram(media, chat_id=chat_id)
                 data = media.get("bytes")
                 if not isinstance(data, (bytes, bytearray)) or not data:
                     continue
                 media_hash = get_media_hash(data=data)
-                if media_hash in seen_media_hashes:
+                visual_hash = _image_visual_hash(bytes(data)) if media.get("type") == "image" else None
+                visual_cache_hash = _visual_cache_key(visual_hash) if visual_hash else ""
+                media_identity = (
+                    visual_cache_hash
+                    if media.get("visual_fallback") and visual_cache_hash
+                    else media_hash
+                )
+                if media_identity in seen_media_hashes:
+                    duplicate_media_count += 1
                     continue
-                seen_media_hashes.add(media_hash)
-                media["hash"] = media_hash
+                if media.get("visual_fallback") and visual_hash and any(
+                    _similar_visual_image(visual_hash, previous_hash)
+                    for previous_hash in seen_direct_visual_hashes
+                ):
+                    visual_duplicate_count += 1
+                    continue
+                seen_media_hashes.add(media_identity)
+                media["hash"] = visual_cache_hash if media.get("visual_fallback") and visual_cache_hash else media_hash
+                if visual_cache_hash:
+                    media["visual_hash"] = visual_cache_hash
                 unique_media.append(media)
+                if media.get("type") == "image" and visual_hash:
+                    seen_direct_visual_hashes.append(visual_hash)
             human_posts.append({
                 "source_id": msg.get("source_id", ""),
                 "source_id_is_index": bool(msg.get("source_id_is_index")),
+                "idx": msg.get("idx"),
+                "data_message_id": msg.get("data_message_id", ""),
+                "mid": msg.get("mid", ""),
+                "data_id": msg.get("data_id", ""),
                 "name": msg.get("name", "Аноним"),
                 "text": msg.get("text", ""),
+                "emoji_texts": msg.get("emoji_texts", []),
                 "time": msg.get("time", ""),
                 "date": msg.get("date", ""),
+                "date_source": msg.get("date_source", "unresolved"),
+                "location": msg.get("location"),
+                "poll": msg.get("poll"),
+                "contact": msg.get("contact"),
+                "special": {
+                    "location": msg.get("location"),
+                    "poll": msg.get("poll"),
+                    "contact": msg.get("contact"),
+                },
                 "media_files": unique_media,
+                "photo_visual_hint": bool(msg.get("photo_visual_hint")),
+                "voice_hint": bool(msg.get("voice_hint")),
+                "video_note_hint": bool(msg.get("video_note_hint")),
+                "media_duration_seconds": float(msg.get("media_duration_seconds") or 0),
+
             })
+            parsed_post = human_posts[-1]
+            parsed_types = [m.get("type", "unknown") for m in unique_media]
+            media_info = [
+                (m.get("type"), len(m.get("bytes") or b""), m.get("content_type") or "",
+                 m.get("filename") or "", (m.get("bytes") or b"")[:16].hex())
+                for m in unique_media
+            ]
+            debug_logger.info(
+                "MAX_PARSED chat_id=%s source_id=%s date=%s date_source=%s time=%s duration=%ss media=%s candidates=%s "
+                "emoji=%s emoji_image_candidates=%s poll=%s contact=%s voice_hint=%s video_note_hint=%s hint_debug=%s text=%s",
+                chat_id,
+                parsed_post.get("source_id") or parsed_post.get("idx"),
+                parsed_post.get("date") or "<missing>",
+                parsed_post.get("date_source") or "unresolved",
+                parsed_post.get("time") or "<missing>",
+                parsed_post.get("media_duration_seconds") or 0,
+                media_info,
+                [(a.get("type"), bool(a.get("url"))) for a in (msg.get("attachments") or []) if isinstance(a, dict)],
+                log_preview("".join(str(x) for x in (parsed_post.get("emoji_texts") or [])), 80) or "<none>",
+                len(msg.get("emoji_image_urls") or []),
+                log_preview(json.dumps(parsed_post.get("poll"), ensure_ascii=False), 220) if parsed_post.get("poll") else "<none>",
+                bool((parsed_post.get("contact") or {}).get("is_contact")),
+                bool(parsed_post.get("voice_hint")),
+                bool(parsed_post.get("video_note_hint")),
+                log_preview(msg.get("media_hint_debug"), 200) or "<none>",
+                log_preview(parsed_post.get("text")),
+            )
+            if not parsed_post.get("date"):
+                debug_logger.warning(
+                    "MAX_DATE_MISSING chat_id=%s source_id=%s source=%s time=%s text=%s",
+                    chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
+                    parsed_post.get("date_source") or "unresolved",
+                    parsed_post.get("time") or "<missing>", log_preview(parsed_post.get("text"))
+                )
+            if msg.get("emoji_image_urls") and not parsed_post.get("emoji_texts"):
+                debug_logger.warning(
+                    "MAX_EMOJI_UNICODE_UNRESOLVED chat_id=%s source_id=%s image_candidates=%s text=%s",
+                    chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
+                    len(msg.get("emoji_image_urls") or []), log_preview(parsed_post.get("text")) or "<empty>"
+                )
+            if (parsed_post.get("voice_hint") or parsed_post.get("video_note_hint")) and not any(
+                t in {"voice", "audio", "video", "video_note"} for t in parsed_types
+            ):
+                debug_logger.error(
+                    "MAX_MEDIA_NOT_EXTRACTED chat_id=%s source_id=%s voice_hint=%s video_note_hint=%s",
+                    chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
+                    bool(parsed_post.get("voice_hint")), bool(parsed_post.get("video_note_hint"))
+                )
+            if parsed_post.get("poll") and not (parsed_post["poll"].get("options") or []):
+                debug_logger.warning(
+                    "MAX_POLL_WITHOUT_OPTIONS chat_id=%s source_id=%s question=%s raw=%s",
+                    chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
+                    log_preview(parsed_post["poll"].get("question")),
+                    log_preview(parsed_post["poll"].get("raw_text"))
+                )
+            if (parsed_post.get("contact") or {}).get("is_contact") and not (parsed_post["contact"].get("phone") or "").strip():
+                debug_logger.warning(
+                    "MAX_CONTACT_PHONE_MISSING chat_id=%s source_id=%s name=%s",
+                    chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
+                    log_preview(parsed_post["contact"].get("first_name"))
+                )
+            if duplicate_media_count or visual_duplicate_count:
+                debug_logger.warning(
+                    "MAX_DUPLICATE_MEDIA_REMOVED chat_id=%s source_id=%s exact=%s visual_fallback=%s",
+                    chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
+                    duplicate_media_count, visual_duplicate_count
+                )
+
+        if len(human_posts) > MAX_MESSAGES_TO_PARSE:
+            debug_logger.error(
+                "MAX_OUTPUT_LIMIT_ENFORCED chat_id=%s parsed_posts=%s max_messages=%s",
+                chat_id, len(human_posts), MAX_MESSAGES_TO_PARSE,
+            )
+            human_posts = human_posts[-MAX_MESSAGES_TO_PARSE:] if MAX_MESSAGES_TO_PARSE else []
 
         recent_post_hashes_by_chat[chat_id] = {
             _get_post_content_signature(post) for post in human_posts
         }
 
+        media_counts = {}
+        for post in human_posts:
+            for media in post.get("media_files", []) or []:
+                media_type = str(media.get("type") or "unknown")
+                media_counts[media_type] = media_counts.get(media_type, 0) + 1
+        debug_logger.info(
+            "MAX_PARSE_COMPLETE chat_id=%s posts=%s media=%s missing_dates=%s voice_hints=%s circle_hints=%s polls=%s closed_polls=%s contacts=%s",
+            chat_id, len(human_posts), media_counts,
+            sum(not bool(post.get("date")) for post in human_posts),
+            sum(bool(post.get("voice_hint")) for post in human_posts),
+            sum(bool(post.get("video_note_hint")) for post in human_posts),
+            sum(bool(post.get("poll")) for post in human_posts),
+            sum(bool((post.get("poll") or {}).get("is_closed")) for post in human_posts),
+            sum(bool((post.get("contact") or {}).get("is_contact")) for post in human_posts),
+        )
+
         return human_posts
 
-    except Exception:
-        try:
-            context.close()
-        except Exception:
-            pass
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            pw.stop()
-        except Exception:
-            pass
+    except Exception as exc:
+        debug_logger.exception("MAX_PARSE_FAILED chat_id=%s error=%s", chat_id, log_preview(exc, 300))
+        print(f"[{chat_id}] ❌ Внутренняя ошибка парсера MAX; traceback:")
+        traceback.print_exc()
         raise
     finally:
         try:
-            context.close()
+            if page and getattr(page, "_max_media_response_listener", None):
+                page.remove_listener("response", page._max_media_response_listener)
         except Exception:
             pass
         try:
-            browser.close()
+            if context:
+                context.close()
         except Exception:
             pass
         try:
-            pw.stop()
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                pw.stop()
         except Exception:
             pass

@@ -3,9 +3,12 @@ seen_messages.json
 seen_messages_v2.json
 seen_images.json
 seen_images_v2.json
+sent_poll_messages.json
+sent_poll_messages.json.tmp
 downloads/
 sessions/
 *.log
+max_parser_debug.log*
 __pycache__/
 *.pyc
 .DS_Store

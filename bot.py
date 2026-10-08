@@ -1,10 +1,15 @@
+#!==============================================================================
+#! 2) БЛОК ИНИЦИАЛИЗАЦИИ
+#!==============================================================================
 import telebot
 import os
 import time
 import io
 import re
 import hashlib
+import json
 import threading
+import traceback
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from telebot import types
@@ -12,36 +17,38 @@ from dotenv import load_dotenv
 import concurrent.futures
 from max_playwright_parser import *
 from DB_service import *
-
-#! ==============================================================================
-#! 2) БЛОК ИНИЦИАЛИЗАЦИИ
-#! ==============================================================================
+from debug_log import logger as debug_logger, preview as log_preview
 
 load_dotenv()
 print("🚀 MAX Parser Bot запущен")
-
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='HTML')
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 add_admin(ADMIN_ID, "main_admin")
-
 _current_cycle_hashes = {}
 NO_PREVIEW = {"disable_web_page_preview": True}
 active_logins = {}
 awaiting_password_from = {}
 
-#! ============ УТИЛИТЫ ============
+def _is_emoji_only_text(text: str, emoji_values) -> bool:
+    text = str(text or "").strip()
+    values = [str(value) for value in (emoji_values or []) if str(value).strip()]
+    if not text or not values:
+        return False
+    remainder = text
+    for value in values:
+        remainder = remainder.replace(value, "")
+    remainder = remainder.replace("\ufe0f", "").replace("\u200d", "").strip()
+    return not remainder
 
 bot.set_my_commands([
     types.BotCommand("start", "Запустить бота"),
     types.BotCommand("admin", "Админ-панель")
 ])
 
-#! ==============================================================================
+#!==============================================================================
 #! 3) ФУНКЦИИ, СВЯЗАННЫЕ С ПАРСИНГОМ
-#! ==============================================================================
-
+#!==============================================================================
 def _media_to_bytesio(media: dict) -> io.BytesIO:
-    """Создаёт объект для отправки в Telegram без сохранения медиа на диск."""
     data = media.get("bytes")
     if not isinstance(data, (bytes, bytearray)) or not data:
         raise ValueError(f"Медиа {media.get('type', 'unknown')} не содержит bytes")
@@ -57,72 +64,550 @@ def _media_already_sent(media: dict, chat_id: int) -> bool:
     media_hash = media.get("hash") or get_media_hash(data=data)
     return not is_new_media(data=data, chat_id=chat_id, media_hash=media_hash)
 
-def _send_post(chat_id: int, post: dict) -> None:
-    """Отправляет сообщение целиком. Кэш обновляется только после успеха."""
+_telegram_last_send = 0.0
+_telegram_send_lock = threading.Lock()
+_send_context = threading.local()
+_POLL_MESSAGE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_poll_messages.json")
+_poll_message_cache = {}
+_poll_message_cache_lock = threading.Lock()
+
+def _load_poll_message_cache():
+    global _poll_message_cache
+    try:
+        with open(_POLL_MESSAGE_CACHE_FILE, "r", encoding="utf-8") as cache_file:
+            value = json.load(cache_file)
+        if isinstance(value, dict):
+            _poll_message_cache = value
+    except (OSError, ValueError, TypeError):
+        _poll_message_cache = {}
+
+def _save_poll_message_cache_locked():
+    temporary_path = _POLL_MESSAGE_CACHE_FILE + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as cache_file:
+            json.dump(_poll_message_cache, cache_file, ensure_ascii=False)
+        os.replace(temporary_path, _POLL_MESSAGE_CACHE_FILE)
+    except OSError as exc:
+        debug_logger.warning("POLL_CACHE_SAVE_FAILED path=%s error=%s", _POLL_MESSAGE_CACHE_FILE, log_preview(exc))
+
+def _poll_cache_key(chat_id: int, post: dict) -> str:
+    source_id = str(post.get("source_id") or "").strip()
+    if post.get("source_id_is_index") or not source_id:
+        poll = post.get("poll") or {}
+        stable = "|".join(str(value or "") for value in (
+            post.get("name"), post.get("date"), post.get("time"), poll.get("question")
+        ))
+        source_id = hashlib.md5(stable.encode("utf-8")).hexdigest()
+    return f"{int(chat_id)}:{source_id}"
+
+def _format_poll_message(poll: dict, comment: str = "", is_closed: bool = False) -> str:
+    question = str(poll.get("question") or "Опрос").strip()
+    if re.match(r"^(?:poll ended|опрос заверш[её]н|total votes?|всего голосов?)\b", question, re.I):
+        question = "Опрос"
+    rows = []
+    for item in poll.get("options") or []:
+        if isinstance(item, dict):
+            label = str(item.get("text") or "").strip()
+            raw_votes = item.get("votes")
+        else:
+            label, raw_votes = str(item or "").strip(), 0
+        if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", label):
+            continue
+        label = re.sub(r"^[⚪⚫▫•]+\s*", "", label)
+        label = re.sub(r"\s+(?:your choice|ваш выбор|winner|победитель|you voted|вы проголосовали|selected)\b.*$", "", label, flags=re.I)
+        try:
+            votes = max(0, int(raw_votes if raw_votes is not None else 0))
+        except (TypeError, ValueError):
+            votes = 0
+        suffix = re.match(r"^(.*?)(?:\s*[.,]\s*|\s+)(\d+)\s*(?:votes?|голос(?:а|ов)?)$", label, re.I)
+        if suffix:
+            label = suffix.group(1).strip()
+            votes = max(votes, int(suffix.group(2)))
+        result = re.match(r"^(.*?)\s*[.,]\s*(\d+)\s*[,;]\s*\d+(?:[.,]\d+)?\s*%.*$", label, re.I)
+        if result:
+            label = result.group(1).strip()
+            votes = max(votes, int(result.group(2)))
+        label = re.sub(r"\s*[,;·|]?\s*\d+(?:[.,]\d+)?\s*%.*$", "", label).strip(" -–—.,;:")
+        if not label or re.match(r"^(?:poll ended|опрос заверш[её]н|total votes?|всего голосов?)\b", label, re.I):
+            continue
+        rows.append((label, votes))
+
+    total_votes = sum(votes for _, votes in rows)
+    try:
+        total_votes = max(total_votes, int(poll.get("total_votes") or 0))
+    except (TypeError, ValueError):
+        pass
+    poll_title = "Завершенный опрос" if is_closed else "Опрос"
+    lines = [f"<b>📊 {poll_title}\n\n{escape_html(question)}</b>"]
+    body_lines = []
+    if rows:
+        option_lines = "\n".join(f"{escape_html(label)}: {votes}" for label, votes in rows)
+        body_lines.append(option_lines)
+    comment = str(comment or "").strip()
+    if comment:
+        body_lines.append(f"Комментарий к опросу: {escape_html(comment)}")
+    body_lines.append(f"<i>Всего ответов: {total_votes}</i>")
+    body = "\n".join(body_lines)
+    lines.append(f"<blockquote>{body}</blockquote>")
+    return "\n".join(lines)
+
+def _poll_is_closed(post: dict) -> bool:
+    poll = post.get("poll") or {}
+    if not isinstance(poll, dict):
+        return False
+    if poll.get("is_closed") is True:
+        return True
+    terminal_states = {
+        "closed", "ended", "finished", "completed", "закрыт", "закрыто",
+        "завершён", "завершен", "завершено",
+    }
+    if any(str(poll.get(key) or "").strip().lower() in terminal_states for key in (
+        "status", "state", "completion_status"
+    )):
+        return True
+    state = str(poll.get("raw_text") or "").lower()
+    return bool(re.search(
+        r"(?:\bpoll\s+(?:is\s+)?(?:closed|ended|finished)\b|"
+        r"\bsurvey\s+(?:is\s+)?(?:closed|ended|finished)\b|"
+        r"опрос\s+(?:закрыт|заверш[её]н)|голосование\s+(?:закрыто|завершено))",
+        state,
+        re.I,
+    ))
+
+def _poll_has_delivery(entry: dict) -> bool:
+    return bool(
+        entry.get("initial_message_id")
+        or entry.get("message_id")
+        or entry.get("final_sent")
+    )
+
+def _get_poll_delivery_state(chat_id: int, post: dict) -> dict:
+    key = _poll_cache_key(chat_id, post)
+    with _poll_message_cache_lock:
+        entry = _poll_message_cache.get(key)
+        return dict(entry) if isinstance(entry, dict) else {}
+
+def _remember_sent_poll(chat_id: int, post: dict, message_id):
+    if not message_id or not post.get("poll"):
+        return
+    key = _poll_cache_key(chat_id, post)
+    closed = _poll_is_closed(post)
+    text = _format_poll_message(
+        post.get("poll") or {}, comment=post.get("text") or "", is_closed=closed
+    )
+    with _poll_message_cache_lock:
+        entry = _poll_message_cache.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        sent_id = int(message_id)
+        if closed:
+            entry.update({
+                "final_sent": True,
+                "final_message_id": sent_id,
+                "final_text": text,
+            })
+            entry.setdefault("message_id", sent_id)
+            entry.setdefault("text", text)
+        else:
+            entry.setdefault("initial_message_id", entry.get("message_id") or sent_id)
+            entry.setdefault("initial_text", entry.get("text") or text)
+            entry.setdefault("message_id", sent_id)
+            entry.setdefault("text", text)
+            entry.setdefault("final_sent", False)
+        entry["has_photo"] = any(
+            media.get("type") == "image" for media in (post.get("media_files") or [])
+        )
+        entry["stage"] = "final" if closed else "initial"
+        _poll_message_cache[key] = entry
+        _save_poll_message_cache_locked()
+    debug_logger.info(
+        "POLL_SNAPSHOT_RECORDED chat_id=%s source_id=%s stage=%s telegram_message_id=%s final_sent=%s",
+        chat_id, post.get("source_id") or "?", "final" if closed else "initial",
+        int(message_id), bool(entry.get("final_sent")),
+    )
+
+def _refresh_poll_snapshot(chat_id: int, post: dict, entry: dict, closed: bool) -> bool:
+    message_id = (
+        entry.get("final_message_id") or entry.get("message_id")
+        if closed else entry.get("initial_message_id") or entry.get("message_id")
+    )
+    if not message_id:
+        return False
+    text = _format_poll_message(
+        post.get("poll") or {}, comment=post.get("text") or "", is_closed=closed
+    )
+    text_key = "final_text" if closed else "initial_text"
+    old_text = entry.get(text_key) or entry.get("text") or ""
+    if text == old_text:
+        return False
+
+    has_photo = bool(entry.get("has_photo")) or any(
+        media.get("type") == "image" for media in (post.get("media_files") or [])
+    )
+    if has_photo:
+        if len(text) > 1024:
+            debug_logger.warning(
+                "POLL_SNAPSHOT_EDIT_SKIPPED chat_id=%s source_id=%s reason=caption_too_long chars=%s",
+                chat_id, post.get("source_id") or "?", len(text),
+            )
+            return False
+        edit = lambda: _telegram_call(
+            bot.edit_message_caption, chat_id=chat_id, message_id=int(message_id),
+            caption=text, parse_mode="HTML",
+        )
+    else:
+        edit = lambda: _telegram_call(
+            bot.edit_message_text, text, chat_id=chat_id, message_id=int(message_id),
+            parse_mode="HTML", **NO_PREVIEW,
+        )
+
+    try:
+        edit()
+    except Exception as exc:
+        debug_logger.warning(
+            "POLL_SNAPSHOT_EDIT_FAILED chat_id=%s source_id=%s message_id=%s error=%s",
+            chat_id, post.get("source_id") or "?", message_id, log_preview(exc, 200),
+        )
+        return False
+
+    key = _poll_cache_key(chat_id, post)
+    with _poll_message_cache_lock:
+        current = _poll_message_cache.get(key)
+        if not isinstance(current, dict):
+            current = dict(entry)
+            _poll_message_cache[key] = current
+        current[text_key] = text
+        current["text"] = text
+        current["has_photo"] = has_photo
+        _save_poll_message_cache_locked()
+    debug_logger.info(
+        "POLL_SNAPSHOT_UPDATED chat_id=%s source_id=%s stage=%s message_id=%s",
+        chat_id, post.get("source_id") or "?", "final" if closed else "initial", message_id,
+    )
+    return True
+
+_load_poll_message_cache()
+
+def _telegram_result_ids(result):
+    values = result if isinstance(result, (list, tuple)) else [result]
+    return [str(getattr(item, "message_id", "")) for item in values if getattr(item, "message_id", None) is not None]
+
+def _telegram_payload_preview(fn, args, kwargs):
+    method = getattr(fn, "__name__", "telegram_api")
+    if method == "send_message" and len(args) > 1:
+        return log_preview(args[1], 240)
+    if kwargs.get("caption"):
+        return log_preview(kwargs["caption"], 240)
+    if method == "send_media_group" and len(args) > 1:
+        captions = [getattr(item, "caption", "") for item in (args[1] or []) if getattr(item, "caption", "")]
+        return log_preview(" | ".join(captions), 240)
+    return ""
+
+def _rewind_telegram_uploads(value):
+    if isinstance(value, io.IOBase):
+        value.seek(0)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _rewind_telegram_uploads(item)
+        return
+    media = getattr(value, "media", None)
+    if media is not None:
+        _rewind_telegram_uploads(media)
+
+def _telegram_call(fn, *args, **kwargs):
+    global _telegram_last_send
+    with _telegram_send_lock:
+        for attempt in range(4):
+            wait = 0.8 - (time.monotonic() - _telegram_last_send)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                for value in args:
+                    _rewind_telegram_uploads(value)
+                for value in kwargs.values():
+                    _rewind_telegram_uploads(value)
+                result = fn(*args, **kwargs)
+                _telegram_last_send = time.monotonic()
+                ctx = getattr(_send_context, "current", None)
+                if ctx is not None:
+                    ids = _telegram_result_ids(result)
+                    ctx["api_ok"] += 1
+                    ctx["message_ids"].extend(ids)
+                    debug_logger.info(
+                        "TELEGRAM_SEND_OK chat_id=%s source_id=%s method=%s telegram_message_ids=%s payload=%s",
+                        ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
+                        ids or "<no-id>", _telegram_payload_preview(fn, args, kwargs) or "<media payload>"
+                    )
+                return result
+            except Exception as e:
+                text = str(e)
+                ctx = getattr(_send_context, "current", None)
+                if ctx is not None:
+                    ctx["api_errors"] += 1
+                    debug_logger.error(
+                        "TELEGRAM_SEND_FAIL chat_id=%s source_id=%s method=%s payload=%s error=%s",
+                        ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
+                        _telegram_payload_preview(fn, args, kwargs) or "<media payload>",
+                        log_preview(text, 300)
+                    )
+                m = re.search(r"retry after (\d+)", text, re.I)
+                if "429" in text and m and attempt < 3:
+                    delay = int(m.group(1)) + 1
+                    print(f"⏳ Telegram 429: ждём {delay} сек.")
+                    time.sleep(delay)
+                    continue
+                raise
+
+def _send_post_impl(chat_id: int, post: dict) -> None:
     msg_text = format_message(post)
     media_files = post.get("media_files", []) or []
-    # Не отправляем одну и ту же фотографию повторно, но само сообщение
-    # всё равно будет отправлено, если текст у него новый.
-    send_media = [
-        media for media in media_files
-        if not _media_already_sent(media, chat_id)
-    ]
-    if not send_media:
-        bot.send_message(chat_id, msg_text, **NO_PREVIEW)
-        return
-    first = True
-    for media in send_media:
-        media_type = media.get("type")
-        file_obj = _media_to_bytesio(media)
-        if media_type == "image":
-            if first:
-                try:
-                    # У Telegram caption есть лимит 1024 символа.
-                    if len(msg_text) <= 1024:
-                        bot.send_photo(chat_id, file_obj, caption=msg_text)
-                    else:
-                        bot.send_photo(chat_id, file_obj)
-                        bot.send_message(chat_id, msg_text, **NO_PREVIEW)
-                except Exception as photo_error:
-                    print(f"⚠️ send_photo не удался: {photo_error}")
-                    file_obj.seek(0)
-                    filename = media.get("filename") or "image.jpg"
-                    bot.send_document(chat_id, file_obj, visible_file_name=filename)
-                    if msg_text:
-                        bot.send_message(chat_id, msg_text, **NO_PREVIEW)
-            else:
-                try:
-                    bot.send_photo(chat_id, file_obj)
-                except Exception as photo_error:
-                    print(f"⚠️ Дополнительное фото не отправилось: {photo_error}")
-                    file_obj.seek(0)
-                    bot.send_document(
-                        chat_id,
-                        file_obj,
-                        visible_file_name=media.get("filename") or "image.jpg",
-                    )
-        elif media_type == "document":
-            filename = media.get("filename") or "document.pdf"
-            if first:
-                if len(msg_text) <= 1024:
-                    bot.send_document(
-                        chat_id,
-                        file_obj,
-                        caption=msg_text,
-                        visible_file_name=filename,
-                    )
-                else:
-                    bot.send_document(chat_id, file_obj, visible_file_name=filename)
-                    bot.send_message(chat_id, msg_text, **NO_PREVIEW)
-            else:
-                bot.send_document(chat_id, file_obj, visible_file_name=filename)
+    ctx = getattr(_send_context, "current", None)
+    if ctx is not None:
+        ctx["suppressed_media"] = 0
+    send_media = []
+    for media in media_files:
+        if media.get("type") == "emoji":
+            continue
+        is_poll_image = bool(post.get("poll")) and media.get("type") == "image"
+        if media.get("type") in {"image", "video_note"} and not is_poll_image and _media_already_sent(media, chat_id):
+            if ctx is not None:
+                ctx["suppressed_media"] += 1
+            debug_logger.info(
+                "MEDIA_SKIPPED chat_id=%s source_id=%s reason=media_already_sent hash=%s",
+                chat_id, post.get("source_id") or post.get("idx") or "?",
+                media.get("hash") or get_media_hash(data=media.get("bytes")),
+            )
+            continue
+        send_media.append(media)
+
+    location = post.get("location") or {}
+    contact = post.get("contact") or {}
+    poll = post.get("poll") or {}
+    special_sent = False
+
+    def yandex_link(loc: dict) -> str:
+        lat=loc.get("latitude"); lon=loc.get("longitude")
+        raw=str(loc.get("url") or "").strip()
+        if re.match(r"^https?://",raw,re.I) and re.search(r"yandex\.(?:ru|com)/maps",raw,re.I):
+            return raw
+        if lat is not None and lon is not None:
+            try:
+                return f"https://yandex.ru/maps/?ll={float(lon)}%2C{float(lat)}&pt={float(lon)}%2C{float(lat)}&z=17"
+            except Exception:
+                pass
+        return raw or "https://yandex.ru/maps/"
+
+    if location and (location.get("url") or (location.get("latitude") is not None and location.get("longitude") is not None)):
+        url=yandex_link(location)
+        caption=f'Геопозиция: <a href="{escape_html(url)}">ссылка на геопозицию</a>'
+        map_media=next((m for m in send_media if m.get("type")=="image"),None)
+        if map_media:
+            obj=_media_to_bytesio(map_media)
+            try:
+                _telegram_call(bot.send_photo,chat_id,obj,caption=caption,parse_mode="HTML")
+            except Exception as exc:
+                print(f"⚠️ [{chat_id}] Не удалось отправить карту с caption: {exc}")
+                _telegram_call(bot.send_message,chat_id,caption,parse_mode="HTML",**NO_PREVIEW)
+            send_media=[]
         else:
-            raise ValueError(f"Неизвестный тип медиа: {media_type}")
-        first = False
+            _telegram_call(bot.send_message,chat_id,caption,parse_mode="HTML",**NO_PREVIEW)
+            send_media=[]
+        special_sent=True
+
+    if contact.get("is_contact"):
+        name=" ".join(str(contact.get(key) or "").strip() for key in ("first_name", "last_name") if str(contact.get(key) or "").strip())
+        name=name or str(contact.get("name") or "").strip()
+        phone=str(contact.get("phone") or "").strip()
+        name=re.sub(r"\s*(?:already in your contacts|уже в ваших контактах)\s*", " ", name, flags=re.I).strip()
+        detail_value=phone or "не найден"
+        text=(
+            "<b>Контакт</b>\n\n"
+            "<blockquote>"
+            f"Имя: {escape_html(name or 'не указано')}\n"
+            f"Номер телефона: {escape_html(detail_value)}"
+            "</blockquote>"
+        )
+        _telegram_call(bot.send_message,chat_id,text,parse_mode="HTML",**NO_PREVIEW)
+        special_sent=True
+        send_media=[]
+
+    if poll:
+        poll_text = _format_poll_message(
+            poll, comment=post.get("text") or "", is_closed=_poll_is_closed(post)
+        )
+        poll_image = next((media for media in send_media if media.get("type") == "image"), None)
+        if poll_image:
+            image_file = _media_to_bytesio(poll_image)
+            if len(poll_text) <= 1024:
+                _telegram_call(bot.send_photo, chat_id, image_file, caption=poll_text, parse_mode="HTML")
+            else:
+                _telegram_call(bot.send_photo, chat_id, image_file)
+                _telegram_call(bot.send_message, chat_id, poll_text, parse_mode="HTML", **NO_PREVIEW)
+        else:
+            _telegram_call(bot.send_message, chat_id, poll_text, parse_mode="HTML", **NO_PREVIEW)
+        special_sent=True
+        send_media=[]
+
+    if special_sent:
+        msg_text=""
+
+    actual_text=_clean_browser_video_fallback(post.get("text") or "")
+    emoji_texts=post.get("emoji_texts") or []
+    if not special_sent and emoji_texts:
+        emoji_text = actual_text if _is_emoji_only_text(actual_text, emoji_texts) else ""
+        if not actual_text:
+            emoji_text = "".join(str(x) for x in emoji_texts if str(x).strip()).strip()
+        if emoji_text and not actual_text:
+            actual_text = emoji_text
+            emoji_post = dict(post)
+            emoji_post["text"] = emoji_text
+            msg_text = format_message(emoji_post)
+
+    if not send_media:
+        if actual_text and not special_sent:
+            _telegram_call(bot.send_message,chat_id,msg_text,**NO_PREVIEW)
+        return
+
+    has_voice_or_circle=any(m.get("type") in ("voice","video_note") for m in send_media)
+    caption_pending=bool(actual_text) and not special_sent and not has_voice_or_circle
+
+    photos=[m for m in send_media if m.get("type")=="image"]
+    album_sent_ids=set()
+    if len(photos)>=2:
+        for start in range(0,len(photos)-1,10):
+            chunk=photos[start:start+10]
+            if len(chunk)<2:
+                break
+            album=[]
+            caption_in_album=False
+            for media in chunk:
+                obj=_media_to_bytesio(media)
+                caption=msg_text if caption_pending and not caption_in_album and len(msg_text)<=1024 else None
+                parse_mode="HTML" if caption else None
+                album.append(types.InputMediaPhoto(obj,caption=caption,parse_mode=parse_mode))
+                if caption:
+                    caption_in_album=True
+            try:
+                _telegram_call(bot.send_media_group,chat_id,album)
+                album_sent_ids.update(id(m) for m in chunk)
+                if caption_in_album:
+                    caption_pending=False
+            except Exception as album_error:
+                print(f"⚠️ [{chat_id}] Не удалось отправить фотоальбом: {album_error}")
+                break
+        if album_sent_ids:
+            send_media=[m for m in send_media if id(m) not in album_sent_ids]
+
+    for media in send_media:
+        media_type=media.get("type")
+        obj=_media_to_bytesio(media)
+        filename=media.get("filename") or "document.bin"
+        try:
+            if media_type=="image":
+                if caption_pending and len(msg_text)<=1024:
+                    _telegram_call(bot.send_photo,chat_id,obj,caption=msg_text)
+                    caption_pending=False
+                else:
+                    _telegram_call(bot.send_photo,chat_id,obj)
+            elif media_type=="video_note":
+                _telegram_call(bot.send_video_note,chat_id,obj)
+                caption_pending=False
+            elif media_type=="video":
+                if caption_pending and len(msg_text)<=1024:
+                    _telegram_call(bot.send_video,chat_id,obj,caption=msg_text,supports_streaming=True)
+                    caption_pending=False
+                else:
+                    _telegram_call(bot.send_video,chat_id,obj,supports_streaming=True)
+            elif media_type=="voice":
+                try:
+                    _telegram_call(bot.send_voice,chat_id,obj)
+                except Exception as voice_error:
+                    print(f"⚠️ [{chat_id}] send_voice не принят Telegram: {voice_error}; пробуем audio")
+                    obj.seek(0)
+                    _telegram_call(bot.send_audio,chat_id,obj,title=filename)
+                caption_pending=False
+            elif media_type=="audio":
+                _telegram_call(bot.send_audio,chat_id,obj,title=filename)
+                caption_pending=False
+            elif media_type=="animation":
+                _telegram_call(bot.send_animation,chat_id,obj)
+            elif media_type=="sticker":
+                _telegram_call(bot.send_photo,chat_id,obj)
+            else:
+                if caption_pending and len(msg_text)<=1024:
+                    _telegram_call(bot.send_document,chat_id,obj,caption=msg_text,visible_file_name=filename)
+                    caption_pending=False
+                else:
+                    _telegram_call(bot.send_document,chat_id,obj,visible_file_name=filename)
+        except Exception as error:
+            print(f"⚠️ [{chat_id}] Ошибка отправки {media_type}: {error}")
+            if media_type not in ("voice","video_note","image","sticker"):
+                try:
+                    obj.seek(0)
+                    _telegram_call(bot.send_document,chat_id,obj,visible_file_name=filename)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Не отправилось медиа {media_type}; fallback send_document также завершился ошибкой: {fallback_error}"
+                    ) from error
+            else:
+                raise
         time.sleep(0.5)
 
+    if caption_pending:
+        _telegram_call(bot.send_message,chat_id,msg_text,**NO_PREVIEW)
+
+def _send_post(chat_id: int, post: dict) -> bool:
+    post_id = str(post.get("source_id") or post.get("idx") or "?")
+    context = {
+        "chat_id": chat_id,
+        "source_id": post_id,
+        "api_ok": 0,
+        "api_errors": 0,
+        "message_ids": [],
+        "suppressed_media": 0,
+    }
+    previous = getattr(_send_context, "current", None)
+    _send_context.current = context
+    media_types = [m.get("type", "unknown") for m in (post.get("media_files") or []) if isinstance(m, dict)]
+    post_kind = (
+        "poll" if post.get("poll") else
+        "contact" if (post.get("contact") or {}).get("is_contact") else
+        "location" if post.get("location") else
+        "media" if media_types else
+        "emoji" if post.get("emoji_texts") else "text"
+    )
+    debug_logger.info(
+        "POST_SEND_START chat_id=%s source_id=%s kind=%s date=%s time=%s media=%s text=%s",
+        chat_id, post_id, post_kind, post.get("date") or "<missing>",
+        post.get("time") or "<missing>", media_types, log_preview(post.get("text")) or "<empty>"
+    )
+    try:
+        _send_post_impl(chat_id, post)
+        if post.get("poll") and context["message_ids"]:
+            _remember_sent_poll(chat_id, post, context["message_ids"][0])
+        if context["api_ok"]:
+            result = "sent"
+        elif context["suppressed_media"]:
+            result = "duplicate_media_suppressed"
+        else:
+            result = "no_telegram_payload"
+        log_method = debug_logger.warning if result != "sent" else debug_logger.info
+        log_method(
+            "POST_SEND_COMPLETE chat_id=%s source_id=%s result=%s api_ok=%s api_errors=%s telegram_message_ids=%s suppressed_media=%s",
+            chat_id, post_id, result, context["api_ok"], context["api_errors"],
+            context["message_ids"] or "<none>", context["suppressed_media"]
+        )
+        return result != "no_telegram_payload"
+    except Exception as exc:
+        debug_logger.exception(
+            "POST_SEND_COMPLETE chat_id=%s source_id=%s result=failed api_ok=%s api_errors=%s error=%s",
+            chat_id, post_id, context["api_ok"], context["api_errors"], log_preview(exc, 300)
+        )
+        raise
+    finally:
+        _send_context.current = previous
+
 def _commit_successful_post(chat_id: int, post: dict) -> None:
-    """Записывает сообщение и медиа в кэш только после успешной отправки."""
     mark_message_seen(post, chat_id=chat_id)
     for media in post.get("media_files", []) or []:
         data = media.get("bytes")
@@ -132,38 +617,100 @@ def _commit_successful_post(chat_id: int, post: dict) -> None:
                 chat_id=chat_id,
                 media_hash=media.get("hash"),
             )
+            visual_hash = media.get("visual_hash")
+            if visual_hash and visual_hash != media.get("hash"):
+                mark_media_seen(
+                    data=data,
+                    chat_id=chat_id,
+                    media_hash=visual_hash,
+                )
     save_message_cache()
     save_photo_cache()
 
 def _process_posts(chat_id: int, title: str, posts: list, send_summary: bool = False) -> tuple:
-    """Обрабатывает список постов и возвращает (new_count, skipped_count)."""
+    if posts is None:
+        raise TypeError(f"Парсер MAX для чата {title} вернул None вместо списка сообщений")
+    if not isinstance(posts, list):
+        raise TypeError(
+            f"Парсер MAX для чата {title} вернул {type(posts).__name__} вместо списка сообщений"
+        )
     new_count = 0
     skipped_count = 0
+    failed_count = 0
+    debug_logger.info("CHAT_PROCESS_START chat_id=%s title=%s posts=%s", chat_id, log_preview(title, 100), len(posts))
     cycle_ids = set()
     for post in posts:
         source_id = str(post.get("source_id") or "").strip()
-        # data-index в MAX нестабилен; внутри одного цикла используем содержимое.
         if post.get("source_id_is_index"):
             cycle_key = get_message_hash(post)
         else:
             cycle_key = source_id or get_message_hash(post)
+
         if cycle_key in cycle_ids:
             skipped_count += 1
+            debug_logger.info("MESSAGE_SKIPPED chat_id=%s source_id=%s reason=duplicate_in_cycle", chat_id, source_id or "?")
             continue
         cycle_ids.add(cycle_key)
-        if not is_new_message(post, chat_id=chat_id):
+
+        force_poll_send = False
+        if post.get("poll"):
+            poll_state = _get_poll_delivery_state(chat_id, post)
+            if _poll_is_closed(post):
+                if poll_state.get("final_sent"):
+                    _refresh_poll_snapshot(chat_id, post, poll_state, closed=True)
+                    skipped_count += 1
+                    debug_logger.info(
+                        "MESSAGE_SKIPPED chat_id=%s source_id=%s reason=poll_final_already_sent",
+                        chat_id, source_id or "?",
+                    )
+                    continue
+                force_poll_send = True
+                debug_logger.info(
+                    "POLL_FINAL_SEND_START chat_id=%s source_id=%s question=%s",
+                    chat_id, source_id or "?",
+                    log_preview((post.get("poll") or {}).get("question"), 120),
+                )
+            elif _poll_has_delivery(poll_state):
+                _refresh_poll_snapshot(chat_id, post, poll_state, closed=False)
+                skipped_count += 1
+                debug_logger.info(
+                    "MESSAGE_SKIPPED chat_id=%s source_id=%s reason=poll_initial_already_sent",
+                    chat_id, source_id or "?",
+                )
+                continue
+
+        if not force_poll_send and not is_new_message(post, chat_id=chat_id):
             skipped_count += 1
+            debug_logger.info("MESSAGE_SKIPPED chat_id=%s source_id=%s reason=seen_cache", chat_id, source_id or "?")
             continue
+
         try:
-            _send_post(chat_id, post)
+            sent = _send_post(chat_id, post)
+            if not sent:
+                skipped_count += 1
+                debug_logger.warning(
+                    "MESSAGE_NOT_SENT chat_id=%s source_id=%s reason=no_payload text=%s",
+                    chat_id, source_id or "?", log_preview(post.get("text")) or "<empty>"
+                )
+                continue
             _commit_successful_post(chat_id, post)
             increment_message_count(chat_id)
             new_count += 1
             time.sleep(1.5)
         except Exception as error:
+            failed_count += 1
+            debug_logger.exception(
+                "MESSAGE_PROCESS_FAILED chat_id=%s source_id=%s title=%s error=%s",
+                chat_id, source_id or "?", log_preview(title, 100), log_preview(error, 300)
+            )
             print(f"❌ [{chat_id}] Ошибка отправки в чат {title}: {error}")
+
     save_message_cache()
     save_photo_cache()
+    debug_logger.info(
+        "CHAT_PROCESS_COMPLETE chat_id=%s title=%s sent=%s skipped=%s failed=%s",
+        chat_id, log_preview(title, 100), new_count, skipped_count, failed_count
+    )
     if send_summary and new_count > 0:
         summary_text = (
             f"✅ <b>Парсинг завершён для: {title}</b>\n\n"
@@ -237,7 +784,9 @@ def run_one_parse_cycle():
                         print(f"⚠️ Не удалось отправить диагностику: {send_error}")
                 results.append(error_msg)
             elif "NO_SESSION" in error_str:
-                results.append(f"⚠️ <b>{title}</b>: нет сессии! Используйте `/login {chat_id}`")
+                results.append(
+                    f"⚠️ <b>{title}</b>: нет сессии! Используйте `/login {chat_id}`"
+                )
             else:
                 print(f"❌ Ошибка парсинга чата {title}: {error}")
                 results.append(
@@ -258,7 +807,6 @@ def run_one_parse_cycle():
     return header + report
 
 def process_single_chat(chat):
-    """Обрабатывает один чат в отдельном потоке."""
     chat_id = chat["chat_id"]
     max_url = chat["max_url"]
     title = chat["title"]
@@ -268,6 +816,7 @@ def process_single_chat(chat):
         return True
     except Exception as error:
         print(f"❌ Ошибка парсинга чата {title}: {error}")
+        traceback.print_exc()
         return False
 
 def background_parser():
@@ -294,12 +843,10 @@ def background_parser():
             time.sleep(60)
 
 load_message_cache()
-threading.Thread(target=background_parser, daemon=True).start()
 
-#! ==============================================================================
+#!==============================================================================
 #! 4) ОСТАЛЬНЫЕ ФУНКЦИИ
-#! ==============================================================================
-
+#!==============================================================================
 def visual_len(s):
     length = 0
     for char in s:
@@ -338,7 +885,6 @@ def center_in_width(s, target_width):
     return ' ' * left + s + ' ' * right
 
 def safe_edit_message(text, chat_id, message_id, reply_markup=None, **kwargs):
-    """Безопасно редактирует сообщение. Если message_id=None или сообщение не найдено — отправляет новое."""
     try:
         if message_id is None:
             if reply_markup:
@@ -373,43 +919,74 @@ def escape_html(text: str) -> str:
     text = text.replace('>', '&gt;')
     return text
 
+def _clean_browser_video_fallback(text: str) -> str:
+    text = re.sub(
+        r"(?:your browser does not support (?:this )?video|your browser does not support the video tag|"
+        r"ваш браузер не поддерживает (?:это )?видео)(?:\s+\d{1,2}:\d{2})?\.?",
+        " ", str(text or ""), flags=re.I,
+    )
+    return " ".join(text.split()).strip()
+
 def format_message_time(raw_time: str, raw_date: str = "") -> str:
     if not raw_time:
         return ""
-    samara_tz = timezone(timedelta(hours=4))
-    now_samara = datetime.now(samara_tz)
+
     weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
     months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
-            'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+              'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+
     date_str = ""
-    if raw_date:
+    value = (raw_date or "").strip()
+    parsed_date = None
+    for pattern in ("%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
-            parsed_date = datetime.strptime(raw_date.strip(), "%d.%m.%Y")
-            weekday = weekdays[parsed_date.weekday()]
-            date_str = f"{weekday}, {parsed_date.day} {months[parsed_date.month - 1]}"
+            parsed_date = datetime.strptime(value, pattern)
+            break
         except ValueError:
-            date_str = ""
-    if not date_str:
-        date_str = "дата не определена"
+            pass
+    if parsed_date is None and re.match(r"^(today|сегодня|yesterday|вчера)$", value, re.I):
+        parsed_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if re.match(r"^(yesterday|вчера)$", value, re.I):
+            parsed_date -= timedelta(days=1)
+    if parsed_date is None:
+        for pattern in ("%B %d, %Y", "%b %d, %Y", "%B %d", "%b %d"):
+            try:
+                parsed_date = datetime.strptime(value, pattern)
+                if "%Y" not in pattern:
+                    parsed_date = parsed_date.replace(year=datetime.now().year)
+                break
+            except ValueError:
+                pass
+    if parsed_date is None:
+        m = re.match(r"^(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?$", value, re.I)
+        if m:
+            month_map = {name:i+1 for i,name in enumerate(months)}
+            parsed_date = datetime(int(m.group(3) or datetime.now().year), month_map[m.group(2).lower()], int(m.group(1)))
     raw_time = raw_time.strip()
     time_str = raw_time
     try:
         raw_upper = raw_time.upper()
         if 'AM' in raw_upper or 'PM' in raw_upper:
-            dt = datetime.strptime(raw_upper.replace(' ', ''), "%I:%M%p")
-            dt = dt + timedelta(hours=1)
-            time_str = dt.strftime("%H:%M")
+            clock = datetime.strptime(raw_upper.replace(' ', ''), "%I:%M%p")
         elif ':' in raw_time:
-            dt = datetime.strptime(raw_time, "%H:%M")
-            dt = dt + timedelta(hours=1)
-            time_str = dt.strftime("%H:%M")
+            clock = datetime.strptime(raw_time, "%H:%M")
+        else:
+            clock = None
+        if clock is not None:
+            time_str = clock.strftime("%H:%M")
     except ValueError:
         pass
+
+    if parsed_date is not None:
+        date_str = f"{weekdays[parsed_date.weekday()]}, {parsed_date.day} {months[parsed_date.month - 1]}"
+    else:
+        date_str = "дата не определена"
+
     return f"<b><blockquote>🗓 {date_str} | 🕐 {time_str}</blockquote></b>"
 
 def format_message(post: dict) -> str:
     raw_name = post.get('name', '').strip()
-    raw_text = post.get('text', '').strip()
+    raw_text = _clean_browser_video_fallback(post.get('text', '').strip())
     raw_time = post.get('time', '').strip()
     raw_date = post.get('date', '').strip()
     if raw_name:
@@ -463,7 +1040,6 @@ def format_message(post: dict) -> str:
     return result
 
 def get_cancel_keyboard():
-    """Клавиатура с кнопкой отмены"""
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
     return kb
@@ -479,8 +1055,6 @@ def track_user(message_or_callback):
             update_admin_username(user.id, username)
     except Exception as e:
         print(f"⚠️ Ошибка track_user: {e}")
-
-#! ============ QR-ЛОГИН ============
 
 def _build_qr_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
@@ -546,8 +1120,6 @@ def do_qr_login(target_chat_id, admin_chat_id):
         bot.send_message(admin_chat_id, f"❌ Ошибка отправки скриншота: {e}", **NO_PREVIEW)
         session.close()
         del active_logins[target_chat_id]
-
-#! ============ ФУНКЦИИ ОТОБРАЖЕНИЯ ИНТЕРФЕЙСА ============
 
 def show_admin_menu(chat_id):
     stats = get_global_stats()
@@ -757,10 +1329,7 @@ def show_users_list(chat_id, message_id):
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
-#! ============ ОБРАБОТЧИКИ ВВОДА (STEP HANDLERS) ============
-
 def process_add_chat_step1(message, admin_chat_id):
-    """Получаем ID чата и сразу добавляем его в БД"""
     track_user(message)
     try:
         chat_id = int(message.text.strip())
@@ -771,7 +1340,7 @@ def process_add_chat_step1(message, admin_chat_id):
     existing_chat = get_chat_by_id(chat_id)
     if existing_chat:
         bot.send_message(
-            message.chat.id, 
+            message.chat.id,
             f"⚠️ <b>Чат уже существует!</b>\n\n"
             f"Чат с ID <code>{chat_id}</code> уже добавлен:\n"
             f"<b>{existing_chat['title']}</b>\n\n"
@@ -816,7 +1385,6 @@ def process_add_chat_step1(message, admin_chat_id):
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}", **NO_PREVIEW)
 
 def process_add_chat_step2(message, admin_chat_id):
-    """Второй шаг: получаем URL"""
     track_user(message)
     if message.text == '/cancel':
         bot.send_message(message.chat.id, " Отменено", **NO_PREVIEW)
@@ -881,7 +1449,7 @@ def process_set_url(message, target_chat_id, admin_chat_id):
 def process_set_phone(message, target_chat_id, admin_chat_id):
     track_user(message)
     phone = message.text.strip()
-    if not re.match(r'^\+?\d{10,15}$', phone.replace(' ', '').replace('-', '')):
+    if not re.match(r'^\\+?\d{10,15}$', phone.replace(' ', '').replace('-', '')):
         bot.send_message(message.chat.id, "❌ Неверный формат телефона", **NO_PREVIEW)
         return
     update_chat_phone(target_chat_id, phone)
@@ -889,10 +1457,9 @@ def process_set_phone(message, target_chat_id, admin_chat_id):
     time.sleep(0.3)
     show_chat_details(message.chat.id, None, target_chat_id)
 
-#! ==============================================================================
+#!==============================================================================
 #! 5) ОСТАЛЬНОЙ КОД (ОБРАБОТЧИКИ СООБЩЕНИЙ)
-#! ==============================================================================
-
+#!==============================================================================
 @bot.message_handler(content_types=['new_chat_members'])
 def on_bot_added_to_chat(message):
     for member in message.new_chat_members:
@@ -1018,10 +1585,9 @@ def handle_password_input(message):
             parse_mode='HTML', **NO_PREVIEW
         )
 
-#! ==============================================================================
+#!==============================================================================
 #! 6) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
-#! ==============================================================================
-
+#!==============================================================================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
@@ -1156,7 +1722,7 @@ def admin_callbacks(call):
             "➕ <b>Добавление чата</b>\n\n"
             "Отправьте <b>ID чата</b> (например: <code>-1001234567890</code>)\n\n"
             "Бот сам получит название чата.",
-            parse_mode='HTML', 
+            parse_mode='HTML',
             reply_markup=get_cancel_keyboard(),
             **NO_PREVIEW
         )
@@ -1167,7 +1733,7 @@ def admin_callbacks(call):
             "➕ <b>Добавление администратора</b>\n\n"
             "Отправьте user_id нового админа:\n\n"
             "Пример: <code>123456789</code>",
-            parse_mode='HTML', 
+            parse_mode='HTML',
             reply_markup=get_cancel_keyboard(),
             **NO_PREVIEW
         )
@@ -1357,6 +1923,7 @@ def admin_callbacks(call):
 
 if __name__ == "__main__":
     try:
+        threading.Thread(target=background_parser, daemon=True).start()
         print("✅ Запуск polling...")
         bot.infinity_polling(none_stop=True, timeout=60)
     except KeyboardInterrupt:
