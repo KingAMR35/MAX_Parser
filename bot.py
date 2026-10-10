@@ -1,6 +1,3 @@
-#!==============================================================================
-#! 2) БЛОК ИНИЦИАЛИЗАЦИИ
-#!==============================================================================
 import telebot
 import os
 import time
@@ -46,7 +43,7 @@ bot.set_my_commands([
 ])
 
 #!==============================================================================
-#! 3) ФУНКЦИИ, СВЯЗАННЫЕ С ПАРСИНГОМ
+#! 1) ФУНКЦИИ, СВЯЗАННЫЕ С ПАРСИНГОМ
 #!==============================================================================
 def _media_to_bytesio(media: dict) -> io.BytesIO:
     data = media.get("bytes")
@@ -424,7 +421,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
             "<b>Контакт</b>\n\n"
             "<blockquote>"
             f"Имя: {escape_html(name or 'не указано')}\n"
-            f"Номер телефона: {escape_html(detail_value)}"
+            f"Номер телефона: <code>{escape_html(detail_value)}</code>"
             "</blockquote>"
         )
         _telegram_call(bot.send_message,chat_id,text,parse_mode="HTML",**NO_PREVIEW)
@@ -845,7 +842,7 @@ def background_parser():
 load_message_cache()
 
 #!==============================================================================
-#! 4) ОСТАЛЬНЫЕ ФУНКЦИИ
+#! 2) ОСТАЛЬНЫЕ ФУНКЦИИ
 #!==============================================================================
 def visual_len(s):
     length = 0
@@ -925,7 +922,31 @@ def _clean_browser_video_fallback(text: str) -> str:
         r"ваш браузер не поддерживает (?:это )?видео)(?:\s+\d{1,2}:\d{2})?\.?",
         " ", str(text or ""), flags=re.I,
     )
-    return " ".join(text.split()).strip()
+    lines = [re.sub(r"[\t ]+", " ", line).strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+def _escape_text_with_links(text: str, links: list) -> str:
+    text = str(text or "")
+    if not text or not links:
+        return escape_html(text)
+    output = []
+    cursor = 0
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        label = str(link.get("text") or "")
+        url = str(link.get("url") or "").strip()
+        if not label or not re.match(r"^(?:https?://|tg:|mailto:|tel:)", url, re.I):
+            continue
+        start = text.find(label, cursor)
+        if start < 0:
+            continue
+        output.append(escape_html(text[cursor:start]))
+        safe_url = escape_html(url).replace('"', "&quot;")
+        output.append(f'<a href="{safe_url}">{escape_html(label)}</a>')
+        cursor = start + len(label)
+    output.append(escape_html(text[cursor:]))
+    return "".join(output)
 
 def format_message_time(raw_time: str, raw_date: str = "") -> str:
     if not raw_time:
@@ -1032,7 +1053,7 @@ def format_message(post: dict) -> str:
             header = f"👤 <b>{escape_html(person_name)}</b>\n\n"
     else:
         header = ""
-    body = escape_html(raw_text)
+    body = _escape_text_with_links(raw_text, post.get("inline_links") or [])
     result = f"{header}{body}"
     time_footer = format_message_time(raw_time, raw_date)
     if time_footer:
@@ -1458,7 +1479,7 @@ def process_set_phone(message, target_chat_id, admin_chat_id):
     show_chat_details(message.chat.id, None, target_chat_id)
 
 #!==============================================================================
-#! 5) ОСТАЛЬНОЙ КОД (ОБРАБОТЧИКИ СООБЩЕНИЙ)
+#! 3) ОСТАЛЬНОЙ КОД (ОБРАБОТЧИКИ СООБЩЕНИЙ)
 #!==============================================================================
 @bot.message_handler(content_types=['new_chat_members'])
 def on_bot_added_to_chat(message):
@@ -1586,7 +1607,7 @@ def handle_password_input(message):
         )
 
 #!==============================================================================
-#! 6) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
+#! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
@@ -1597,7 +1618,6 @@ def admin_callbacks(call):
     action = call.data
     if action == "cancel_step":
         try:
-            print(f"🔄 Отмена действия для чата {call.message.chat.id}")
             bot.clear_step_handler(call.message)
             bot.delete_message(call.message.chat.id, call.message.message_id)
             bot.answer_callback_query(call.id, "❌ Отменено")

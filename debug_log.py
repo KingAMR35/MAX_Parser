@@ -18,6 +18,7 @@ if not logger.handlers:
     )
     console = logging.StreamHandler()
     console.setFormatter(formatter)
+    console.setLevel(logging.CRITICAL + 1)
     logger.addHandler(console)
 
     try:

@@ -38,7 +38,15 @@ def _strip_browser_video_fallback(text: str) -> str:
         r"ваш браузер не поддерживает (?:это )?видео)(?:\s+\d{1,2}:\d{2})?\.?",
         " ", text, flags=re.I,
     )
-    return " ".join(text.split()).strip()
+    return _normalize_message_lines(text)
+
+
+def _normalize_message_lines(text: str) -> str:
+    lines = [
+        re.sub(r"[\t ]+", " ", line).strip()
+        for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 #! ==========================================
 #! 1. QR-АВТОРИЗАЦИЯ
@@ -88,10 +96,6 @@ def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int 
             error_text = str(exc).lower()
             if attempt >= 2 or not any(marker in error_text for marker in retryable_errors):
                 raise
-            print(
-                f"[{chat_id}] ⚠️ MAX: соединение закрыто на этапе «{stage}» "
-                f"({type(exc).__name__}); повтор через 2 сек."
-            )
             page.wait_for_timeout(2000)
 
 def _get_password_input(page):
@@ -256,7 +260,6 @@ class QRLoginSession:
             self.page.wait_for_timeout(300)
             submit_clicked = _click_submit_button(self.page)
             if not submit_clicked:
-                print(f"⚠️ [Поток {self.chat_id}] Кнопка не найдена, пробуем Enter")
                 self.page.keyboard.press("Enter")
             self.page.wait_for_timeout(7000)
             current_url = self.page.url.lower()
@@ -271,13 +274,11 @@ class QRLoginSession:
                 self.result_queue.put(("success", session_file))
                 return
             if not password_gone:
-                print(f" [Поток {self.chat_id}] Поле пароля всё ещё видно — неверный пароль")
                 self.screenshot_bytes = self.page.screenshot(full_page=True)
                 self.status = "awaiting_password"
                 self.result_queue.put(("wrong_password", self.screenshot_bytes))
                 return
             self.screenshot_bytes = self.page.screenshot(full_page=True)
-            print(f"️ [Поток {self.chat_id}] Неоднозначный результат (сигналов: {success_signals}/3)")
             self.status = "waiting"
             self.result_queue.put(("waiting", self.screenshot_bytes))
         except Exception as e:
@@ -510,8 +511,6 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
     poll = post.get("poll") or special.get("poll") or {}
     msg_hash = get_message_hash(post)
     if msg_hash in cache:
-        # Poll counts can change while the source message id and question stay the same.
-        # A new poll signature must be processed so it can update or establish tracking.
         if poll and signature and signature not in known_signatures:
             return True
         return False
@@ -739,10 +738,6 @@ def get_media_bytes(
                 raise RuntimeError("MAX вернул пустой файл")
             detected_type = _sniff_rich_media_type(data, content_type) if media_type == "image" else ""
             if detected_type:
-                print(
-                    f"[{chat_id}] ℹ️ MAX вернул {detected_type} вместо изображения; "
-                    "обрабатываю как медиа"
-                )
                 result = {
                     "url": url,
                     "bytes": data,
@@ -756,13 +751,11 @@ def get_media_bytes(
                 return result
             if media_type == "image":
                 if len(data) < 500:
-                    print(f"[{chat_id}] ⛔ Слишком маленькое изображение: {len(data)} байт")
                     return None
                 if not _looks_like_image(data, content_type):
                     # Если MAX вернул HTML shell вместо картинки, не повторяем
                     # бессмысленные запросы. Выходим в screenshot fallback ниже.
                     if str(content_type or "").lower().startswith("text/html") or data.lstrip().lower().startswith((b"<html", b"<!doctype")):
-                        print(f"[{chat_id}] ℹ️ URL изображения вернул HTML MAX; используем визуальный fallback")
                         return None
                     raise RuntimeError(
                         f"ответ не похож на изображение: content-type={content_type!r}, size={len(data)}"
@@ -776,10 +769,8 @@ def get_media_bytes(
                 "content_type": content_type,
             }
         except Exception as error:
-            print(f"[{chat_id}] ⚠️ Попытка {attempt}/3 скачать {media_type}: {error}")
             if attempt < 3:
                 time.sleep(1.5)
-    print(f"[{chat_id}] ❌ Не удалось скачать {media_type}")
     return None
 
 def is_human_message(msg: dict) -> bool:
@@ -1517,7 +1508,6 @@ def _record_animated_image_as_video(media: dict, chat_id: int = 0) -> dict:
         except Exception:
             ffmpeg = None
     if not ffmpeg:
-        # GIF remains animated in Telegram when sent with send_animation.
         if kind == "gif":
             media["type"] = "animation"
             media["filename"] = "animated_sticker.gif"
@@ -1965,9 +1955,6 @@ def _refresh_card_image_urls(page, msg: dict, chat_id: int = 0) -> list[str]:
         try:
             card.scroll_into_view_if_needed(timeout=1500)
             page.wait_for_timeout(140)
-            # Прогреваем каждое изображение внутри конкретной карточки. В MAX
-            # captioned-photo часто лениво получает src только при попадании
-            # самого img в viewport.
             imgs=card.locator("img")
             for i in range(min(imgs.count(), 12)):
                 try:
@@ -2144,8 +2131,6 @@ def _screenshot_card_images(page, msg: dict, chat_id: int = 0) -> list[dict]:
                 print(f"[{chat_id}] ℹ️ Screenshot фото #{i} не получен: {exc}"); continue
             if data and len(data)>200:
                 out.append({'url':f'screenshot:{dom_id}:{i}','bytes':data,'type':'image','hash':get_media_hash(data=data),'content_type':'image/png','visual_fallback':True})
-        # Второй fallback для captioned-photo в MAX: иногда фото хранится как CSS background-image
-        # у div/a, а не как <img>. Снимаем только сам визуальный контейнер.
         try:
             candidates=card.locator("[style*='background-image' i], [data-image-url], [data-photo-url], [data-media-url]")
             for i in range(min(candidates.count(),20)):
@@ -3375,48 +3360,178 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     return withDateSource("","unresolved");
                 }
 
-                function getOwnText(row) {
-                    const pollSelector = "[data-testid*='poll' i],[class*='poll' i],[data-type='poll'],[class*='survey' i]";
-                    // The poll widget contains answer labels and empty-state text, not the
-                    // message comment. Remove that widget before using bubble text as a caption.
+                const emojiNodeSelectors = [
+                    '[class*="emoji" i]', '[class*="animated" i]', '[data-animated-emoji]',
+                    '[data-custom-emoji]', '[data-emoji-id]', '[data-emoji-name]', '[data-emoji-code]',
+                    '[data-emoji-codepoint]', '[data-codepoint]', '[data-codepoints]', '[data-unicode]',
+                    '[data-type*="emoji" i]', '[data-testid*="emoji" i]', '[aria-label*="emoji" i]',
+                    '[title*="emoji" i]', '[role="img"]', 'canvas', 'video', 'img[alt]',
+                    'img[aria-label]', '[data-emoji]', '[data-emoji-char]', '[data-emoji-text]',
+                    '[data-character]', '[data-name]', '[data-icon]'
+                ];
+                const emojiNodeSelector = emojiNodeSelectors.join(",");
+
+                function emojiClusters(value) {
+                    const text = String(value || "");
+                    const matches = [];
                     try {
-                        const bubble = row.querySelector(".bubbleContent");
-                        if (bubble && bubble.querySelector(pollSelector)) {
-                            const clone = bubble.cloneNode(true);
-                            [
-                                ".header", ".meta", ".link", "button.mark",
-                                '[class*="reply" i]', '[class*="quoted" i]',
-                                '[class*="quote" i]', pollSelector
-                            ].forEach(selector => {
-                                try {
-                                    clone.querySelectorAll(selector).forEach(el => el.remove());
-                                } catch (e) {}
-                            });
-                            return clean(clone.textContent);
+                        if (typeof Intl !== "undefined" && Intl.Segmenter) {
+                            const segmenter = new Intl.Segmenter(undefined, {granularity:"grapheme"});
+                            for (const part of segmenter.segment(text)) {
+                                if (/[\p{Extended_Pictographic}\p{Regional_Indicator}]/u.test(part.segment) || /[#*0-9]\uFE0F?\u20E3/u.test(part.segment)) {
+                                    matches.push(part.segment);
+                                }
+                            }
+                            return matches;
                         }
-                    } catch (e) {}
-                    // Самый надёжный вариант: только непосредственный .text внутри bubbleContent.
+                    } catch(e) {}
                     try {
-                        const direct = row.querySelector(".bubbleContent > .text");
-                        if (direct) return clean(direct.textContent);
-                    } catch (e) {}
+                        return text.match(/(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier}|\u200D\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?)*)/gu) || [];
+                    } catch(e) { return []; }
+                }
+
+                function cleanMessageText(value) {
+                    return String(value || "")
+                        .replace(/\r\n?/g, "\n")
+                        .split("\n")
+                        .map(line => line.replace(/[^\S\n]+/g, " ").trim())
+                        .join("\n")
+                        .replace(/\n{3,}/g, "\n\n")
+                        .trim();
+                }
+
+                function emojiValueFromElement(el) {
+                    if (!el) return "";
+                    const textAttrs = ["alt", "data-emoji", "data-emoji-char", "data-emoji-text", "data-text", "data-unicode", "aria-label", "title", "data-emoji-name", "data-custom-emoji"];
+                    for (const attr of textAttrs) {
+                        const found = emojiClusters(safeAttr(el, attr));
+                        if (found.length) return found.join("");
+                    }
+                    const codeAttrs = ["data-codepoint", "data-codepoints", "data-emoji-code", "data-emoji-codepoint"];
+                    for (const attr of codeAttrs) {
+                        const tokens = safeAttr(el, attr).match(/(?:U\+|0x)?[0-9a-f]{4,6}/gi) || [];
+                        const decoded = tokens.map(token => parseInt(token.replace(/^(?:U\+|0x)/i, ""), 16))
+                            .filter(cp => cp >= 0x2000 && cp <= 0x1FAFF)
+                            .map(cp => String.fromCodePoint(cp));
+                        if (decoded.length) return emojiClusters(decoded.join("")).join("");
+                    }
+                    const mediaNodes = [el, ...Array.from(el.querySelectorAll("img,video,canvas,source"))];
+                    for (const mediaNode of mediaNodes) {
+                        let src = mediaNode.currentSrc || mediaNode.src || safeAttr(mediaNode, "src") || safeAttr(mediaNode, "data-src") || safeAttr(mediaNode, "data-emoji-url") || safeAttr(mediaNode, "data-animation-url") || "";
+                        if (!src) {
+                            try {
+                                const match = String(getComputedStyle(mediaNode).backgroundImage || "").match(/url\(["']?(.*?)["']?\)/i);
+                                if (match) src = match[1];
+                            } catch(e) {}
+                        }
+                        const tokens = String(src).match(/(?:U\+|0x|emoji[=_-]|codepoint[=_-])([0-9a-f]{4,6})|(?:^|[\/_-])((?:1f|26|27)[0-9a-f]{2,4})(?=$|[\/_-])/gi) || [];
+                        const decoded = [];
+                        for (const token of tokens) {
+                            const hexes = token.match(/[0-9a-f]{4,6}/gi) || [];
+                            for (const hex of hexes) {
+                                const cp = parseInt(hex, 16);
+                                if (cp >= 0x2000 && cp <= 0x1FAFF) decoded.push(String.fromCodePoint(cp));
+                            }
+                        }
+                        if (decoded.length) return emojiClusters(decoded.join("")).join("");
+                    }
+                    return "";
+                }
+
+                function getOwnContent(row) {
+                    const pollSelector = "[data-testid*='poll' i],[class*='poll' i],[data-type='poll'],[class*='survey' i]";
                     try {
                         const bubble = row.querySelector(".bubbleContent");
-                        if (!bubble) return "";
+                        if (!bubble) return {text:"", links:[], emojiTexts:[]};
                         const clone = bubble.cloneNode(true);
                         [
-                            ".header", ".meta", ".link", "button.mark",
-                            '[class*="reply" i]', '[class*="quoted" i]',
-                            '[class*="quote" i]'
+                            ".header", ".meta", "button.mark",
+                            '[class*="reply" i]', '[class*="quoted" i]', '[class*="quote" i]', pollSelector
                         ].forEach(selector => {
-                            try {
-                                clone.querySelectorAll(selector).forEach(el => el.remove());
-                            } catch (e) {}
+                            try { clone.querySelectorAll(selector).forEach(el => el.remove()); } catch(e) {}
                         });
-                        return clean(clone.textContent);
-                    } catch (e) {
-                        return "";
+                        clone.querySelectorAll(".link").forEach(el => {
+                            if (!el.matches("a[href]") && !el.querySelector("a[href]")) el.remove();
+                        });
+
+                        const emojiTexts = getEmojiTexts(clone);
+                        const emojiQueue = emojiTexts.slice();
+                        const candidates = Array.from(clone.querySelectorAll(emojiNodeSelector));
+                        const consume = value => {
+                            for (const emoji of emojiClusters(value)) {
+                                const index = emojiQueue.indexOf(emoji);
+                                if (index >= 0) emojiQueue.splice(index, 1);
+                            }
+                        };
+                        for (const el of candidates) {
+                            if (!clone.contains(el)) continue;
+                            const meta = `${safeAttr(el, "class")} ${safeAttr(el, "data-testid")} ${safeAttr(el, "data-type")} ${safeAttr(el, "aria-label")} ${safeAttr(el, "alt")} ${safeAttr(el, "title")}`;
+                            if (/sticker|стикер/i.test(meta)) continue;
+                            let parent = el.parentElement;
+                            let insideSticker = false;
+                            for (; parent && parent !== clone; parent = parent.parentElement) {
+                                if (/sticker|стикер/i.test(`${safeAttr(parent, "class")} ${safeAttr(parent, "data-testid")} ${safeAttr(parent, "data-type")}`)) { insideSticker = true; break; }
+                            }
+                            if (insideSticker) continue;
+                            const hasNestedEmoji = candidates.some(child => {
+                                if (child === el || !el.contains(child)) return false;
+                                const childMeta = `${safeAttr(child, "class")} ${safeAttr(child, "data-testid")} ${safeAttr(child, "data-type")} ${safeAttr(child, "aria-label")} ${safeAttr(child, "alt")} ${safeAttr(child, "title")}`;
+                                if (/sticker|стикер/i.test(childMeta)) return false;
+                                return /emoji|эмодзи|emoticon|smiley|custom.?emoji/i.test(childMeta) ||
+                                    emojiClusters(childMeta).length > 0 || child.hasAttribute("data-animated-emoji") ||
+                                    ["data-custom-emoji", "data-emoji-id", "data-emoji-name", "data-codepoint", "data-codepoints", "data-emoji-code", "data-emoji-codepoint"].some(attr => child.hasAttribute(attr));
+                            });
+                            if (hasNestedEmoji) continue;
+                            const visibleText = String(el.textContent || "");
+                            if (visibleText.trim()) {
+                                consume(visibleText);
+                                continue;
+                            }
+                            const hasEmojiMetadata = /emoji|эмодзи|emoticon|smiley|custom.?emoji/i.test(meta) ||
+                                emojiClusters(meta).length > 0 || el.hasAttribute("data-animated-emoji") ||
+                                ["data-custom-emoji", "data-emoji-id", "data-emoji-name", "data-codepoint", "data-codepoints", "data-emoji-code", "data-emoji-codepoint"].some(attr => el.hasAttribute(attr));
+                            if (!hasEmojiMetadata) continue;
+                            const emoji = emojiValueFromElement(el) || emojiQueue[0] || "";
+                            if (!emoji) continue;
+                            el.replaceWith(document.createTextNode(emoji));
+                            consume(emoji);
+                        }
+
+                        const blockTags = /^(?:DIV|P|LI|UL|OL|BLOCKQUOTE|PRE|SECTION|ARTICLE)$/;
+                        const blockBreak = "\uE000";
+                        const explicitBreak = "\uE001";
+                        const emojiBlockStart = "\uE002";
+                        const emojiBlockEnd = "\uE003";
+                        const flatten = node => {
+                            if (node.nodeType === 3) return node.nodeValue || "";
+                            if (node.nodeType !== 1) return "";
+                            if (node.tagName === "BR") return explicitBreak;
+                            const inner = Array.from(node.childNodes).map(flatten).join("");
+                            if (!blockTags.test(node.tagName)) return inner;
+                            const visibleInner = inner.replace(/[\uE000-\uE003]/g, "").trim();
+                            if (visibleInner && emojiClusters(visibleInner).join("") === visibleInner) {
+                                return `${emojiBlockStart}${inner}${emojiBlockEnd}`;
+                            }
+                            return `${blockBreak}${inner}${blockBreak}`;
+                        };
+                        const flattenText = node => cleanMessageText(
+                            flatten(node)
+                                .replace(new RegExp(`${blockBreak}*${emojiBlockStart}([\\s\\S]*?)${emojiBlockEnd}${blockBreak}*`, "g"), "$1")
+                                .replace(/[\uE000\uE001]/g, "\n")
+                        );
+                        const links = Array.from(clone.querySelectorAll("a[href]")).map(anchor => {
+                            let url = safeAttr(anchor, "href");
+                            try { url = new URL(url, location.href).href; } catch(e) {}
+                            return {text:flattenText(anchor), url};
+                        }).filter(link => link.text && /^(?:https?:\/\/|tg:|mailto:|tel:)/i.test(link.url));
+                        return {text:flattenText(clone), links, emojiTexts};
+                    } catch(e) {
+                        return {text:"", links:[], emojiTexts:[]};
                     }
+                }
+
+                function getOwnText(row) {
+                    return getOwnContent(row).text;
                 }
 
                 function getEmojiTexts(row) {
@@ -3425,8 +3540,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                     function add(value, nodeSeen) {
                         const s = clean(value);
                         if (!s) return;
-                        let matches = [];
-                        try { matches = s.match(/[\p{Extended_Pictographic}](?:\uFE0F|\u200D[\p{Extended_Pictographic}])*/gu) || []; } catch(e) {}
+                        const matches = emojiClusters(s);
                         for (const emoji of matches) {
                             if (!nodeSeen.has(emoji)) { nodeSeen.add(emoji); out.push(emoji); }
                         }
@@ -3440,8 +3554,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                         if(chars.length) add(chars.join(''), nodeSeen);
                     }
 
-                    const selectors = ['[class*="emoji" i]','[class*="animated" i]','[data-animated-emoji]','[data-custom-emoji]','[data-emoji-id]','[data-emoji-name]','[data-emoji-code]','[data-emoji-codepoint]','[data-codepoint]','[data-codepoints]','[data-unicode]','[data-type*="emoji" i]','[data-testid*="emoji" i]','[aria-label*="emoji" i]','[title*="emoji" i]','[role="img"]','canvas','video','img[alt]','img[aria-label]','[data-emoji]','[data-emoji-char]','[data-emoji-text]','[data-character]','[data-name]','[data-icon]'];
-                    const selectorText = selectors.join(",");
+                    const selectorText = emojiNodeSelector;
                     function hasNestedEmojiNode(el) {
                         try {
                             return Array.from(el.querySelectorAll(selectorText)).some(child => {
@@ -3449,7 +3562,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                                 const hint = `${safeAttr(child,"alt")} ${safeAttr(child,"aria-label")} ${safeAttr(child,"title")} ${safeAttr(child,"data-emoji")} ${safeAttr(child,"data-emoji-char")} ${safeAttr(child,"data-emoji-text")}`;
                                 if (/sticker|стикер/.test(meta)) return false;
                                 return /emoji|эмодзи|animated|emoticon|smiley|custom.?emoji/.test(meta) ||
-                                    /[\u2600-\u27BF\u{1F000}-\u{1FAFF}]/u.test(hint);
+                                    emojiClusters(hint).length > 0;
                             });
                         } catch(e) { return false; }
                     }
@@ -3460,9 +3573,8 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                         }
                         return false;
                     }
-                    for (const selector of selectors) {
-                        try {
-                            row.querySelectorAll(selector).forEach(el => {
+                    try {
+                            row.querySelectorAll(selectorText).forEach(el => {
                                 if (seenElements.has(el)) return;
                                 if (insideSticker(el)) return;
                                 // MAX renders one emoji as nested .emojis/.emoji/image nodes.
@@ -3508,8 +3620,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                                     } catch(e) {}
                                 }
                             });
-                        } catch(e) {}
-                    }
+                    } catch(e) {}
                     return out;
                 }
 
@@ -4297,23 +4408,17 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                         // для emoji-only сообщений. В v10 переменная emojiTexts объявлялась
                         // ПОСЛЕ первого обращения к ней, из-за чего каждый обычный .item
                         // падал с ReferenceError и в итоге парсер видел 0 сообщений.
-                        const emojiTexts = getEmojiTexts(bubble);
-                        let text = getOwnText(row);
+                        const richContent = getOwnContent(row);
+                        const emojiTexts = richContent.emojiTexts;
+                        let text = richContent.text;
                         // Emoji-only сообщения часто не имеют отдельного .text в MAX.
                         // Сохраняем сами эмодзи, не превращая время/служебный текст в сообщение.
                         if (!text) {
                             try {
-                                const emojiMatches = fullRowText.match(/[\p{Extended_Pictographic}](?:\uFE0F|\u200D[\p{Extended_Pictographic}])*/gu) || [];
+                                const emojiMatches = emojiClusters(fullRowText);
                                 if (emojiMatches.length) text = emojiMatches.join("");
                             } catch(e) {}
                             if (!text && emojiTexts.length) text = emojiTexts.join("");
-                        }
-                        if (emojiTexts.length) {
-                            try {
-                                const present = new Set(text.match(/[\p{Extended_Pictographic}](?:\uFE0F|\u200D[\p{Extended_Pictographic}])*/gu) || []);
-                                const missing = emojiTexts.filter(e => !present.has(e));
-                                if (missing.length) text = (text || "") + missing.join("");
-                            } catch(e) {}
                         }
                         const time = getTime(row);
                         const date = getDate(row);
@@ -4499,6 +4604,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                             download_click_filename: filenameHint,
                             name: finalName || "Аноним",
                             text,
+                            inline_links: richContent.links,
                             time,
                             date,
                             date_source: safeAttr(row,"data-max-parser-date-source") || "unresolved",
@@ -4561,7 +4667,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
         cleaned = []
         seen_ids = set()
         for msg in raw_messages:
-            text = " ".join((msg.get("text") or "").split()).strip()
+            text = _normalize_message_lines(msg.get("text") or "")
             text = _strip_browser_video_fallback(text)
             name = " ".join((msg.get("name") or "").split()).strip()
             source_id = str(msg.get("source_id") or "").strip()
@@ -4953,6 +5059,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
                 "data_id": msg.get("data_id", ""),
                 "name": msg.get("name", "Аноним"),
                 "text": msg.get("text", ""),
+                "inline_links": msg.get("inline_links", []),
                 "emoji_texts": msg.get("emoji_texts", []),
                 "time": msg.get("time", ""),
                 "date": msg.get("date", ""),
