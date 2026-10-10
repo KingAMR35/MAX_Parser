@@ -21,6 +21,7 @@ SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
 MAX_MESSAGES_TO_PARSE = 10  #! Тут менять кол-во сообщений
 MAX_MESSAGES_TO_PARSE = max(0, int(MAX_MESSAGES_TO_PARSE))
+MAX_TIMEZONE_ID = "Europe/Samara"
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -197,7 +198,10 @@ class QRLoginSession:
             headless=True,
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
         )
-        self.context = self.browser.new_context(viewport={'width': 1280, 'height': 800})
+        self.context = self.browser.new_context(
+            viewport={'width': 1280, 'height': 800},
+            timezone_id=MAX_TIMEZONE_ID,
+        )
         self.page = self.context.new_page()
         self.page.goto("https://web.max.ru", timeout=30000)
         self.page.wait_for_timeout(5000)
@@ -2895,6 +2899,7 @@ def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
         context = browser.new_context(
             storage_state=session_file,
             viewport={"width": 1280, "height": 800},
+            timezone_id=MAX_TIMEZONE_ID,
         )
         page = context.new_page()
         _install_max_media_response_cache(page, chat_id)
