@@ -25,6 +25,24 @@ _current_cycle_hashes = {}
 NO_PREVIEW = {"disable_web_page_preview": True}
 active_logins = {}
 awaiting_password_from = {}
+support_sessions = set(get_open_support_sessions())
+support_message_routes = get_support_message_routes()
+support_state_lock = threading.RLock()
+pending_setup_modes = {}
+customer_setup_state = {}
+SUPPORT_END_TEXT = "✅ Завершить чат с поддержкой"
+
+bot.set_my_commands([
+    types.BotCommand("start", "Запустить бота"),
+    types.BotCommand("help", "Связаться с тех поддержкой"),
+    types.BotCommand("connect", "Подключить группу MAX"),
+    types.BotCommand("mychats", "Мои группы парсинга"),
+    types.BotCommand("admin", "Админ-панель")
+])
+
+#!==============================================================================
+#! 1) ФУНКЦИИ, СВЯЗАННЫЕ С ПАРСИНГОМ
+#!==============================================================================
 
 def _is_emoji_only_text(text: str, emoji_values) -> bool:
     text = str(text or "").strip()
@@ -37,14 +55,6 @@ def _is_emoji_only_text(text: str, emoji_values) -> bool:
     remainder = remainder.replace("\ufe0f", "").replace("\u200d", "").strip()
     return not remainder
 
-bot.set_my_commands([
-    types.BotCommand("start", "Запустить бота"),
-    types.BotCommand("admin", "Админ-панель")
-])
-
-#!==============================================================================
-#! 1) ФУНКЦИИ, СВЯЗАННЫЕ С ПАРСИНГОМ
-#!==============================================================================
 def _media_to_bytesio(media: dict) -> io.BytesIO:
     data = media.get("bytes")
     if not isinstance(data, (bytes, bytearray)) or not data:
@@ -624,7 +634,7 @@ def _commit_successful_post(chat_id: int, post: dict) -> None:
     save_message_cache()
     save_photo_cache()
 
-def _process_posts(chat_id: int, title: str, posts: list, send_summary: bool = False) -> tuple:
+def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
     if posts is None:
         raise TypeError(f"Парсер MAX для чата {title} вернул None вместо списка сообщений")
     if not isinstance(posts, list):
@@ -708,27 +718,13 @@ def _process_posts(chat_id: int, title: str, posts: list, send_summary: bool = F
         "CHAT_PROCESS_COMPLETE chat_id=%s title=%s sent=%s skipped=%s failed=%s",
         chat_id, log_preview(title, 100), new_count, skipped_count, failed_count
     )
-    if send_summary and new_count > 0:
-        summary_text = (
-            f"✅ <b>Парсинг завершён для: {title}</b>\n\n"
-            f"📦 <b>Новых сообщений:</b> {new_count}"
-        )
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(types.InlineKeyboardButton(
-            "🗑 Удалить это сообщение",
-            callback_data="delete_this_msg"
-        ))
-        try:
-            bot.send_message(
-                chat_id,
-                summary_text,
-                parse_mode="HTML",
-                reply_markup=kb,
-                **NO_PREVIEW,
-            )
-        except Exception as error:
-            print(f"❌ Не удалось отправить отчёт в чат {title}: {error}")
     return new_count, skipped_count
+
+
+def _session_path_for_chat(chat):
+    if chat.get("account_mode") == "project":
+        return os.path.join("sessions", "project_account.json")
+    return os.path.join("sessions", f"{chat['chat_id']}.json")
 
 def run_one_parse_cycle():
     active_chats = get_active_chats()
@@ -740,12 +736,15 @@ def run_one_parse_cycle():
         max_url = chat["max_url"]
         title = chat["title"]
         try:
-            posts = parse_max_group_media(group_url=max_url, chat_id=chat_id)
+            posts = parse_max_group_media(
+                group_url=max_url,
+                chat_id=chat_id,
+                session_path=_session_path_for_chat(chat),
+            )
             new_count, skipped_count = _process_posts(
                 chat_id,
                 title,
                 posts,
-                send_summary=False,
             )
             if new_count:
                 results.append(
@@ -757,6 +756,7 @@ def run_one_parse_cycle():
                 )
         except Exception as error:
             error_str = str(error)
+            login_command = "/project_login" if chat.get("account_mode") == "project" else f"/login {chat_id}"
             if "SESSION_EXPIRED" in error_str:
                 debug_path = get_parse_debug_screenshot(chat_id)
                 if "|" in error_str:
@@ -765,7 +765,7 @@ def run_one_parse_cycle():
                         debug_path = candidate
                 error_msg = (
                     f"⚠️ <b>{title}</b>: сессия истекла!\n"
-                    f"Используйте `/login {chat_id}`"
+                    f"Используйте `{login_command}`"
                 )
                 if debug_path and os.path.exists(debug_path):
                     try:
@@ -782,7 +782,7 @@ def run_one_parse_cycle():
                 results.append(error_msg)
             elif "NO_SESSION" in error_str:
                 results.append(
-                    f"⚠️ <b>{title}</b>: нет сессии! Используйте `/login {chat_id}`"
+                    f"⚠️ <b>{title}</b>: нет сессии! Используйте `{login_command}`"
                 )
             else:
                 print(f"❌ Ошибка парсинга чата {title}: {error}")
@@ -808,8 +808,12 @@ def process_single_chat(chat):
     max_url = chat["max_url"]
     title = chat["title"]
     try:
-        posts = parse_max_group_media(group_url=max_url, chat_id=chat_id)
-        _process_posts(chat_id, title, posts, send_summary=True)
+        posts = parse_max_group_media(
+            group_url=max_url,
+            chat_id=chat_id,
+            session_path=_session_path_for_chat(chat),
+        )
+        _process_posts(chat_id, title, posts)
         return True
     except Exception as error:
         print(f"❌ Ошибка парсинга чата {title}: {error}")
@@ -1084,16 +1088,23 @@ def _build_qr_keyboard(target_chat_id):
     kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
 
+
+def _qr_target_from_action(action):
+    raw_target = action.split("_", 2)[2]
+    return "project_account" if raw_target == "project_account" else int(raw_target)
+
 def _build_password_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
 
 def do_qr_login(target_chat_id, admin_chat_id):
-    chat = get_chat_by_id(target_chat_id)
-    if not chat:
+    is_project_account = target_chat_id == "project_account"
+    chat = None if is_project_account else get_chat_by_id(target_chat_id)
+    if not is_project_account and not chat:
         bot.send_message(admin_chat_id, "❌ Чат не найден", **NO_PREVIEW)
         return
+    title = "аккаунта проекта" if is_project_account else chat["title"]
     session = active_logins.pop(target_chat_id, None)
     if session:
         try:
@@ -1103,15 +1114,17 @@ def do_qr_login(target_chat_id, admin_chat_id):
     awaiting_password_from.pop(target_chat_id, None)
     bot.send_message(
         admin_chat_id,
-        f"⏳ Открываю web.max.ru для <b>{chat['title']}</b>...\nЭто займет несколько секунд.",
+        f"⏳ Открываю web.max.ru для <b>{escape_html(title)}</b>...\nЭто займет несколько секунд.",
         parse_mode='HTML', **NO_PREVIEW
     )
     session = QRLoginSession(target_chat_id)
     status, data = session.start()
     if status == "already_logged_in":
+        if not is_project_account and chat.get("account_mode") == "self" and chat.get("max_url"):
+            toggle_chat(target_chat_id, True)
         bot.send_message(
             admin_chat_id,
-            f"✅ <b>Уже авторизован!</b>\nСессия для <b>{chat['title']}</b> актуальна.",
+            f"✅ <b>Уже авторизован!</b>\nСессия для <b>{escape_html(title)}</b> актуальна.",
             parse_mode='HTML', **NO_PREVIEW
         )
         return
@@ -1131,7 +1144,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
             photo_obj,
             caption=(
                 f"📱 <b>Отсканируйте QR-код</b> на этом скриншоте через приложение MAX\n\n"
-                f"Чат: <b>{chat['title']}</b>\n\n"
+                f"MAX: <b>{escape_html(title)}</b>\n\n"
                 f"После сканирования нажмите <b>«✅ Готово, я отсканировал»</b>"
             ),
             parse_mode='HTML',
@@ -1164,6 +1177,10 @@ def show_admin_menu(chat_id):
         types.InlineKeyboardButton("👑 Админы", callback_data="admin_admins"),
         types.InlineKeyboardButton("👤 Пользователи", callback_data="admin_users")
     )
+    kb.row(types.InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast"))
+    kb.row(types.InlineKeyboardButton("💬 Отправить в чат", callback_data="admin_send_to_chat"))
+    kb.row(types.InlineKeyboardButton("👤 Отправить пользователю", callback_data="admin_send_to_user"))
+    kb.add(types.InlineKeyboardButton("🔑 MAX-аккаунт проекта", callback_data="admin_project_login"))
     kb.add(types.InlineKeyboardButton("🗑 Очистить весь кэш", callback_data="admin_clear_cache", style="danger"))
     bot.send_message(chat_id, text, reply_markup=kb, **NO_PREVIEW)
 
@@ -1177,15 +1194,15 @@ def show_chats_list(chat_id, message_id=None):
             if c['is_active']:
                 status = "🟢"
                 status_text = "Активен"
-            elif not c.get('max_url') or not c.get('phone'):
+            elif not c.get('max_url'):
                 status = "🟡"
                 status_text = "Не настроен"
             else:
                 status = "🔴"
                 status_text = "Остановлен"
             url_mark = "✅" if c.get('max_url') else ""
-            phone_mark = "✅" if c.get('phone') else "❌"
-            session_mark = "✅" if os.path.exists(f"sessions/{c['chat_id']}.json") else ""
+            phone_mark = "✅" if c.get('phone') else "—"
+            session_mark = "✅" if os.path.exists(_session_path_for_chat(c)) else "❌"
             stats = get_chat_stats(c['chat_id'])
             text += f"\n\n{status} <b>{c['title']}</b>"
             text += f"<blockquote>🆔 <code>{c['chat_id']}</code> │ {status_text}\n"
@@ -1195,7 +1212,7 @@ def show_chats_list(chat_id, message_id=None):
     for c in chats:
         if c['is_active']:
             icon = "⏸"
-        elif not c.get('max_url') or not c.get('phone'):
+        elif not c.get('max_url'):
             icon = "⚙️"
         else:
             icon = "▶️"
@@ -1219,17 +1236,20 @@ def show_chat_details(chat_id, message_id, target_chat_id):
     cache_count = get_chat_cache_count(target_chat_id)
     if chat['is_active']:
         status_text = "🟢 Активен"
-    elif not chat.get('max_url') or not chat.get('phone'):
+    elif not chat.get('max_url'):
         status_text = "🟡 Нужно настроить"
     else:
         status_text = "🔴 Остановлен"
-    session_file = f"sessions/{target_chat_id}.json"
+    session_file = _session_path_for_chat(chat)
     session_status = "✅ Активна" if os.path.exists(session_file) else "❌ Отсутствует"
+    account_mode_text = "Аккаунт проекта" if chat.get("account_mode") == "project" else "Аккаунт пользователя"
     text = (
         f"📋 <b>{chat['title']}</b>\n\n"
         f"🆔 <b>ID:</b> <code>{chat['chat_id']}</code>\n"
         f"🔗 <b>URL:</b> {chat['max_url'] or ' не задан'}\n"
         f"📱 <b>Телефон:</b> {chat['phone'] or '❌ не задан'}\n"
+        f"👤 <b>MAX-аккаунт:</b> {account_mode_text}\n"
+        f"🧑‍💻 <b>Владелец Telegram:</b> <code>{chat.get('owner_id') or 'не назначен'}</code>\n"
         f"🔑 <b>Сессия:</b> {session_status}\n"
         f"⚙️ <b>Парсинг:</b> {status_text}\n\n"
         f"<blockquote>"
@@ -1238,7 +1258,7 @@ def show_chat_details(chat_id, message_id, target_chat_id):
         f"</blockquote>"
     )
     kb = types.InlineKeyboardMarkup(row_width=1)
-    if chat.get('max_url') and chat.get('phone'):
+    if chat.get('max_url') and (chat.get('phone') or os.path.exists(session_file)):
         if chat['is_active']:
             kb.add(types.InlineKeyboardButton("⏹ Остановить парсинг", callback_data=f"admin_toggle_chat_{target_chat_id}", style="danger"))
         else:
@@ -1478,6 +1498,343 @@ def process_set_phone(message, target_chat_id, admin_chat_id):
     time.sleep(0.3)
     show_chat_details(message.chat.id, None, target_chat_id)
 
+
+def send_content_to_user(user_id, message):
+    try:
+        caption = message.caption or ""
+
+        if message.video:
+            bot.send_video(user_id, message.video.file_id, caption=caption)
+        elif message.photo:
+            bot.send_photo(user_id, message.photo[-1].file_id, caption=caption)
+        elif message.document:
+            bot.send_document(user_id, message.document.file_id, caption=caption)
+        elif message.audio:
+            bot.send_audio(user_id, message.audio.file_id, caption=caption)
+        elif message.voice:
+            bot.send_voice(user_id, message.voice.file_id, caption=caption)
+        elif message.animation:
+            bot.send_animation(user_id, message.animation.file_id, caption=caption)
+        elif message.sticker:
+            bot.send_sticker(user_id, message.sticker.file_id)
+        elif message.video_note:
+            bot.send_video_note(user_id, message.video_note.file_id)
+        elif message.text:
+            bot.send_message(user_id, message.text)
+        else:
+            return False, "Тип сообщения не поддерживается"
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def process_broadcast_message(message):
+    users = select_users()
+    ok_count = 0
+    fail_count = 0
+    failed_users = []
+
+    for user in users:
+        user_id = user["user_id"]
+
+        ok, error = copy_message_to_chat(user_id, message)
+
+        if ok:
+            ok_count += 1
+        else:
+            fail_count += 1
+            failed_users.append(f"{user_id}: {error}")
+
+        time.sleep(0.05)
+
+    report = (
+        "✅ Рассылка завершена.\n"
+        f"Отправлено: {ok_count}\n"
+        f"Ошибок: {fail_count}"
+    )
+
+    if failed_users:
+        report += "\n\nПервые ошибки:\n" + "\n".join(failed_users[:10])
+
+    bot.send_message(message.chat.id, report)
+
+def process_send_to_one(message, target_user_id):
+    ok, error = copy_message_to_chat(target_user_id, message)
+
+    if ok:
+        bot.send_message(
+            message.chat.id,
+            f"✅ Сообщение отправлено пользователю {target_user_id}"
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Не удалось отправить пользователю {target_user_id}.\n"
+            f"Причина: {error[:300]}"
+        )
+
+def process_send_to_chat(message, target_chat_id):
+    ok, error = copy_message_to_chat(target_chat_id, message)
+
+    if ok:
+        bot.send_message(
+            message.chat.id,
+            f"✅ Сообщение отправлено в чат {target_chat_id}"
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Не удалось отправить в чат {target_chat_id}.\n"
+            f"Причина: {error[:300]}"
+        )
+
+def process_send_to_user_content(message, target_user_id):
+    ok, error = send_content_to_user(target_user_id, message)
+
+    if ok:
+        bot.send_message(
+            message.chat.id,
+            f"✅ Сообщение отправлено пользователю {target_user_id}"
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Не удалось отправить пользователю {target_user_id}.\n"
+            f"Причина: {error[:300]}"
+        )
+
+def process_send_to_user_id(message):
+    track_user(message)
+
+    text = (message.text or "").strip()
+
+    try:
+        target_user_id = int(text)
+    except (TypeError, ValueError):
+        bot.send_message(
+            message.chat.id,
+            "❌ ID пользователя должен быть числом.\n"
+            "Отправь ID ещё раз или нажми «❌ Отмена».",
+            reply_markup=get_cancel_keyboard()
+        )
+        bot.register_next_step_handler(
+            message,
+            process_send_to_user_id
+        )
+        return
+
+    prompt = bot.send_message(
+        message.chat.id,
+        f"Теперь отправь сообщение для пользователя {target_user_id}.",
+        reply_markup=get_cancel_keyboard()
+    )
+
+    bot.register_next_step_handler(
+        prompt,
+        process_send_to_user_content,
+        target_user_id
+    )
+
+def process_send_to_chat_id(message):
+    track_user(message)
+
+    text = (message.text or "").strip()
+
+    try:
+        target_chat_id = int(text)
+    except (TypeError, ValueError):
+        bot.send_message(
+            message.chat.id,
+            "❌ ID чата должен быть числом.\n"
+            "Отправь ID ещё раз или нажми «❌ Отмена».",
+            reply_markup=get_cancel_keyboard()
+        )
+        bot.register_next_step_handler(
+            message,
+            process_send_to_chat_id
+        )
+        return
+
+    prompt = bot.send_message(
+        message.chat.id,
+        f"Теперь отправь сообщение для чата {target_chat_id}.",
+        reply_markup=get_cancel_keyboard()
+    )
+
+    bot.register_next_step_handler(
+        prompt,
+        process_send_to_chat_content,
+        target_chat_id
+    )
+
+def process_send_to_chat_content(message, target_chat_id):
+    ok, error = send_content_to_user(target_chat_id, message)
+
+    if ok:
+        bot.send_message(
+            message.chat.id,
+            f"✅ Сообщение отправлено в чат {target_chat_id}"
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Не удалось отправить в чат {target_chat_id}.\n"
+            f"Причина: {error[:300]}"
+        )
+
+def copy_message_to_chat(target_chat_id, source_message):
+    try:
+        bot.copy_message(
+            chat_id=target_chat_id,
+            from_chat_id=source_message.chat.id,
+            message_id=source_message.message_id
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def start_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(types.InlineKeyboardButton("✔ Подключить MAX_Parser", callback_data="parse_setup"))
+    keyboard.add(types.InlineKeyboardButton("🔎 О парсинге", callback_data="about_bot"))
+    keyboard.add(types.InlineKeyboardButton("💬 Тех поддержка", callback_data="support_start"))
+    return keyboard
+
+def return_start():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(types.InlineKeyboardButton("✔ Подключить MAX_Parser", callback_data="parse_setup"))
+    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="start_comeback"))
+    return keyboard
+
+def parser_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(types.InlineKeyboardButton("1️⃣ Мой аккаунт MAX — 250 ₽/мес", callback_data="my_acc_250"))
+    keyboard.add(types.InlineKeyboardButton("2️⃣ Через готовый аккаунт — 500 ₽/мес", callback_data="not_my_acc_250"))
+    keyboard.add(types.InlineKeyboardButton("📖 Инструкция", callback_data="instruction"))
+    keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
+    return keyboard
+
+
+def _support_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    keyboard.add(types.KeyboardButton(SUPPORT_END_TEXT))
+    return keyboard
+
+
+def _support_admin_keyboard(user_id):
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("❌ Завершить чат", callback_data=f"support_close_{user_id}"))
+    return keyboard
+
+
+def _support_user_label(user):
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part).strip()
+    full_name = escape_html(full_name or "Имя не указано")
+    username = f"@{escape_html(user.username)}" if user.username else "не указан"
+    return full_name, username
+
+
+def _map_support_message(message_id, user_id):
+    with support_state_lock:
+        support_message_routes[message_id] = user_id
+        save_support_message_route(message_id, user_id)
+
+
+def _notify_support_admin(user, body_message=None):
+    full_name, username = _support_user_label(user)
+    header = bot.send_message(
+        ADMIN_ID,
+        "🆘 <b>Обращение в тех поддержку</b>\n"
+        f"👤 {full_name}\n"
+        f"🔎 Никнейм: {username}",
+        parse_mode="HTML",
+        reply_markup=_support_admin_keyboard(user.id),
+        **NO_PREVIEW,
+    )
+    _map_support_message(header.message_id, user.id)
+    if body_message is None:
+        return
+    try:
+        copied = bot.copy_message(
+            ADMIN_ID,
+            body_message.chat.id,
+            body_message.message_id,
+        )
+        _map_support_message(copied.message_id, user.id)
+    except Exception as error:
+        fallback = body_message.text or body_message.caption or "[Вложение не удалось скопировать]"
+        copied = bot.send_message(
+            ADMIN_ID,
+            f"⚠️ <b>Сообщение не удалось скопировать</b>\n{escape_html(fallback[:3000])}\n\n"
+            f"Причина: <code>{escape_html(str(error)[:500])}</code>",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        _map_support_message(copied.message_id, user.id)
+
+
+def start_support(chat_id, user):
+    if chat_id != user.id:
+        bot.send_message(
+            chat_id,
+            "Чтобы написать в тех поддержку, откройте со мной личный чат и отправьте /help.",
+            **NO_PREVIEW,
+        )
+        return
+    track_user(type("SupportUserEvent", (), {"from_user": user})())
+    with support_state_lock:
+        if user.id in support_sessions:
+            bot.send_message(
+                chat_id,
+                "Чат с поддержкой уже открыт. Напишите сообщение или нажмите кнопку завершения.",
+                reply_markup=_support_keyboard(),
+                **NO_PREVIEW,
+            )
+            return
+        support_sessions.add(user.id)
+        open_support_session(user.id)
+    try:
+        bot.send_message(
+            chat_id,
+            "💬 <b>Чат с тех поддержкой открыт</b>\n\n"
+            "Напишите, с чем нужна помощь. Ваши сообщения и никнейм увидит поддержка. "
+            "Ответы придут сюда от имени бота, личный аккаунт специалиста вам не показывается.\n\n"
+            "Если вы проходите вход в MAX, сообщение с паролем двухэтапной проверки обрабатывается отдельно и поддержке не пересылается.\n\n"
+            "Когда вопрос решён, нажмите кнопку ниже.",
+            parse_mode="HTML",
+            reply_markup=_support_keyboard(),
+            **NO_PREVIEW,
+        )
+        _notify_support_admin(user)
+    except Exception as error:
+        with support_state_lock:
+            support_sessions.discard(user.id)
+            close_support_session(user.id)
+        bot.send_message(
+            chat_id,
+            f"Не удалось открыть обращение. Попробуйте позже. ({escape_html(str(error)[:200])})",
+            reply_markup=types.ReplyKeyboardRemove(),
+            **NO_PREVIEW,
+        )
+
+
+def _close_support(user_id, notify_user=True):
+    with support_state_lock:
+        was_open = user_id in support_sessions
+        support_sessions.discard(user_id)
+        for message_id, routed_user_id in list(support_message_routes.items()):
+            if routed_user_id == user_id:
+                support_message_routes.pop(message_id, None)
+        close_support_session(user_id)
+    if was_open and notify_user:
+        bot.send_message(
+            user_id,
+            "Чат с тех поддержкой завершён. Если понадобится помощь, снова отправьте /help.",
+            reply_markup=types.ReplyKeyboardRemove(),
+            **NO_PREVIEW,
+        )
+    return was_open
 #!==============================================================================
 #! 3) ОСТАЛЬНОЙ КОД (ОБРАБОТЧИКИ СООБЩЕНИЙ)
 #!==============================================================================
@@ -1487,7 +1844,10 @@ def on_bot_added_to_chat(message):
         if member.id == bot.get_me().id:
             chat_id = message.chat.id
             title = message.chat.title or f"Чат {chat_id}"
-            add_chat(chat_id, title)
+            owner_id = message.from_user.id if message.from_user else None
+            setup_mode = pending_setup_modes.get(owner_id) if owner_id else None
+            if not setup_mode:
+                add_chat(chat_id, title)
             try:
                 member_status = bot.get_chat_member(chat_id, bot.get_me().id).status
                 if member_status not in ['administrator', 'creator']:
@@ -1495,9 +1855,10 @@ def on_bot_added_to_chat(message):
                         chat_id,
                         "👋 <b>Привет!</b>\n\n"
                         "Я — <b>MAX Parser Bot</b>. Меня добавили в этот чат.\n\n"
-                        "️ <b>Важно:</b> Чтобы я мог работать, мне нужны права администратора.\n"
-                        "Пожалуйста, назначьте меня админом чата.\n\n"
-                        "ℹ️ Администратор должен написать мне в ЛС команду /admin для настройки.",
+                        "Эту группу можно выбрать как место получения сообщений MAX.\n"
+                        "В личном чате со мной отправьте /connect, выберите способ подключения, "
+                        "а затем напишите здесь /bind.\n\n"
+                        "Проверьте, что боту разрешено отправлять сообщения в эту группу.",
                         parse_mode='HTML', **NO_PREVIEW
                     )
                 else:
@@ -1505,8 +1866,9 @@ def on_bot_added_to_chat(message):
                         chat_id,
                         "👋 <b>Привет!</b>\n\n"
                         "Я — <b>MAX Parser Bot</b>. Меня добавили в этот чат.\n\n"
-                        "✅ Права администратора получены. Готов к работе!\n\n"
-                        "ℹ️ Администратор должен написать мне в ЛС команду /admin для настройки парсинга.",
+                        "Группу можно выбрать как место получения сообщений MAX.\n"
+                        "В личном чате со мной отправьте /connect, выберите способ подключения, "
+                        "а затем напишите здесь /bind.",
                         parse_mode='HTML', **NO_PREVIEW
                     )
             except Exception as e:
@@ -1515,21 +1877,259 @@ def on_bot_added_to_chat(message):
                     chat_id,
                     "👋 <b>Привет!</b>\n\n"
                     "Я — <b>MAX Parser Bot</b>. Меня добавили в этот чат.\n\n"
-                    "️ Для полноценной работы мне нужны права администратора.\n\n"
-                    "ℹ️ Администратор должен написать мне в ЛС команду /admin.",
+                    "Чтобы выбрать эту группу для получения сообщений, отправьте /connect в личном чате со мной, "
+                    "затем напишите здесь /bind.",
                     parse_mode='HTML', **NO_PREVIEW
                 )
+            if setup_mode and owner_id:
+                _begin_customer_group_setup(chat_id, owner_id, setup_mode)
             return
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start1'])
 def start_bot(message):
     track_user(message)
     text = (
-        " <b>Привет!</b>\n\n"
-        "Я — <b>MAX_Parser</b>. Я автоматически пересылаю сообщения "
-        "из мессенджера MAX в Telegram."
+        "👋 <b>Привет!</b>\n\n"
+        "Меня зовут <b>MAX_Parser</b>.\n\n"
+        "Я помогаю автоматически пересылать сообщения из выбранной группы "
+        "мессенджера MAX в Telegram.\n\n"
+        "📌 <b>Для чего я нужен</b>\n"
+        "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
+        "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
+        "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
+        "⚡ <b>Почему это удобно</b>\n"
+        "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
+        "• Не нужно постоянно включать и выключать VPN.\n"
+        "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
+
     )
-    bot.send_message(message.chat.id, text, **NO_PREVIEW)
+
+    bot.send_message(message.chat.id, text, **NO_PREVIEW, reply_markup=start_keyboard())
+
+
+@bot.message_handler(commands=['help1'])
+def help_command(message):
+    start_support(message.chat.id, message.from_user)
+
+
+@bot.message_handler(commands=['connect1'])
+def connect_command(message):
+    track_user(message)
+    if message.chat.type != "private":
+        bot.reply_to(message, "Откройте личный чат со мной и отправьте /connect.")
+        return
+    bot.send_message(
+        message.chat.id,
+        "Выберите способ подключения.",
+        reply_markup=parser_keyboard(),
+        **NO_PREVIEW,
+    )
+
+
+@bot.message_handler(commands=['mychats1'])
+def my_chats_command(message):
+    track_user(message)
+    if message.chat.type != "private":
+        bot.reply_to(message, "Список подключений показывается только в личном чате. Отправьте мне /mychats напрямую.")
+        return
+    chats = get_user_chats(message.from_user.id)
+    if not chats:
+        bot.send_message(
+            message.chat.id,
+            "У вас пока нет подключённых Telegram-групп. Начните настройку командой /connect.",
+            **NO_PREVIEW,
+        )
+        return
+    lines = ["📬 <b>Ваши группы MAX_Parser</b>"]
+    for chat in chats:
+        state = "🟢 Парсинг включён" if chat.get("is_active") else "🟡 Ожидает настройки"
+        mode = "ваш MAX-аккаунт" if chat.get("account_mode") != "project" else "аккаунт проекта"
+        lines.append(
+            f"\n<b>{escape_html(chat.get('title') or 'Группа')}</b>\n"
+            f"{state} · {mode}"
+        )
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML", **NO_PREVIEW)
+
+
+def _begin_customer_group_setup(chat_id, owner_id, account_mode):
+    title = None
+    try:
+        title = bot.get_chat(chat_id).title or f"Группа {chat_id}"
+    except Exception:
+        title = f"Группа {chat_id}"
+    if not claim_chat(chat_id, title, owner_id, account_mode):
+        pending_setup_modes.pop(owner_id, None)
+        bot.send_message(
+            owner_id,
+            "Эта Telegram-группа уже подключена к другому аккаунту. Выберите свою группу и повторите /bind.",
+            **NO_PREVIEW,
+        )
+        return False
+    pending_setup_modes.pop(owner_id, None)
+    customer_setup_state[owner_id] = {"chat_id": chat_id, "mode": account_mode}
+    bot.send_message(
+        owner_id,
+        f"✅ Группа <b>{escape_html(title)}</b> закреплена за вами.\n\n"
+        f"<b>Шаг 2 из {2 if account_mode == 'project' else 3}.</b> Пришлите сюда ссылку на группу MAX, из которой нужно получать сообщения.\n"
+        "Как скопировать ссылку: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
+        "зайдите в нужную группу и скопируйте её ссылку из меню группы.\n\n"
+        "Для отмены отправьте /cancel.",
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+    return True
+
+
+@bot.message_handler(commands=['bind'])
+def bind_customer_group(message):
+    if message.chat.type == "private":
+        bot.send_message(
+            message.chat.id,
+            "Отправьте /bind в той Telegram-группе, куда должны приходить сообщения.",
+            **NO_PREVIEW,
+        )
+        return
+    mode = pending_setup_modes.get(message.from_user.id)
+    if not mode:
+        bot.reply_to(message, "Сначала откройте личный чат со мной и нажмите /connect.")
+        return
+    _begin_customer_group_setup(message.chat.id, message.from_user.id, mode)
+    bot.reply_to(message, "Настройку продолжим в личном чате с ботом.")
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.from_user.id in customer_setup_state
+    and not (m.text or "").startswith("/"),
+    content_types=["text"],
+)
+def customer_source_url(message):
+    state = customer_setup_state.get(message.from_user.id)
+    if not state:
+        return
+    url = (message.text or "").strip()
+    if not re.match(r"^https?://(?:web\.)?max\.ru/", url, re.I):
+        bot.send_message(
+            message.chat.id,
+            "Не похоже на ссылку группы MAX. Пришлите полную ссылку вида <code>https://web.max.ru/…</code>.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        return
+    chat_id = state["chat_id"]
+    mode = state["mode"]
+    update_chat_url(chat_id, url)
+    customer_setup_state.pop(message.from_user.id, None)
+    if mode == "self":
+        bot.send_message(
+            message.chat.id,
+            "<b>Шаг 3 из 3.</b> Сейчас открою страницу входа MAX и пришлю QR-код. "
+            "Отсканируйте его в приложении MAX; авторизация будет сохранена только для вашей группы.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        do_qr_login(chat_id, message.from_user.id)
+        return
+
+    project_session = os.path.join("sessions", "project_account.json")
+    if os.path.exists(project_session):
+        toggle_chat(chat_id, True)
+        bot.send_message(
+            message.chat.id,
+            "✅ Ссылка сохранена. Группа добавлена в очередь парсинга. Проверьте, что аккаунт проекта MAX приглашён в исходную группу.",
+            **NO_PREVIEW,
+        )
+    else:
+        account_name = os.getenv("MAX_PROJECT_ACCOUNT_USERNAME", "").strip()
+        account_line = f"Аккаунт проекта: <b>{escape_html(account_name)}</b>.\n" if account_name else ""
+        bot.send_message(
+            message.chat.id,
+            "✅ Ссылка сохранена. Подключение включится, когда администратор настроит сессию аккаунта проекта.\n\n"
+            f"{account_line}Если аккаунт ещё не добавлен в исходную MAX-группу, напишите в поддержку командой /help.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+
+
+@bot.message_handler(commands=['cancel'])
+def cancel_customer_setup(message):
+    state = customer_setup_state.pop(message.from_user.id, None)
+    pending_setup_modes.pop(message.from_user.id, None)
+    if state:
+        bot.send_message(message.chat.id, "Настройка отменена. Можно начать заново командой /connect.", **NO_PREVIEW)
+    elif _close_support(message.from_user.id):
+        return
+    else:
+        bot.send_message(message.chat.id, "Нечего отменять.", **NO_PREVIEW)
+
+
+@bot.message_handler(func=lambda m: m.chat.type == "private" and m.text == SUPPORT_END_TEXT)
+def end_support_button(message):
+    if _close_support(message.from_user.id):
+        bot.send_message(message.chat.id, "Спасибо за обращение!", **NO_PREVIEW)
+    else:
+        bot.send_message(message.chat.id, "Чат с поддержкой сейчас не открыт.", reply_markup=types.ReplyKeyboardRemove(), **NO_PREVIEW)
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.from_user.id == ADMIN_ID
+    and m.reply_to_message is not None
+    and m.reply_to_message.message_id in support_message_routes
+    and (
+        not m.text
+        or not m.text.startswith("/")
+        or m.text.strip().lower() == "/close"
+    ),
+    content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
+)
+def support_admin_reply(message):
+    user_id = support_message_routes.get(message.reply_to_message.message_id)
+    if not user_id:
+        return
+    if message.content_type == "text" and message.text.strip().lower() == "/close":
+        if _close_support(user_id):
+            bot.reply_to(message, "Диалог завершён. Пользователь получил уведомление.")
+        else:
+            bot.reply_to(message, "Этот диалог уже закрыт.")
+        return
+    with support_state_lock:
+        if user_id not in support_sessions:
+            bot.reply_to(message, "Диалог уже закрыт. Откройте новое обращение, если пользователь напишет снова.")
+            return
+    try:
+        if message.content_type == "text" and len(message.text) <= 3900:
+            bot.send_message(
+                user_id,
+                "🆘 <b>Ответ от тех поддержки</b>\n\n" + escape_html(message.text),
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            return
+        bot.send_message(
+            user_id,
+            "🆘 <b>Ответ от тех поддержки</b>",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        bot.copy_message(user_id, message.chat.id, message.message_id)
+    except Exception as error:
+        bot.reply_to(message, f"Не удалось доставить ответ: {escape_html(str(error)[:300])}")
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.from_user.id in support_sessions
+    and m.from_user.id not in set(awaiting_password_from.values()),
+    content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
+)
+def support_user_message(message):
+    if message.content_type == "text" and message.text.startswith("/"):
+        return
+    try:
+        _notify_support_admin(message.from_user, message)
+    except Exception as error:
+        bot.send_message(message.chat.id, f"Не удалось доставить сообщение в поддержку: {escape_html(str(error)[:200])}", **NO_PREVIEW)
 
 @bot.message_handler(commands=['login'])
 def start_login_process(message):
@@ -1553,6 +2153,15 @@ def start_login_process(message):
         return
     do_qr_login(target_chat_id, message.chat.id)
 
+
+@bot.message_handler(commands=['project_login'])
+def start_project_account_login(message):
+    track_user(message)
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔️ Только для админов")
+        return
+    do_qr_login("project_account", message.chat.id)
+
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
     track_user(message)
@@ -1561,7 +2170,11 @@ def admin_panel(message):
         return
     show_admin_menu(message.chat.id)
 
-@bot.message_handler(func=lambda m: m.from_user.id in [ADMIN_ID] and not m.text.startswith('/'))
+@bot.message_handler(
+    func=lambda m: m.text is not None
+    and not m.text.startswith('/')
+    and m.from_user.id in set(awaiting_password_from.values())
+)
 def handle_password_input(message):
     user_id = message.from_user.id
     target_chat_id = None
@@ -1572,8 +2185,9 @@ def handle_password_input(message):
     if target_chat_id is None:
         return
     password = message.text.strip()
-    chat = get_chat_by_id(target_chat_id)
-    session = active_logins.pop(target_chat_id, None)
+    chat = get_chat_by_id(target_chat_id) if target_chat_id != "project_account" else None
+    title = "аккаунта проекта" if target_chat_id == "project_account" else (chat["title"] if chat else "MAX")
+    session = active_logins.get(target_chat_id)
     if not session:
         bot.send_message(message.chat.id, "❌ Сессия авторизации не найдена", **NO_PREVIEW)
         awaiting_password_from.pop(target_chat_id, None)
@@ -1582,9 +2196,16 @@ def handle_password_input(message):
     status, data = session.enter_password(password)
     awaiting_password_from.pop(target_chat_id, None)
     if status == "success":
+        active_logins.pop(target_chat_id, None)
+        if target_chat_id == "project_account":
+            for customer_chat in get_all_chats():
+                if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
+                    toggle_chat(customer_chat["chat_id"], True)
+        elif chat and chat.get("max_url"):
+            toggle_chat(target_chat_id, True)
         bot.send_message(
             message.chat.id,
-            f"🎉 <b>Успешно!</b>\nСессия для <b>{chat['title']}</b> сохранена.\nТеперь фоновый парсер сможет работать автоматически!",
+            f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> сохранена.\nТеперь фоновый парсер сможет работать автоматически!",
             parse_mode='HTML', **NO_PREVIEW
         )
     elif status == "wrong_password":
@@ -1609,13 +2230,44 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
-    if not is_admin(call.from_user.id):
+    action = call.data
+    is_allowed_customer_qr = False
+    if not is_admin(call.from_user.id) and action.startswith("qr_"):
+        try:
+            qr_target = _qr_target_from_action(action)
+            chat = get_chat_by_id(qr_target) if qr_target != "project_account" else None
+            is_allowed_customer_qr = bool(
+                chat
+                and int(chat.get("owner_id") or 0) == call.from_user.id
+                and chat.get("account_mode") == "self"
+            )
+        except (ValueError, IndexError, TypeError):
+            is_allowed_customer_qr = False
+    if not is_admin(call.from_user.id) and not is_allowed_customer_qr:
         bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
         return
-    action = call.data
+    if action.startswith("support_close_"):
+        try:
+            user_id = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Не удалось определить обращение", show_alert=True)
+            return
+        if support_message_routes.get(call.message.message_id) != user_id:
+            bot.answer_callback_query(call.id, "Кнопка относится к уже завершённому обращению")
+            return
+        if _close_support(user_id):
+            bot.answer_callback_query(call.id, "Диалог завершён")
+            bot.send_message(call.message.chat.id, "✅ Чат с пользователем завершён.", **NO_PREVIEW)
+        else:
+            bot.answer_callback_query(call.id, "Этот диалог уже закрыт")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
     if action == "cancel_step":
         try:
             bot.clear_step_handler(call.message)
@@ -1634,20 +2286,27 @@ def admin_callbacks(call):
             print(f"Ошибка удаления: {e}")
         return
     if action.startswith("qr_ready_"):
-        target_id = int(action.split("_")[-1])
+        target_id = _qr_target_from_action(action)
         bot.answer_callback_query(call.id, "⏳ Проверяю вход...")
         session = active_logins.get(target_id)
         if not session:
             bot.send_message(call.message.chat.id, "❌ Сессия авторизации не найдена", **NO_PREVIEW)
             return
-        chat = get_chat_by_id(target_id)
+        chat = get_chat_by_id(target_id) if target_id != "project_account" else None
+        title = "аккаунта проекта" if target_id == "project_account" else chat["title"]
         status, data = session.check()
         if status == "success":
             active_logins.pop(target_id, None)
             awaiting_password_from.pop(target_id, None)
+            if target_id == "project_account":
+                for customer_chat in get_all_chats():
+                    if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
+                        toggle_chat(customer_chat["chat_id"], True)
+            elif chat and chat.get("max_url"):
+                toggle_chat(target_id, True)
             bot.send_message(
                 call.message.chat.id,
-                f"🎉 <b>Успешно!</b>\nСессия для <b>{chat['title']}</b> сохранена.",
+                f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> сохранена.",
                 parse_mode='HTML', **NO_PREVIEW
             )
         elif status == "awaiting_password":
@@ -1686,19 +2345,26 @@ def admin_callbacks(call):
                 parse_mode='HTML', **NO_PREVIEW
             )
     elif action.startswith("qr_refresh_"):
-        target_id = int(action.split("_")[-1])
+        target_id = _qr_target_from_action(action)
         bot.answer_callback_query(call.id, "🔄 Обновляю QR-код...")
         session = active_logins.get(target_id)
         if not session:
             bot.send_message(call.message.chat.id, "❌ Сессия авторизации не найдена", **NO_PREVIEW)
             return
-        chat = get_chat_by_id(target_id)
+        chat = get_chat_by_id(target_id) if target_id != "project_account" else None
+        title = "аккаунта проекта" if target_id == "project_account" else chat["title"]
         status, data = session.refresh()
         if status == "success":
             active_logins.pop(target_id, None)
+            if target_id == "project_account":
+                for customer_chat in get_all_chats():
+                    if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
+                        toggle_chat(customer_chat["chat_id"], True)
+            elif chat and chat.get("max_url"):
+                toggle_chat(target_id, True)
             bot.send_message(
                 call.message.chat.id,
-                f"🎉 <b>Успешно!</b>\nВы уже авторизованы в <b>{chat['title']}</b>!",
+                f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> обновлена!",
                 parse_mode='HTML', **NO_PREVIEW
             )
             return
@@ -1724,7 +2390,7 @@ def admin_callbacks(call):
         except Exception as e:
             bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}", **NO_PREVIEW)
     elif action.startswith("qr_cancel_"):
-        target_id = int(action.split("_")[-1])
+        target_id = _qr_target_from_action(action)
         session = active_logins.pop(target_id, None)
         if session:
             try:
@@ -1747,6 +2413,9 @@ def admin_callbacks(call):
             **NO_PREVIEW
         )
         bot.register_next_step_handler(msg, process_add_chat_step1, call.message.chat.id)
+    elif action == "admin_project_login":
+        bot.answer_callback_query(call.id, "⏳ Открываю вход в MAX...")
+        do_qr_login("project_account", call.message.chat.id)
     elif action == "admin_add_admin":
         msg = bot.send_message(
             call.message.chat.id,
@@ -1825,6 +2494,41 @@ def admin_callbacks(call):
             bot.delete_message(call.message.chat.id, call.message.message_id)
         except:
             pass
+    elif action == "admin_broadcast":
+        track_user(call.message)
+
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "💬 Введите текст рассылки:"
+        )
+
+        bot.register_next_step_handler(prompt, process_broadcast_message)
+    elif action == "admin_send_to_chat":
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "Отправь ID чата, в который нужно отправить сообщение.\n\n"
+            "Пример для группы: <code>-1001234567890</code>",
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard()
+        )
+
+        bot.register_next_step_handler(
+            prompt,
+            process_send_to_chat_id
+        )
+    elif action == "admin_send_to_user":
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "Отправь ID пользователя, которому нужно отправить сообщение.\n\n"
+            "Пример: <code>123456789</code>",
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard()
+        )
+
+        bot.register_next_step_handler(
+            prompt,
+            process_send_to_user_id
+        )
     elif action.startswith("admin_chat_"):
         target_id = int(action.split("_")[-1])
         show_chat_details(call.message.chat.id, call.message.message_id, target_id)
@@ -1832,9 +2536,16 @@ def admin_callbacks(call):
         target_id = int(action.split("_")[-1])
         chat = get_chat_by_id(target_id)
         if chat:
-            if not chat.get('max_url') or not chat.get('phone'):
-                bot.answer_callback_query(call.id, "⚠️ Сначала настройте URL и телефон!", show_alert=True)
-                return
+            going_active = not bool(chat['is_active'])
+            if going_active:
+                session_exists = os.path.exists(_session_path_for_chat(chat))
+                if not chat.get('max_url') or (not session_exists and not chat.get('phone')):
+                    bot.answer_callback_query(
+                        call.id,
+                        "⚠️ Сначала задайте URL и настройте MAX-аккаунт!",
+                        show_alert=True,
+                    )
+                    return
             toggle_chat(target_id, not bool(chat['is_active']))
         show_chat_details(call.message.chat.id, call.message.message_id, target_id)
     elif action.startswith("admin_clear_chat_cache_"):
@@ -1940,6 +2651,167 @@ def admin_callbacks(call):
         except Exception as e:
             bot.answer_callback_query(call.id, f"Ошибка: {str(e)[:50]}", show_alert=True)
             print(f"Ошибка статистики: {e}")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if call.message:
+        if call.data == "about_bot":
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text='''
+<b>MAX_Parser — удобный мост между MAX и Telegram</b>\n
+<i>Он помогает автоматически пересылать новые сообщения из выбранной группы MAX в Telegram. Ты не пропустишь важные объявления, обсуждения и файлы, даже если чаще пользуешься Telegram.</i>\n
+<blockquote><b>Что умеет бот:</b>\n
+• Пересылать новые сообщения из подключённой группы MAX.
+• Отправлять текст, фото, видео, документы и другие поддерживаемые вложения.
+• Работать автоматически: не нужно постоянно открывать MAX и проверять группу вручную.
+• Помогать не терять важную информацию из школьных, рабочих или дружеских чатов.
+<b>Почему это удобно:</b>\n
+• Все важные сообщения приходят в Telegram.
+• Не нужно каждый раз переключаться между приложениями.
+• Не нужно постоянно включать и выключать VPN.
+• Ты сам выбираешь группу и настраиваешь, откуда получать сообщения.</blockquote>\n
+<blockquote><b>⚠️ Важно знать:</b>\n
+Бот использует <b>автоматизированный доступ к MAX</b>, поэтому в редких случаях аккаунт может быть <b>временно ограничен на несколько дней</b>. Это редкая ситуация, но такие ограничения возможны со стороны MAX.\n
+Если вы боитесь, что можете временно потерять доступ к аккаунту в MAX, то у MAX_Parser <b>есть отличное решение</b>:\n
+MAX_Parser будет работать через <b>другой аккаунт</b>, который сделан специально для парсинга. Тебе не нужно авторизоваться в MAX и предоставлять доступ к своему аккаунту.\n
+Достаточно будет просто пригласить этот аккаунт в группу MAX, из которой нужно пересылать сообщения. Бот будет автоматически получать новые сообщения и пересылать их в Telegram.\n
+🔒 Тем самым, ваш аккаунт в MAX останется в <b>абсолютной безопасности</b>.</blockquote>
+
+''', reply_markup=return_start(), parse_mode='HTML', **NO_PREVIEW)
+        elif call.data == "start_comeback":
+            text = (
+                "👋 <b>Привет!</b>\n\n"
+                "Меня зовут <b>MAX_Parser</b>.\n\n"
+                "Я помогаю автоматически пересылать сообщения из выбранной группы "
+                "мессенджера MAX в Telegram.\n\n"
+                "📌 <b>Для чего я нужен</b>\n"
+                "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
+                "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
+                "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
+                "⚡ <b>Почему это удобно</b>\n"
+                "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
+                "• Не нужно постоянно включать и выключать VPN.\n"
+                "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
+                "🔒 <b>Важно</b>\n"
+                "Бот работает только с теми группами, доступ к которым тебе разрешён."
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=text, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
+        elif call.data == "parse_setup":
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    "<b>Подключение MAX → Telegram</b>\n\n"
+                    "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
+                    "<blockquote><b>1️⃣ Ваш аккаунт MAX</b>\n"
+                    "Вы сканируете QR-код для своей группы. Сессия и сообщения привязаны к вашей Telegram-группе.</blockquote>\n"
+                    "<blockquote><b>2️⃣ Аккаунт проекта</b>\n"
+                    "В исходную группу добавляется отдельный аккаунт MAX проекта. Его имя можно получить у поддержки.</blockquote>\n\n"
+                    "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
+                ),
+                reply_markup=parser_keyboard(),
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        elif call.data in ("my_acc_250", "not_my_acc_250"):
+            if call.message.chat.type != "private":
+                bot.answer_callback_query(
+                    call.id,
+                    "Откройте личный чат с ботом, чтобы настроить подключение.",
+                    show_alert=True,
+                )
+                return
+            mode = "self" if call.data == "my_acc_250" else "project"
+            pending_setup_modes[call.from_user.id] = mode
+            track_user(call)
+            label = "настройку своего аккаунта MAX" if mode == "self" else "настройку через готовый аккаунт"
+            bot.answer_callback_query(call.id, "Настройка запущена")
+            bot.send_message(
+                call.from_user.id,
+                f"<b>Шаг 1 из {2 if mode == 'project' else 3} · Telegram-группа</b>\n\n"
+                f"Вы выбрали: <b>{label}</b>. Добавьте меня в Telegram-группу, в которую я буду присылать сообщения. "
+                "Когда я появлюсь в группе, настройка продолжится автоматически. Если я уже состою в ней, то "
+                "напишите в группе команду /bind.\n\n"
+                "Убедитесь, что мне разрешено отправлять сообщения. Для отмены отправьте /cancel.",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            try:
+                bot.edit_message_text(
+                    "Настройка начата. Продолжите её в вашей Telegram-группе; подробная инструкция доступна по кнопке ниже.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=parser_keyboard(),
+                    **NO_PREVIEW,
+                )
+            except Exception:
+                pass
+        elif call.data == "support_start":
+            bot.answer_callback_query(call.id)
+            start_support(call.message.chat.id, call.from_user)
+        elif call.data == "start_home":
+            text = (
+                "👋 <b>Привет!</b>\n\n"
+                "Меня зовут <b>MAX_Parser</b>.\n\n"
+                "Я помогаю автоматически пересылать сообщения из выбранной группы "
+                "мессенджера MAX в Telegram.\n\n"
+                "📌 <b>Для чего я нужен</b>\n"
+                "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
+                "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
+                "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
+                "⚡ <b>Почему это удобно</b>\n"
+                "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
+                "• Не нужно постоянно включать и выключать VPN.\n"
+                "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
+                "🔒 <b>Важно</b>\n"
+                "Бот работает только с теми группами, доступ к которым тебе разрешён."
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=text, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
+        elif call.data == "instruction":
+            instruction_kb = types.InlineKeyboardMarkup(row_width=1)
+            instruction_kb.add(types.InlineKeyboardButton("💬 Задать вопрос к поддержке", callback_data="support_start"))
+            instruction_kb.add(types.InlineKeyboardButton("🔙 К выбору подключения", callback_data="parse_setup"))
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    "<b>📖 Подробная инструкция по подключению</b>\n\n"
+                    "<b>Что понадобится</b>\n"
+                    "• Эта переписка с ботом.\n"
+                    "• Ваша Telegram-группа для получения сообщений.\n"
+                    "• Ссылка на группу MAX.\n\n"
+                    "<b>Шаг 1 · Выберите Telegram-группу, в которую будут приходить сообщения из группы MAX</b>\n"
+                    "После нажатия на кнопку «Подключить MAX_Parser» выберите способ работы с MAX. Затем добавьте этого бота "
+                    "в Telegram-группу, куда должны приходить сообщения. После появления бота отправьте в группе /bind. "
+                    "Если бот уже добавлен, то просто напишите /bind. Боту нужно разрешить отправлять сообщения.\n\n"
+                    "<b>Шаг 2 · Укажите группу MAX</b>\n"
+                    "Откройте <a href=\"https://web.max.ru\">web.max.ru</a>, войдите в MAX, перейдите в нужную группу "
+                    "и скопируйте ссылку группы из её меню. Бот попросит прислать эту ссылку в личный чат. "
+                    "Проверьте, что ссылка ведёт именно в нужную группу.\n\n"
+                    "<b>Вариант 1 · Ваш аккаунт MAX</b>\n"
+                    "После отправки ссылки бот покажет QR-код. Отсканируйте его камерой приложения MAX и подтвердите вход кнопкой "
+                    "«Готово, я отсканировал». Если MAX запросит пароль двухэтапной проверки, отправьте его боту в этой личной переписке; "
+                    "он нужен только для входа в MAX. После успешного входа парсер включится автоматически 🎉.\n\n"
+                    "<b>Вариант 2 · Через готовый аккаунт MAX</b>\n"
+                    "После того как вы добавили MAX_Pаrser в группу напишите в вашей группе в Telegram команду /bind и после, "
+                    "пришлите БОТУ ссылку, которая ведет на вашу группу. Настройка завершена 🎉.\n\n"
+                    "<b>Управление и помощь</b>\n"
+                    "• /mychats — посмотреть свои подключения.\n"
+                    "• /cancel — отменить текущий шаг настройки.\n"
+                    "• /help — открыть анонимный чат с поддержкой.\n\n"
+                ),
+                reply_markup=instruction_kb,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
 
 if __name__ == "__main__":
     try:

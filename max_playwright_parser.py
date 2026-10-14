@@ -147,8 +147,12 @@ def _click_submit_button(page):
         return False
 
 class QRLoginSession:
-    def __init__(self, chat_id: int):
+    def __init__(self, chat_id):
         self.chat_id = chat_id
+        session_key = str(chat_id)
+        if not re.fullmatch(r"-?\d+|project_account", session_key):
+            raise ValueError("Некорректный идентификатор сессии MAX")
+        self.session_file = os.path.join(SESSIONS_DIR, f"{session_key}.json")
         self.command_queue = queue.Queue()
         self.result_queue = queue.Queue()
         self.thread = None
@@ -206,10 +210,9 @@ class QRLoginSession:
         self.page.goto("https://web.max.ru", timeout=30000)
         self.page.wait_for_timeout(5000)
         if _is_logged_in(self.page):
-            session_file = f"sessions/{self.chat_id}.json"
-            self.context.storage_state(path=session_file)
+            self.context.storage_state(path=self.session_file)
             self._do_close()
-            self.result_queue.put(("already_logged_in", session_file))
+            self.result_queue.put(("already_logged_in", self.session_file))
             return
         self.screenshot_bytes = self.page.screenshot(full_page=True)
         self.status = "waiting"
@@ -222,10 +225,9 @@ class QRLoginSession:
         self.page.reload()
         self.page.wait_for_timeout(4000)
         if _is_logged_in(self.page):
-            session_file = f"sessions/{self.chat_id}.json"
-            self.context.storage_state(path=session_file)
+            self.context.storage_state(path=self.session_file)
             self._do_close()
-            self.result_queue.put(("success", session_file))
+            self.result_queue.put(("success", self.session_file))
             return
         self.screenshot_bytes = self.page.screenshot(full_page=True)
         self.status = "waiting"
@@ -236,10 +238,9 @@ class QRLoginSession:
             self.result_queue.put(("error", "Сессия не активна"))
             return
         if _is_logged_in(self.page):
-            session_file = f"sessions/{self.chat_id}.json"
-            self.context.storage_state(path=session_file)
+            self.context.storage_state(path=self.session_file)
             self._do_close()
-            self.result_queue.put(("success", session_file))
+            self.result_queue.put(("success", self.session_file))
             return
         password_input = _get_password_input(self.page)
         if password_input:
@@ -272,10 +273,9 @@ class QRLoginSession:
             password_gone = _get_password_input(self.page) is None
             success_signals = sum([url_changed, logged_in, password_gone])
             if success_signals >= 2:
-                session_file = f"sessions/{self.chat_id}.json"
-                self.context.storage_state(path=session_file)
+                self.context.storage_state(path=self.session_file)
                 self._do_close()
-                self.result_queue.put(("success", session_file))
+                self.result_queue.put(("success", self.session_file))
                 return
             if not password_gone:
                 self.screenshot_bytes = self.page.screenshot(full_page=True)
@@ -2881,12 +2881,16 @@ def _resolve_contact_link_via_dialog(page, msg: dict, group_url: str, chat_id: i
                 page.wait_for_timeout(1000)
         except Exception: pass
 
-def parse_max_group_media(group_url: str, chat_id: int) -> List[Dict]:
+def parse_max_group_media(
+    group_url: str,
+    chat_id: int,
+    session_path: str = None,
+) -> List[Dict]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
     debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
     if not isinstance(chat_id, int):
         raise Exception(f"Некорректный chat_id: {chat_id} (должен быть int)")
-    session_file = f"{SESSIONS_DIR}/{chat_id}.json"
+    session_file = session_path or f"{SESSIONS_DIR}/{chat_id}.json"
     if not os.path.exists(session_file):
         raise Exception("NO_SESSION")
     pw = browser = context = page = None

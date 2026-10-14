@@ -1,247 +1,323 @@
-import sqlite3
 import os
-from datetime import datetime
 
-DB_PATH = "MAX_Parser.db"
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import dict_row
+
+
+# DB_service is imported before bot.py loads dotenv, so load the project settings here.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_NAME = os.getenv("PGDATABASE", "MAX_Parser")
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open a PostgreSQL connection using DATABASE_URL or standard PG* settings."""
+    if DATABASE_URL:
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    options = {
+        "dbname": DATABASE_NAME,
+        "host": os.getenv("PGHOST"),
+        "port": os.getenv("PGPORT", "5432"),
+        "user": os.getenv("PGUSER"),
+        "password": os.getenv("PGPASSWORD"),
+        "sslmode": os.getenv("PGSSLMODE"),
+    }
+    return psycopg.connect(
+        row_factory=dict_row,
+        **{key: value for key, value in options.items() if value not in (None, "")},
+    )
 
 
 def init_db():
-    conn = get_connection()
-    con = conn.cursor()
+    """Create the clean PostgreSQL schema; no SQLite data is imported."""
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                first_seen TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id BIGINT PRIMARY KEY,
+                title TEXT,
+                max_url TEXT,
+                phone TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                message_count BIGINT NOT NULL DEFAULT 0,
+                owner_id BIGINT,
+                account_mode TEXT NOT NULL DEFAULT 'self',
+                added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS chats (
-            chat_id INTEGER PRIMARY KEY,
-            title TEXT,
-            max_url TEXT,
-            phone TEXT,
-            is_active INTEGER DEFAULT 0,
-            message_count INTEGER DEFAULT 0,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_sessions (
+                user_id BIGINT PRIMARY KEY,
+                opened_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    # Миграции для существующей БД
-    try:
-        con.execute("ALTER TABLE chats ADD COLUMN message_count INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        con.execute("ALTER TABLE chats ADD COLUMN phone TEXT")
-    except sqlite3.OperationalError:
-        pass
-
-    # ВАЖНО: Удаляем старую таблицу messages, если она существует, чтобы освободить место на диске
-    con.execute("DROP TABLE IF EXISTS messages")
-    
-    conn.commit()
-    conn.close()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_message_routes (
+                message_id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL
+            )
+        """)
 
 
 #! ============ АДМИНЫ ============
 
 def add_admin(user_id: int, username: str = None):
-    conn = get_connection()
-    conn.execute("INSERT OR IGNORE INTO admins (user_id, username) VALUES (?, ?)", (user_id, username))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO admins (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id, username),
+        )
 
 
 def update_admin_username(user_id: int, username: str):
-    conn = get_connection()
-    conn.execute("UPDATE admins SET username = ? WHERE user_id = ?", (username, user_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("UPDATE admins SET username = %s WHERE user_id = %s", (username, user_id))
 
 
 def is_admin(user_id: int) -> bool:
-    conn = get_connection()
-    row = conn.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close()
-    return row is not None
+    with get_connection() as conn:
+        row = conn.execute("SELECT 1 AS found FROM admins WHERE user_id = %s", (user_id,)).fetchone()
+        return row is not None
 
 
 def get_all_admins():
-    conn = get_connection()
-    rows = conn.execute("SELECT user_id, username FROM admins ORDER BY added_at").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_connection() as conn:
+        rows = conn.execute("SELECT user_id, username FROM admins ORDER BY added_at").fetchall()
+        return list(rows)
 
 
 def delete_admin(user_id: int):
-    conn = get_connection()
-    conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
 
 
 #! ============ ПОЛЬЗОВАТЕЛИ ============
 
 def add_or_update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO users (user_id, username, first_name, last_name, last_seen)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name,
-            last_name = excluded.last_name,
-            last_seen = CURRENT_TIMESTAMP
-    """, (user_id, username, first_name, last_name))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO users (user_id, username, first_name, last_name, last_seen)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                last_seen = CURRENT_TIMESTAMP
+        """, (user_id, username, first_name, last_name))
 
 
 def get_all_users():
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT user_id, username, first_name, last_name, first_seen, last_seen
-        FROM users ORDER BY last_seen DESC
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT user_id, username, first_name, last_name, first_seen, last_seen
+            FROM users ORDER BY last_seen DESC
+        """).fetchall()
+        return list(rows)
 
 
 def get_user_count():
-    conn = get_connection()
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    conn.close()
-    return count
+    with get_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+        return row["count"]
+
+
+def open_support_session(user_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO support_sessions (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id,),
+        )
+
+
+def get_open_support_sessions():
+    with get_connection() as conn:
+        rows = conn.execute("SELECT user_id FROM support_sessions").fetchall()
+        return [int(row["user_id"]) for row in rows]
+
+
+def save_support_message_route(message_id: int, user_id: int):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO support_message_routes (message_id, user_id) VALUES (%s, %s)
+            ON CONFLICT (message_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        """, (message_id, user_id))
+
+
+def get_support_message_routes():
+    with get_connection() as conn:
+        rows = conn.execute("SELECT message_id, user_id FROM support_message_routes").fetchall()
+        return {int(row["message_id"]): int(row["user_id"]) for row in rows}
+
+
+def close_support_session(user_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM support_sessions WHERE user_id = %s", (user_id,))
+        conn.execute("DELETE FROM support_message_routes WHERE user_id = %s", (user_id,))
+
+
+def select_users():
+    with get_connection() as conn:
+        rows = conn.execute("SELECT user_id, username FROM users ORDER BY user_id ASC").fetchall()
+        return list(rows)
 
 
 #! ============ ЧАТЫ ============
 
-def add_chat(chat_id: int, title: str, max_url: str = None, phone: str = None):
-    conn = get_connection()
-    conn.execute("""
-        INSERT OR IGNORE INTO chats (chat_id, title, max_url, phone, is_active, message_count)
-        VALUES (?, ?, ?, ?, 0, 0)
-    """, (chat_id, title, max_url, phone))
-    conn.commit()
-    conn.close()
+def add_chat(
+    chat_id: int,
+    title: str,
+    max_url: str = None,
+    phone: str = None,
+    owner_id: int = None,
+    account_mode: str = "self",
+):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO chats
+                (chat_id, title, max_url, phone, is_active, message_count, owner_id, account_mode)
+            VALUES (%s, %s, %s, %s, FALSE, 0, %s, %s)
+            ON CONFLICT (chat_id) DO NOTHING
+        """, (chat_id, title, max_url, phone, owner_id, account_mode))
+        if owner_id is not None:
+            conn.execute(
+                "UPDATE chats SET owner_id = COALESCE(owner_id, %s) WHERE chat_id = %s",
+                (owner_id, chat_id),
+            )
+
+
+def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bool:
+    """Bind a Telegram destination to one customer; never transfer an existing owner."""
+    with get_connection() as conn:
+        with conn.transaction():
+            conn.execute("""
+                INSERT INTO chats (chat_id, title, owner_id, account_mode, is_active, message_count)
+                VALUES (%s, %s, %s, %s, FALSE, 0)
+                ON CONFLICT (chat_id) DO NOTHING
+            """, (chat_id, title, owner_id, account_mode))
+            row = conn.execute(
+                "SELECT owner_id FROM chats WHERE chat_id = %s FOR UPDATE", (chat_id,)
+            ).fetchone()
+            if row and row["owner_id"] is not None and int(row["owner_id"]) != int(owner_id):
+                return False
+            conn.execute("""
+                UPDATE chats
+                SET title = %s, owner_id = %s, account_mode = %s, max_url = NULL,
+                    phone = NULL, is_active = FALSE
+                WHERE chat_id = %s
+            """, (title, owner_id, account_mode, chat_id))
+            return True
+
+
+def get_user_chats(owner_id: int):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chats WHERE owner_id = %s ORDER BY added_at DESC", (owner_id,)
+        ).fetchall()
+        return list(rows)
 
 
 def update_chat_url(chat_id: int, max_url: str):
-    conn = get_connection()
-    conn.execute("UPDATE chats SET max_url = ? WHERE chat_id = ?", (max_url, chat_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("UPDATE chats SET max_url = %s WHERE chat_id = %s", (max_url, chat_id))
 
 
 def update_chat_phone(chat_id: int, phone: str):
-    conn = get_connection()
-    conn.execute("UPDATE chats SET phone = ? WHERE chat_id = ?", (phone, chat_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("UPDATE chats SET phone = %s WHERE chat_id = %s", (phone, chat_id))
 
 
 def update_chat_title(chat_id: int, title: str):
-    conn = get_connection()
-    conn.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (title, chat_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("UPDATE chats SET title = %s WHERE chat_id = %s", (title, chat_id))
 
 
 def get_chat_by_id(chat_id: int):
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM chats WHERE chat_id = %s", (chat_id,)).fetchone()
+        return row
 
 
 def get_active_chats():
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT * FROM chats
-        WHERE is_active = 1 AND max_url IS NOT NULL AND phone IS NOT NULL
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM chats
+            WHERE is_active = TRUE AND max_url IS NOT NULL
+        """).fetchall()
+        return list(rows)
 
 
 def get_all_chats():
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM chats ORDER BY added_at DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM chats ORDER BY added_at DESC").fetchall()
+        return list(rows)
 
 
 def toggle_chat(chat_id: int, active: bool):
-    conn = get_connection()
-    conn.execute("UPDATE chats SET is_active = ? WHERE chat_id = ?",
-                 (1 if active else 0, chat_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("UPDATE chats SET is_active = %s WHERE chat_id = %s", (bool(active), chat_id))
 
 
 def delete_chat(chat_id: int):
-    conn = get_connection()
-    conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
-    # Удаление записей из messages больше не требуется
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM chats WHERE chat_id = %s", (chat_id,))
 
 
 #! ============ СЧЕТЧИКИ СООБЩЕНИЙ ============
 
 def increment_message_count(chat_id: int):
     """Увеличивает счетчик сообщений для чата на 1"""
-    conn = get_connection()
-    conn.execute("UPDATE chats SET message_count = message_count + 1 WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("UPDATE chats SET message_count = message_count + 1 WHERE chat_id = %s", (chat_id,))
 
 
 def get_chat_stats(chat_id: int):
-    conn = get_connection()
-    row = conn.execute("SELECT message_count FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
-    conn.close()
-    count = row['message_count'] if row else 0
-    # Возвращаем общее число и для "сегодня", так как детальное логирование по дням отключено для экономии места
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT message_count FROM chats WHERE chat_id = %s", (chat_id,)
+        ).fetchone()
+    count = row["message_count"] if row else 0
+    # Детальное логирование по дням отключено, поэтому today совпадает с total.
     return {"total": count, "today": count}
 
 
 def get_global_stats():
-    conn = get_connection()
-    total_chats = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
-    active_chats = conn.execute("SELECT COUNT(*) FROM chats WHERE is_active = 1").fetchone()[0]
-    
-    # Суммируем счетчики всех чатов
-    total_msgs_row = conn.execute("SELECT SUM(message_count) FROM chats").fetchone()
-    total_msgs = total_msgs_row[0] if total_msgs_row[0] is not None else 0
-    
-    conn.close()
+    with get_connection() as conn:
+        total_chats = conn.execute("SELECT COUNT(*) AS count FROM chats").fetchone()["count"]
+        active_chats = conn.execute(
+            "SELECT COUNT(*) AS count FROM chats WHERE is_active = TRUE"
+        ).fetchone()["count"]
+        total_msgs = conn.execute(
+            "SELECT COALESCE(SUM(message_count), 0) AS count FROM chats"
+        ).fetchone()["count"]
     return {
         "total_chats": total_chats,
         "active_chats": active_chats,
         "total_msgs": total_msgs,
-        "today_msgs": total_msgs
+        "today_msgs": total_msgs,
     }
+
 
 init_db()
