@@ -1,5 +1,3 @@
-"""Structured, local diagnostics for MAX parsing and Telegram delivery."""
-
 import logging
 import os
 import re
@@ -37,7 +35,6 @@ _QUERY_RE = re.compile(r"([?&][^=\s]+)=([^&\s]+)")
 
 
 def preview(value, limit=180):
-    """Return a one-line log preview with phone-like strings masked."""
     text = " ".join(str(value or "").replace("\x00", "").split())
     text = _PHONE_RE.sub("[номер скрыт]", text)
     text = _TOKEN_RE.sub("[telegram token скрыт]", text)

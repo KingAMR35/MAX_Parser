@@ -4,8 +4,6 @@ import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
-
-# DB_service is imported before bot.py loads dotenv, so load the project settings here.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -13,7 +11,6 @@ DATABASE_NAME = os.getenv("PGDATABASE", "MAX_Parser")
 
 
 def get_connection():
-    """Open a PostgreSQL connection using DATABASE_URL or standard PG* settings."""
     if DATABASE_URL:
         return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
@@ -32,7 +29,6 @@ def get_connection():
 
 
 def init_db():
-    """Create the clean PostgreSQL schema; no SQLite data is imported."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admins (
@@ -288,7 +284,6 @@ def delete_chat(chat_id: int):
 #! ============ СЧЕТЧИКИ СООБЩЕНИЙ ============
 
 def increment_message_count(chat_id: int):
-    """Увеличивает счетчик сообщений для чата на 1"""
     with get_connection() as conn:
         conn.execute("UPDATE chats SET message_count = message_count + 1 WHERE chat_id = %s", (chat_id,))
 
@@ -299,7 +294,6 @@ def get_chat_stats(chat_id: int):
             "SELECT message_count FROM chats WHERE chat_id = %s", (chat_id,)
         ).fetchone()
     count = row["message_count"] if row else 0
-    # Детальное логирование по дням отключено, поэтому today совпадает с total.
     return {"total": count, "today": count}
 
 
