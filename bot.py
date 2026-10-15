@@ -2236,7 +2236,7 @@ def on_bot_added_to_chat(message):
                 _begin_customer_group_setup(chat_id, owner_id, setup_mode)
             return
 
-@bot.message_handler(commands=['start1'])
+@bot.message_handler(commands=['start'])
 def start_bot(message):
     track_user(message)
     text = (
@@ -2263,7 +2263,7 @@ def help_command(message):
     start_support(message.chat.id, message.from_user)
 
 
-@bot.message_handler(commands=['connect1'])
+@bot.message_handler(commands=['connect'])
 def connect_command(message):
     track_user(message)
     if message.chat.type != "private":
@@ -2277,7 +2277,7 @@ def connect_command(message):
     )
 
 
-@bot.message_handler(commands=['mychats', 'mychats1'])
+@bot.message_handler(commands=['mychats'])
 def my_chats_command(message):
     track_user(message)
     if message.chat.type != "private":
