@@ -119,6 +119,73 @@ def _get_password_input(page):
             continue
     return None
 
+def _get_phone_input(page):
+    selectors = [
+        "input[type='tel']",
+        "input[autocomplete='tel']",
+        "input[name*='phone' i]",
+        "input[placeholder*='телефон' i]",
+        "input[placeholder*='phone' i]",
+        "input[aria-label*='телефон' i]",
+        "input[aria-label*='phone' i]",
+    ]
+    for selector in selectors:
+        try:
+            element = page.locator(selector).first
+            if element.is_visible(timeout=700):
+                return element
+        except Exception:
+            continue
+    return None
+
+
+def _get_login_code_input(page):
+    selectors = [
+        "input[autocomplete='one-time-code']",
+        "input[inputmode='numeric']",
+        "input[name*='otp' i]",
+        "input[name*='verification' i]",
+        "input[name*='code' i]",
+        "input[placeholder*='код' i]",
+        "input[placeholder*='code' i]",
+    ]
+    for selector in selectors:
+        try:
+            element = page.locator(selector).first
+            if not element.is_visible(timeout=700):
+                continue
+            if selector == "input[inputmode='numeric']":
+                hints = " ".join(
+                    str(element.get_attribute(attribute) or "")
+                    for attribute in ("name", "placeholder", "aria-label", "autocomplete")
+                )
+                if re.search(r"phone|телефон|номер", hints, re.I):
+                    continue
+            return element
+        except Exception:
+            continue
+    return None
+
+
+def _click_phone_login_option(page):
+    selectors = [
+        "button:has-text('Войти по номеру телефона')",
+        "button:has-text('Войти по телефону')",
+        "text=Войти по номеру телефона",
+        "text=Sign in with phone number",
+        "text=Log in with phone number",
+    ]
+    for selector in selectors:
+        try:
+            element = page.locator(selector).first
+            if element.is_visible(timeout=700):
+                element.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _click_submit_button(page):
     submit_selectors = [
         "button[type='submit']",
@@ -185,6 +252,12 @@ class QRLoginSession:
                     self._do_check()
                 elif cmd == "password":
                     self._do_enter_password(args)
+                elif cmd == "phone_login":
+                    self._do_start_phone_login()
+                elif cmd == "phone":
+                    self._do_enter_phone(args)
+                elif cmd == "code":
+                    self._do_enter_code(args)
                 elif cmd == "close":
                     self._do_close()
                     break
@@ -218,8 +291,100 @@ class QRLoginSession:
         self.status = "waiting"
         self.result_queue.put(("waiting", self.screenshot_bytes))
 
+    def _do_start_phone_login(self):
+        if self.status not in ("waiting", "awaiting_phone"):
+            self.result_queue.put(("error", "Сессия входа не активна"))
+            return
+        if not _click_phone_login_option(self.page):
+            self.result_queue.put(("error", "Кнопка входа по номеру телефона не найдена"))
+            return
+        self.page.wait_for_timeout(800)
+        if not _get_phone_input(self.page):
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("error", "MAX не показал поле номера телефона"))
+            return
+        self.status = "awaiting_phone"
+        self.screenshot_bytes = self.page.screenshot(full_page=True)
+        self.result_queue.put(("awaiting_phone", self.screenshot_bytes))
+
+    def _do_enter_phone(self, phone: str):
+        if self.status != "awaiting_phone":
+            self.result_queue.put(("error", "Сейчас номер телефона не запрашивается"))
+            return
+        try:
+            digits = re.sub(r"\D", "", str(phone or ""))
+            if not 7 <= len(digits) <= 15:
+                self.result_queue.put(("error", "Проверьте формат номера телефона"))
+                return
+            phone_input = _get_phone_input(self.page)
+            if not phone_input:
+                self.result_queue.put(("error", "Поле номера телефона не найдено"))
+                return
+            phone_input.fill("+" + digits)
+            if not _click_submit_button(self.page):
+                self.page.keyboard.press("Enter")
+            self.page.wait_for_timeout(5000)
+            if _is_logged_in(self.page):
+                self.context.storage_state(path=self.session_file)
+                self._do_close()
+                self.result_queue.put(("success", self.session_file))
+                return
+            if _get_password_input(self.page):
+                self.status = "awaiting_password"
+                self.screenshot_bytes = self.page.screenshot(full_page=True)
+                self.result_queue.put(("awaiting_password", self.screenshot_bytes))
+                return
+            if _get_login_code_input(self.page):
+                self.status = "awaiting_code"
+                self.screenshot_bytes = self.page.screenshot(full_page=True)
+                self.result_queue.put(("awaiting_code", self.screenshot_bytes))
+                return
+            self.status = "waiting"
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("waiting", self.screenshot_bytes))
+        except Exception as e:
+            self.result_queue.put(("error", f"Не удалось отправить номер в MAX: {str(e)[:200]}"))
+
+    def _do_enter_code(self, code: str):
+        if self.status != "awaiting_code":
+            self.result_queue.put(("error", "Сейчас код подтверждения не запрашивается"))
+            return
+        try:
+            digits = re.sub(r"\D", "", str(code or ""))
+            if not 4 <= len(digits) <= 8:
+                self.result_queue.put(("error", "Код должен содержать от 4 до 8 цифр"))
+                return
+            code_input = _get_login_code_input(self.page)
+            if not code_input:
+                self.result_queue.put(("error", "Поле кода подтверждения не найдено"))
+                return
+            code_input.fill(digits)
+            if not _click_submit_button(self.page):
+                self.page.keyboard.press("Enter")
+            self.page.wait_for_timeout(6000)
+            if _is_logged_in(self.page):
+                self.context.storage_state(path=self.session_file)
+                self._do_close()
+                self.result_queue.put(("success", self.session_file))
+                return
+            if _get_password_input(self.page):
+                self.status = "awaiting_password"
+                self.screenshot_bytes = self.page.screenshot(full_page=True)
+                self.result_queue.put(("awaiting_password", self.screenshot_bytes))
+                return
+            if _get_login_code_input(self.page):
+                self.status = "awaiting_code"
+                self.screenshot_bytes = self.page.screenshot(full_page=True)
+                self.result_queue.put(("wrong_code", self.screenshot_bytes))
+                return
+            self.status = "waiting"
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("waiting", self.screenshot_bytes))
+        except Exception as e:
+            self.result_queue.put(("error", f"Не удалось подтвердить код в MAX: {str(e)[:200]}"))
+
     def _do_refresh(self):
-        if self.status not in ("waiting", "awaiting_password"):
+        if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code"):
             self.result_queue.put(("error", "Сессия не активна"))
             return
         self.page.reload()
@@ -234,7 +399,7 @@ class QRLoginSession:
         self.result_queue.put(("waiting", self.screenshot_bytes))
 
     def _do_check(self):
-        if self.status not in ("waiting", "awaiting_password"):
+        if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code"):
             self.result_queue.put(("error", "Сессия не активна"))
             return
         if _is_logged_in(self.page):
@@ -247,6 +412,16 @@ class QRLoginSession:
             self.status = "awaiting_password"
             self.screenshot_bytes = self.page.screenshot(full_page=True)
             self.result_queue.put(("awaiting_password", self.screenshot_bytes))
+            return
+        if _get_login_code_input(self.page):
+            self.status = "awaiting_code"
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("awaiting_code", self.screenshot_bytes))
+            return
+        if _get_phone_input(self.page):
+            self.status = "awaiting_phone"
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("awaiting_phone", self.screenshot_bytes))
             return
         self.result_queue.put(("waiting", None))
 
@@ -326,6 +501,27 @@ class QRLoginSession:
         except queue.Empty:
             return ("error", "Таймаут ввода пароля")
 
+    def start_phone_login(self):
+        self.command_queue.put(("phone_login", None))
+        try:
+            return self.result_queue.get(timeout=15)
+        except queue.Empty:
+            return ("error", "Таймаут переключения на вход по номеру")
+
+    def enter_phone(self, phone: str):
+        self.command_queue.put(("phone", phone))
+        try:
+            return self.result_queue.get(timeout=20)
+        except queue.Empty:
+            return ("error", "Таймаут ввода номера телефона")
+
+    def enter_code(self, code: str):
+        self.command_queue.put(("code", code))
+        try:
+            return self.result_queue.get(timeout=20)
+        except queue.Empty:
+            return ("error", "Таймаут подтверждения кода")
+
     def close(self):
         self.command_queue.put(("close", None))
         try:
@@ -398,8 +594,8 @@ def normalize_for_hash(text: str) -> str:
     text = text.replace("👤", "").strip()
     return " ".join(text.split())
 
-def _get_post_content_signature(post: dict) -> str:
-    """Stable content key that distinguishes separate media messages."""
+def _get_post_text_signature(post: dict) -> str:
+    """Signature for message identity that stays stable when MAX loads its media later."""
     name = normalize_for_hash(post.get("name", ""))
     text = normalize_for_hash(post.get("text", ""))
     msg_time = normalize_for_hash(post.get("time", ""))
@@ -411,15 +607,27 @@ def _get_post_content_signature(post: dict) -> str:
         special_key = json.dumps(special, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     except Exception:
         special_key = str(special)
+    return "|".join([
+        name, text, msg_time, normalize_for_hash(post.get("date", "")),
+        normalize_for_hash(special_key),
+    ])
+
+
+def _has_media_independent_content(post: dict) -> bool:
+    if normalize_for_hash(post.get("text", "")):
+        return True
+    special = post.get("special") if isinstance(post.get("special"), dict) else {}
+    return any(post.get(key) or special.get(key) for key in ("location", "poll", "contact"))
+
+
+def _get_post_content_signature(post: dict) -> str:
+    """Signature that also records media, retained for compatibility with existing caches."""
     media_keys = sorted(
         str(item.get("hash") or item.get("content_hash") or item.get("url") or "")
         for item in (post.get("media_files") or [])
         if isinstance(item, dict) and (item.get("hash") or item.get("content_hash") or item.get("url"))
     )
-    return "|".join([
-        name, text, msg_time, normalize_for_hash(post.get("date", "")),
-        normalize_for_hash(special_key), "|".join(media_keys),
-    ])
+    return _get_post_text_signature(post) + "|" + "|".join(media_keys)
 
 def get_message_hash(post: dict) -> str:
     """Primary duplicate key: message content, never data-index/date-of-today."""
@@ -439,7 +647,9 @@ def get_message_hash(post: dict) -> str:
     return hashlib.md5(content.encode("utf-8")).hexdigest()
 
 def get_text_message_hash(post: dict) -> str:
-    signature = _get_post_content_signature(post)
+    if not _has_media_independent_content(post):
+        return ""
+    signature = _get_post_text_signature(post)
     if not signature:
         return ""
     return hashlib.md5(f"max-text-message:{signature}".encode("utf-8")).hexdigest()
@@ -511,6 +721,20 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
     known_signatures = message_signatures_by_chat.get(chat_id, set())
     if signature and signature in known_signatures:
         return False
+    text_signature = _get_post_text_signature(post)
+    if _has_media_independent_content(post) and text_signature and text_signature in known_signatures:
+        mark_message_seen(post, chat_id=chat_id)
+        return False
+    # Старые версии добавляли к подписи фотографии/видео. Ищем историческую
+    # подпись с той же текстовой частью, чтобы обновившиеся вложения не создавали
+    # новое сообщение. После совпадения записываем новый стабильный ключ.
+    if _has_media_independent_content(post) and text_signature and any(
+        cached_signature.startswith(text_signature + "|")
+        for cached_signature in known_signatures
+        if isinstance(cached_signature, str)
+    ):
+        mark_message_seen(post, chat_id=chat_id)
+        return False
     special = post.get("special") if isinstance(post.get("special"), dict) else {}
     poll = post.get("poll") or special.get("poll") or {}
     msg_hash = get_message_hash(post)
@@ -546,6 +770,9 @@ def mark_message_seen(post: dict, chat_id: int = 0) -> None:
     signature = _get_post_content_signature(post)
     if signature:
         message_signatures_by_chat[chat_id].add(signature)
+    text_signature = _get_post_text_signature(post)
+    if _has_media_independent_content(post) and text_signature:
+        message_signatures_by_chat[chat_id].add(text_signature)
     msg_hash = get_message_hash(post)
     if msg_hash:
         message_cache_by_chat[chat_id].add(msg_hash)
@@ -583,6 +810,7 @@ def clear_chat_cache(chat_id: int):
     message_cache_by_chat.pop(chat_id, None)
     message_signatures_by_chat.pop(chat_id, None)
     photo_cache_by_chat.pop(chat_id, None)
+    recent_post_hashes_by_chat.pop(chat_id, None)
     save_message_cache()
     save_photo_cache()
 

@@ -77,7 +77,6 @@ def init_db():
             )
         """)
 
-
 #! ============ АДМИНЫ ============
 
 def add_admin(user_id: int, username: str = None):

@@ -25,9 +25,14 @@ _current_cycle_hashes = {}
 NO_PREVIEW = {"disable_web_page_preview": True}
 active_logins = {}
 awaiting_password_from = {}
+awaiting_phone_from = {}
+awaiting_code_from = {}
 support_sessions = set(get_open_support_sessions())
 support_message_routes = get_support_message_routes()
 support_state_lock = threading.RLock()
+PARSE_DIAGNOSTICS = {}
+PARSE_DIAGNOSTICS_LOCK = threading.RLock()
+CHAT_LIFECYCLE_LOCK = threading.RLock()
 pending_setup_modes = {}
 customer_setup_state = {}
 SUPPORT_END_TEXT = "✅ Завершить чат с поддержкой"
@@ -500,7 +505,40 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 if caption_in_album:
                     caption_pending=False
             except Exception as album_error:
-                print(f"⚠️ [{chat_id}] Не удалось отправить фотоальбом: {album_error}")
+                debug_logger.warning(
+                    "PHOTO_ALBUM_SEND_FAILED chat_id=%s source_id=%s photos=%s error=%s",
+                    chat_id, post.get("source_id") or post.get("idx") or "?",
+                    len(chunk), log_preview(album_error, 240),
+                )
+                print(f"⚠️ [{chat_id}] Не удалось отправить фотоальбом с подписью: {album_error}")
+                # Если Telegram отклонил именно подпись/разметку, сохраняем фотографии
+                # одним альбомом без подписи, а текст отправляем отдельным сообщением.
+                if caption_in_album:
+                    try:
+                        retry_album = [
+                            types.InputMediaPhoto(_media_to_bytesio(media))
+                            for media in chunk
+                        ]
+                        _telegram_call(bot.send_media_group, chat_id, retry_album)
+                        album_sent_ids.update(id(media) for media in chunk)
+                        if caption_pending:
+                            try:
+                                _telegram_call(bot.send_message, chat_id, msg_text, **NO_PREVIEW)
+                            except Exception as text_error:
+                                debug_logger.warning(
+                                    "PHOTO_ALBUM_CAPTION_FALLBACK_FAILED chat_id=%s source_id=%s error=%s",
+                                    chat_id, post.get("source_id") or post.get("idx") or "?",
+                                    log_preview(text_error, 240),
+                                )
+                            caption_pending = False
+                        continue
+                    except Exception as retry_error:
+                        debug_logger.warning(
+                            "PHOTO_ALBUM_RETRY_FAILED chat_id=%s source_id=%s photos=%s error=%s",
+                            chat_id, post.get("source_id") or post.get("idx") or "?",
+                            len(chunk), log_preview(retry_error, 240),
+                        )
+                        print(f"⚠️ [{chat_id}] Не удалось повторно отправить фотоальбом: {retry_error}")
                 break
         if album_sent_ids:
             send_media=[m for m in send_media if id(m) not in album_sent_ids]
@@ -512,7 +550,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         try:
             if media_type=="image":
                 if caption_pending and len(msg_text)<=1024:
-                    _telegram_call(bot.send_photo,chat_id,obj,caption=msg_text)
+                    _telegram_call(bot.send_photo,chat_id,obj,caption=msg_text,parse_mode="HTML")
                     caption_pending=False
                 else:
                     _telegram_call(bot.send_photo,chat_id,obj)
@@ -634,6 +672,48 @@ def _commit_successful_post(chat_id: int, post: dict) -> None:
     save_message_cache()
     save_photo_cache()
 
+def _diagnostic_post(post, status, detail=""):
+    media_counts = {}
+    for media in post.get("media_files", []) or []:
+        if isinstance(media, dict):
+            media_type = str(media.get("type") or "unknown")
+            media_counts[media_type] = media_counts.get(media_type, 0) + 1
+    media_summary = ", ".join(
+        f"{media_type} ×{count}" for media_type, count in sorted(media_counts.items())
+    ) or "нет"
+    preview = " ".join(str(post.get("text") or "").split()).strip()
+    if not preview:
+        preview = "[без текста]"
+    return {
+        "source_id": str(post.get("source_id") or post.get("idx") or "?")[:80],
+        "status": status,
+        "detail": str(detail or "")[:120],
+        "text": preview[:180],
+        "media": media_summary[:120],
+        "date": str(post.get("date") or "")[:24],
+        "time": str(post.get("time") or "")[:16],
+    }
+
+
+def _store_parse_diagnostic(chat_id, title, sent, skipped, failed, posts, error=None):
+    entry = {
+        "chat_id": int(chat_id),
+        "title": str(title or "")[:100],
+        "updated_at": datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S"),
+        "sent": int(sent),
+        "skipped": int(skipped),
+        "failed": int(failed),
+        "posts": list(posts or [])[-10:],
+        "error": str(error or "")[:240],
+    }
+    with PARSE_DIAGNOSTICS_LOCK:
+        PARSE_DIAGNOSTICS[int(chat_id)] = entry
+
+
+def _record_parse_diagnostic_failure(chat_id, title, error):
+    _store_parse_diagnostic(chat_id, title, 0, 0, 1, [], error=error)
+
+
 def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
     if posts is None:
         raise TypeError(f"Парсер MAX для чата {title} вернул None вместо списка сообщений")
@@ -644,6 +724,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
     new_count = 0
     skipped_count = 0
     failed_count = 0
+    diagnostic_posts = []
     debug_logger.info("CHAT_PROCESS_START chat_id=%s title=%s posts=%s", chat_id, log_preview(title, 100), len(posts))
     cycle_ids = set()
     for post in posts:
@@ -655,6 +736,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
 
         if cycle_key in cycle_ids:
             skipped_count += 1
+            diagnostic_posts.append(_diagnostic_post(post, "skipped", "дубль в текущей выборке"))
             debug_logger.info("MESSAGE_SKIPPED chat_id=%s source_id=%s reason=duplicate_in_cycle", chat_id, source_id or "?")
             continue
         cycle_ids.add(cycle_key)
@@ -666,6 +748,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
                 if poll_state.get("final_sent"):
                     _refresh_poll_snapshot(chat_id, post, poll_state, closed=True)
                     skipped_count += 1
+                    diagnostic_posts.append(_diagnostic_post(post, "skipped", "итог опроса уже отправлен"))
                     debug_logger.info(
                         "MESSAGE_SKIPPED chat_id=%s source_id=%s reason=poll_final_already_sent",
                         chat_id, source_id or "?",
@@ -680,6 +763,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
             elif _poll_has_delivery(poll_state):
                 _refresh_poll_snapshot(chat_id, post, poll_state, closed=False)
                 skipped_count += 1
+                diagnostic_posts.append(_diagnostic_post(post, "skipped", "опрос уже отправлен"))
                 debug_logger.info(
                     "MESSAGE_SKIPPED chat_id=%s source_id=%s reason=poll_initial_already_sent",
                     chat_id, source_id or "?",
@@ -688,6 +772,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
 
         if not force_poll_send and not is_new_message(post, chat_id=chat_id):
             skipped_count += 1
+            diagnostic_posts.append(_diagnostic_post(post, "skipped", "уже есть в кэше отправленных"))
             debug_logger.info("MESSAGE_SKIPPED chat_id=%s source_id=%s reason=seen_cache", chat_id, source_id or "?")
             continue
 
@@ -695,6 +780,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
             sent = _send_post(chat_id, post)
             if not sent:
                 skipped_count += 1
+                diagnostic_posts.append(_diagnostic_post(post, "skipped", "нет поддерживаемого содержимого"))
                 debug_logger.warning(
                     "MESSAGE_NOT_SENT chat_id=%s source_id=%s reason=no_payload text=%s",
                     chat_id, source_id or "?", log_preview(post.get("text")) or "<empty>"
@@ -703,9 +789,11 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
             _commit_successful_post(chat_id, post)
             increment_message_count(chat_id)
             new_count += 1
+            diagnostic_posts.append(_diagnostic_post(post, "sent"))
             time.sleep(1.5)
         except Exception as error:
             failed_count += 1
+            diagnostic_posts.append(_diagnostic_post(post, "failed", str(error)))
             debug_logger.exception(
                 "MESSAGE_PROCESS_FAILED chat_id=%s source_id=%s title=%s error=%s",
                 chat_id, source_id or "?", log_preview(title, 100), log_preview(error, 300)
@@ -718,13 +806,30 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
         "CHAT_PROCESS_COMPLETE chat_id=%s title=%s sent=%s skipped=%s failed=%s",
         chat_id, log_preview(title, 100), new_count, skipped_count, failed_count
     )
+    _store_parse_diagnostic(
+        chat_id, title, new_count, skipped_count, failed_count, diagnostic_posts
+    )
     return new_count, skipped_count
+
+
+def _process_chat_posts_if_present(chat_id, title, posts):
+    with CHAT_LIFECYCLE_LOCK:
+        if not get_chat_by_id(chat_id):
+            return None
+        return _process_posts(chat_id, title, posts)
+
+
+def _record_parse_failure_if_present(chat_id, title, error):
+    with CHAT_LIFECYCLE_LOCK:
+        if get_chat_by_id(chat_id):
+            _record_parse_diagnostic_failure(chat_id, title, error)
 
 
 def _session_path_for_chat(chat):
     if chat.get("account_mode") == "project":
         return os.path.join("sessions", "project_account.json")
     return os.path.join("sessions", f"{chat['chat_id']}.json")
+
 
 def run_one_parse_cycle():
     active_chats = get_active_chats()
@@ -741,11 +846,10 @@ def run_one_parse_cycle():
                 chat_id=chat_id,
                 session_path=_session_path_for_chat(chat),
             )
-            new_count, skipped_count = _process_posts(
-                chat_id,
-                title,
-                posts,
-            )
+            processed = _process_chat_posts_if_present(chat_id, title, posts)
+            if processed is None:
+                continue
+            new_count, skipped_count = processed
             if new_count:
                 results.append(
                     f"✅ <b>{title}</b>: +{new_count} новых, ⏭ {skipped_count} пропущено"
@@ -755,6 +859,7 @@ def run_one_parse_cycle():
                     f"ℹ️ <b>{title}</b>: новых сообщений нет (⏭ {skipped_count} пропущено)"
                 )
         except Exception as error:
+            _record_parse_failure_if_present(chat_id, title, error)
             error_str = str(error)
             login_command = "/project_login" if chat.get("account_mode") == "project" else f"/login {chat_id}"
             if "SESSION_EXPIRED" in error_str:
@@ -813,9 +918,10 @@ def process_single_chat(chat):
             chat_id=chat_id,
             session_path=_session_path_for_chat(chat),
         )
-        _process_posts(chat_id, title, posts)
+        _process_chat_posts_if_present(chat_id, title, posts)
         return True
     except Exception as error:
+        _record_parse_failure_if_present(chat_id, title, error)
         print(f"❌ Ошибка парсинга чата {title}: {error}")
         traceback.print_exc()
         return False
@@ -842,6 +948,7 @@ def background_parser():
         except Exception as error:
             print(f"❌ Критическая ошибка парсера: {error}")
             time.sleep(60)
+
 
 load_message_cache()
 
@@ -1084,6 +1191,7 @@ def track_user(message_or_callback):
 def _build_qr_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("✅ Готово, я отсканировал", callback_data=f"qr_ready_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("📱 Войти по номеру телефона", callback_data=f"qr_phone_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🔄 Обновить QR", callback_data=f"qr_refresh_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
@@ -1098,7 +1206,46 @@ def _build_password_keyboard(target_chat_id):
     kb.add(types.InlineKeyboardButton("❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
 
+def _clear_auth_waiters(target_chat_id):
+    awaiting_password_from.pop(target_chat_id, None)
+    awaiting_phone_from.pop(target_chat_id, None)
+    awaiting_code_from.pop(target_chat_id, None)
+
+
+def _set_auth_waiter(waiting_map, target_chat_id, user_id):
+    _clear_auth_waiters(target_chat_id)
+    waiting_map[target_chat_id] = int(user_id)
+
+
+def _complete_login(target_chat_id, output_chat_id):
+    active_logins.pop(target_chat_id, None)
+    _clear_auth_waiters(target_chat_id)
+    chat = get_chat_by_id(target_chat_id) if target_chat_id != "project_account" else None
+    if target_chat_id == "project_account":
+        for customer_chat in get_all_chats():
+            if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
+                toggle_chat(customer_chat["chat_id"], True)
+        title = "аккаунта проекта"
+    else:
+        title = chat["title"] if chat else "MAX"
+        if chat and chat.get("max_url"):
+            toggle_chat(target_chat_id, True)
+    bot.send_message(
+        output_chat_id,
+        f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> сохранена.",
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+
+
 def do_qr_login(target_chat_id, admin_chat_id):
+    if int(admin_chat_id) < 0:
+        bot.send_message(
+            admin_chat_id,
+            "Для безопасности MAX авторизацию можно начать только в личном чате с ботом.",
+            **NO_PREVIEW,
+        )
+        return
     is_project_account = target_chat_id == "project_account"
     chat = None if is_project_account else get_chat_by_id(target_chat_id)
     if not is_project_account and not chat:
@@ -1111,7 +1258,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
             session.close()
         except:
             pass
-    awaiting_password_from.pop(target_chat_id, None)
+    _clear_auth_waiters(target_chat_id)
     bot.send_message(
         admin_chat_id,
         f"⏳ Открываю web.max.ru для <b>{escape_html(title)}</b>...\nЭто займет несколько секунд.",
@@ -1173,6 +1320,7 @@ def show_admin_menu(chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("📋 Список чатов", callback_data="admin_chats"))
     kb.add(types.InlineKeyboardButton("📊 Статус парсинга", callback_data="admin_parse_status"))
+    kb.add(types.InlineKeyboardButton("🧪 Последний разбор сообщений", callback_data="admin_parse_diagnostics"))
     kb.row(
         types.InlineKeyboardButton("👑 Админы", callback_data="admin_admins"),
         types.InlineKeyboardButton("👤 Пользователи", callback_data="admin_users")
@@ -1201,12 +1349,16 @@ def show_chats_list(chat_id, message_id=None):
                 status = "🔴"
                 status_text = "Остановлен"
             url_mark = "✅" if c.get('max_url') else ""
-            phone_mark = "✅" if c.get('phone') else "—"
             session_mark = "✅" if os.path.exists(_session_path_for_chat(c)) else "❌"
+            if c.get("account_mode") == "project":
+                connection_status = f"🔗URL: {url_mark} │ 🔑Сессия: {session_mark}\n"
+            else:
+                phone_mark = "✅" if c.get('phone') else "—"
+                connection_status = f"🔗URL: {url_mark} │ 📱Телефон: {phone_mark} │ 🔑Сессия: {session_mark}\n"
             stats = get_chat_stats(c['chat_id'])
             text += f"\n\n{status} <b>{c['title']}</b>"
             text += f"<blockquote>🆔 <code>{c['chat_id']}</code> │ {status_text}\n"
-            text += f"🔗URL: {url_mark} │ 📱Телефон: {phone_mark} │ 🔑Сессия: {session_mark}\n"
+            text += connection_status
             text += f"💬 Сегодня: {stats['today']} │ Всего: {stats['total']}</blockquote>"
     kb = types.InlineKeyboardMarkup(row_width=1)
     for c in chats:
@@ -1243,11 +1395,15 @@ def show_chat_details(chat_id, message_id, target_chat_id):
     session_file = _session_path_for_chat(chat)
     session_status = "✅ Активна" if os.path.exists(session_file) else "❌ Отсутствует"
     account_mode_text = "Аккаунт проекта" if chat.get("account_mode") == "project" else "Аккаунт пользователя"
+    phone_line = (
+        f"📱 <b>Телефон:</b> {chat['phone'] or '❌ не задан'}\n"
+        if chat.get("account_mode") != "project" else ""
+    )
     text = (
         f"📋 <b>{chat['title']}</b>\n\n"
         f"🆔 <b>ID:</b> <code>{chat['chat_id']}</code>\n"
         f"🔗 <b>URL:</b> {chat['max_url'] or ' не задан'}\n"
-        f"📱 <b>Телефон:</b> {chat['phone'] or '❌ не задан'}\n"
+        f"{phone_line}"
         f"👤 <b>MAX-аккаунт:</b> {account_mode_text}\n"
         f"🧑‍💻 <b>Владелец Telegram:</b> <code>{chat.get('owner_id') or 'не назначен'}</code>\n"
         f"🔑 <b>Сессия:</b> {session_status}\n"
@@ -1264,7 +1420,8 @@ def show_chat_details(chat_id, message_id, target_chat_id):
         else:
             kb.add(types.InlineKeyboardButton("▶️ Запустить парсинг", callback_data=f"admin_toggle_chat_{target_chat_id}", style="success"))
     kb.add(types.InlineKeyboardButton("🔗 Задать URL группы MAX", callback_data=f"admin_set_url_{target_chat_id}"))
-    kb.add(types.InlineKeyboardButton("📱 Задать номер телефона", callback_data=f"admin_set_phone_{target_chat_id}"))
+    if chat.get("account_mode") != "project":
+        kb.add(types.InlineKeyboardButton("📱 Задать номер телефона", callback_data=f"admin_set_phone_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🔑 Авторизоваться (QR)", callback_data=f"admin_qr_login_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🗑 Очистить кэш чата", callback_data=f"admin_clear_chat_cache_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("❌ Удалить чат", callback_data=f"admin_ask_delete_{target_chat_id}", style="danger"))
@@ -1290,85 +1447,262 @@ def show_chat_statistics(chat_id, message_id, target_chat_id):
     kb.add(types.InlineKeyboardButton("🔙 Назад к настройкам чата", callback_data=f"admin_chat_{target_chat_id}"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
-def show_admins_list(chat_id, message_id):
-    admins = get_all_admins()
-    INNER_W = 36
-    c_num = 3
-    c_id = 8
-    c_uname = INNER_W - c_num - c_id - 10
-    line_top = "╔" + "═" * INNER_W + "╗"
-    line_mid = "" + "═" * INNER_W + ""
-    line_bot = "╚" + "═" * INNER_W + "╝"
-    title = "👑 АДМИНЫ"
-    title_line = f"║{center_in_width(title, INNER_W)}║"
-    header = (
-        f"║ {pad_right('№', c_num)} │ {pad_right('User ID', c_id)} │ "
-        f"{pad_right('Username', c_uname)} ║"
-    )
-    lines = [line_top, title_line, line_mid, header, line_mid]
-    for i, a in enumerate(admins, 1):
-        uid = str(a['user_id'])
-        uname = a.get('username') or '—'
-        uname_display = f"@{uname}" if uname != '—' else '—'
-        while visual_len(uname_display) > c_uname:
-            uname_display = uname_display[:-1]
-        row = (
-            f"║ {pad_right(str(i), c_num)} │ {pad_right(uid, c_id)} │ "
-            f"{pad_right(uname_display, c_uname)} ║"
-        )
-        lines.append(row)
-    lines.append(line_bot)
-    table = "\n".join(lines)
-    text = f"<pre>{table}</pre>"
+ADMIN_LIST_PAGE_SIZE = 10
+
+
+def _page_buttons(keyboard, page, page_count, prefix):
+    if page_count <= 1:
+        return
+    row = []
+    if page > 0:
+        row.append(types.InlineKeyboardButton("◀️ Назад", callback_data=f"{prefix}_{page - 1}"))
+    if page + 1 < page_count:
+        row.append(types.InlineKeyboardButton("Вперёд ▶️", callback_data=f"{prefix}_{page + 1}"))
+    if row:
+        keyboard.row(*row)
+
+
+def _short_button_label(value, limit=25):
+    value = str(value or "").strip()
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def show_parse_diagnostics(chat_id, message_id, target_chat_id=None):
+    chats = get_all_chats()
+    with PARSE_DIAGNOSTICS_LOCK:
+        diagnostics = {key: dict(value) for key, value in PARSE_DIAGNOSTICS.items()}
+
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for a in admins:
-        uname = f"@{a['username']}" if a.get('username') else f"ID {a['user_id']}"
-        if a['user_id'] != 5213315899 and a['user_id'] != ADMIN_ID:
+    if target_chat_id is None:
+        text = "🧪 <b>Последние результаты парсинга</b>\n\n"
+        if not chats:
+            text += "Сначала добавьте чат для парсинга."
+        else:
+            text += "Выберите чат, чтобы увидеть последние сообщения и их статус."
+            for chat in chats[:12]:
+                chat_id_value = int(chat["chat_id"])
+                entry = diagnostics.get(chat_id_value)
+                title = escape_html(chat.get("title") or str(chat_id_value))
+                if entry:
+                    text += (
+                        f"\n\n<b>{title}</b> · {escape_html(entry.get('updated_at') or '')}"
+                        f"\n✅ {entry.get('sent', 0)} отправлено · "
+                        f"⏭ {entry.get('skipped', 0)} пропущено · "
+                        f"⚠️ {entry.get('failed', 0)} ошибок"
+                    )
+                    button_label = _short_button_label(
+                        f"🧾 {chat.get('title') or chat_id_value}", 32
+                    )
+                else:
+                    text += f"\n\n<b>{title}</b> · данных пока нет"
+                    button_label = _short_button_label(
+                        f"🔎 {chat.get('title') or chat_id_value}", 32
+                    )
+                kb.add(types.InlineKeyboardButton(
+                    button_label,
+                    callback_data=f"admin_parse_diag_{chat_id_value}"
+                ))
+        if chats:
+            text += "\n\n<i>Данные хранятся в памяти до перезапуска бота.</i>"
+        kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
+        safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+        return
+
+    target_chat_id = int(target_chat_id)
+    entry = diagnostics.get(target_chat_id)
+    chat = get_chat_by_id(target_chat_id)
+    title = (entry or {}).get("title") or (chat or {}).get("title") or str(target_chat_id)
+    text = f"🧪 <b>Проверка: {escape_html(title)}</b>\n🆔 <code>{target_chat_id}</code>"
+    if not entry:
+        text += "\n\nРезультатов пока нет. Они появятся после следующего цикла парсинга."
+    else:
+        text += (
+            f"\n🕒 {escape_html(entry.get('updated_at') or '')}"
+            f"\n✅ Отправлено: {entry.get('sent', 0)}"
+            f" · ⏭ Пропущено: {entry.get('skipped', 0)}"
+            f" · ⚠️ Ошибок: {entry.get('failed', 0)}"
+        )
+        if entry.get("error"):
+            text += f"\n\n⚠️ <b>Ошибка разбора:</b> {escape_html(entry['error'])}"
+        for item in entry.get("posts", []):
+            status_label = {
+                "sent": "✅ отправлено",
+                "skipped": "⏭ пропущено",
+                "failed": "⚠️ ошибка",
+            }.get(item.get("status"), "ℹ️ обработано")
+            preview = escape_html(item.get("text") or "[без текста]")
+            detail = escape_html(item.get("detail") or "")
+            text += (
+                f"\n\n<b>{status_label}</b> · ID <code>{escape_html(item.get('source_id') or '?')}</code>"
+                f"\n{preview}"
+                f"\n📎 {escape_html(item.get('media') or 'нет')}"
+            )
+            if item.get("date") or item.get("time"):
+                text += f" · {escape_html(' '.join(x for x in (item.get('date'), item.get('time')) if x))}"
+            if detail:
+                text += f"\n<i>{detail}</i>"
+    kb.add(types.InlineKeyboardButton("🔙 К списку результатов", callback_data="admin_parse_diagnostics"))
+    kb.add(types.InlineKeyboardButton("🔙 В меню", callback_data="admin_back"))
+    safe_edit_message(text[:3900], chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+
+
+def show_admins_list(chat_id, message_id, page=0):
+    admins = get_all_admins()
+    page_count = max(1, (len(admins) + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    first = page * ADMIN_LIST_PAGE_SIZE
+    shown = admins[first:first + ADMIN_LIST_PAGE_SIZE]
+    text = f"👑 <b>Администраторы</b> · {len(admins)} всего"
+    if admins:
+        text += f" · {first + 1}–{first + len(shown)} из {len(admins)}"
+        for index, admin in enumerate(shown, first + 1):
+            username = f"@{escape_html(admin['username'])}" if admin.get("username") else "без username"
+            text += (
+                f"\n\n<b>{index}. {username}</b>"
+                f"\n🆔 ID: <code>{admin['user_id']}</code>"
+            )
+    else:
+        text += "\n\nСписок пока пуст."
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for admin in shown:
+        kb.add(types.InlineKeyboardButton(
+            f"📋 Копировать ID {admin['user_id']}",
+            copy_text=types.CopyTextButton(text=str(admin["user_id"])),
+        ))
+        if admin["user_id"] not in (5213315899, ADMIN_ID):
+            label = _short_button_label(f"🗑 Удалить @{admin.get('username') or admin['user_id']}", 32)
             kb.add(types.InlineKeyboardButton(
-                f" Удалить {uname}",
-                callback_data=f"admin_ask_delete_admin_{a['user_id']}"
+                label,
+                callback_data=f"admin_ask_delete_admin_{admin['user_id']}"
             ))
+    _page_buttons(kb, page, page_count, "admin_admins_page")
     kb.add(types.InlineKeyboardButton("➕ Добавить админа", callback_data="admin_add_admin"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
-def show_users_list(chat_id, message_id):
+
+def show_users_list(chat_id, message_id, page=0):
     users = get_all_users()
-    INNER_W = 36
-    c_num = 3
-    c_id = 8
-    c_uname = INNER_W - c_num - c_id - 10
-    c_uname_2 = INNER_W - c_num - c_id - 2
-    line_top = "╔" + "═" * INNER_W + "╗"
-    line_mid = "╠" + "═" * INNER_W + "╣"
-    line_bot = "╚" + "═" * INNER_W + "╝"
-    title = "👤 ПОЛЬЗОВАТЕЛИ"
-    title_line = f"║{center_in_width(title, INNER_W)}║"
-    header = (
-        f"║ {pad_right('№', c_num)} │ {pad_right('User ID', c_id)} │ "
-        f"{pad_right('Username', c_uname_2)} ║"
-    )
-    lines = [line_top, title_line, line_mid, header, line_mid]
-    for i, u in enumerate(users, 1):
-        uid = str(u['user_id'])
-        uname = u.get('username') or '—'
-        uname_display = f"@{uname}" if uname != '—' else '—'
-        while visual_len(uname_display) > c_uname:
-            uname_display = uname_display[:-1]
-        row = (
-            f"║ {pad_right(str(i), c_num)} │ {pad_right(uid, c_id)} │ "
-            f"{pad_right(uname_display, c_uname)} ║"
-        )
-        lines.append(row)
-    lines.append(line_bot)
-    table = "\n".join(lines)
-    text = (
-        f"<pre>{table}</pre>\n\n"
-        f"<blockquote>Всего: {len(users)}</blockquote>"
-    )
+    page_count = max(1, (len(users) + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    first = page * ADMIN_LIST_PAGE_SIZE
+    shown = users[first:first + ADMIN_LIST_PAGE_SIZE]
+    text = f"👤 <b>Пользователи</b> · {len(users)} всего"
+    if users:
+        text += f" · {first + 1}–{first + len(shown)} из {len(users)}"
+        for index, user in enumerate(shown, first + 1):
+            name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
+            name = escape_html(name or "Имя не указано")
+            username = f"@{escape_html(user['username'])}" if user.get("username") else "username не указан"
+            text += (
+                f"\n\n<b>{index}. {name}</b>"
+                f"\n{username}"
+                f"\n🆔 ID: <code>{user['user_id']}</code>"
+            )
+    else:
+        text += "\n\nПользователей пока нет."
     kb = types.InlineKeyboardMarkup(row_width=1)
+    for user in shown:
+        kb.row(
+            types.InlineKeyboardButton(
+                "✉️ Написать",
+                callback_data=f"admin_user_send_{user['user_id']}"
+            ),
+            types.InlineKeyboardButton(
+                "📋 ID",
+                copy_text=types.CopyTextButton(text=str(user["user_id"])),
+            ),
+        )
+    _page_buttons(kb, page, page_count, "admin_users_page")
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+
+
+def show_user_send_selector(chat_id, message_id, page=0):
+    users = get_all_users()
+    page_count = max(1, (len(users) + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    first = page * ADMIN_LIST_PAGE_SIZE
+    shown = users[first:first + ADMIN_LIST_PAGE_SIZE]
+    text = f"👤 <b>Выберите пользователя</b> · {len(users)} всего"
+    if users:
+        for user in shown:
+            name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
+            name = escape_html(name or "Имя не указано")
+            username = f"@{escape_html(user['username'])}" if user.get("username") else "username не указан"
+            text += f"\n\n<b>{name}</b> · {username}\n🆔 ID: <code>{user['user_id']}</code>"
+    else:
+        text += "\n\nСписок пользователей пока пуст."
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for user in shown:
+        kb.row(
+            types.InlineKeyboardButton(
+                "👤 Выбрать",
+                callback_data=f"admin_send_user_pick_{user['user_id']}"
+            ),
+            types.InlineKeyboardButton(
+                "📋 ID",
+                copy_text=types.CopyTextButton(text=str(user["user_id"])),
+            ),
+        )
+    _page_buttons(kb, page, page_count, "admin_send_users_page")
+    kb.add(types.InlineKeyboardButton("✍️ Ввести ID вручную", callback_data="admin_send_user_manual"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
+    safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+
+
+def show_chat_send_selector(chat_id, message_id, page=0):
+    chats = get_all_chats()
+    page_count = max(1, (len(chats) + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    first = page * ADMIN_LIST_PAGE_SIZE
+    shown = chats[first:first + ADMIN_LIST_PAGE_SIZE]
+    text = f"💬 <b>Выберите чат</b> · {len(chats)} всего"
+    if chats:
+        for chat in shown:
+            title = escape_html(chat.get("title") or "Без названия")
+            text += f"\n\n<b>{title}</b>\n🆔 ID: <code>{chat['chat_id']}</code>"
+    else:
+        text += "\n\nЧатов пока нет."
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for chat in shown:
+        kb.row(
+            types.InlineKeyboardButton(
+                "💬 Выбрать",
+                callback_data=f"admin_send_chat_pick_{chat['chat_id']}"
+            ),
+            types.InlineKeyboardButton(
+                "📋 ID",
+                copy_text=types.CopyTextButton(text=str(chat["chat_id"])),
+            ),
+        )
+    _page_buttons(kb, page, page_count, "admin_send_chats_page")
+    kb.add(types.InlineKeyboardButton("✍️ Ввести ID вручную", callback_data="admin_send_chat_manual"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
+    safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+
+
+def _prompt_send_to_user(chat_id, user_id):
+    prompt = bot.send_message(
+        chat_id,
+        f"Теперь отправьте сообщение пользователю <code>{user_id}</code>.",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+        **NO_PREVIEW,
+    )
+    bot.register_next_step_handler(prompt, process_send_to_user_content, int(user_id))
+
+
+def _prompt_send_to_chat(chat_id, target_chat_id):
+    prompt = bot.send_message(
+        chat_id,
+        f"Теперь отправьте сообщение в чат <code>{target_chat_id}</code>.",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+        **NO_PREVIEW,
+    )
+    bot.register_next_step_handler(prompt, process_send_to_chat_content, int(target_chat_id))
+
 
 def process_add_chat_step1(message, admin_chat_id):
     track_user(message)
@@ -1501,26 +1835,46 @@ def process_set_phone(message, target_chat_id, admin_chat_id):
 
 def send_content_to_user(user_id, message):
     try:
+        header = "📨 <b>Сообщение от админа</b>\n\n"
         caption = message.caption or ""
 
+        def send_captioned(send_method, file_id):
+            formatted_caption = header + escape_html(caption)
+            if len(formatted_caption) <= 1024:
+                send_method(
+                    user_id, file_id, caption=formatted_caption, parse_mode="HTML"
+                )
+            else:
+                bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
+                send_method(user_id, file_id, caption=caption)
+
         if message.video:
-            bot.send_video(user_id, message.video.file_id, caption=caption)
+            send_captioned(bot.send_video, message.video.file_id)
         elif message.photo:
-            bot.send_photo(user_id, message.photo[-1].file_id, caption=caption)
+            send_captioned(bot.send_photo, message.photo[-1].file_id)
         elif message.document:
-            bot.send_document(user_id, message.document.file_id, caption=caption)
+            send_captioned(bot.send_document, message.document.file_id)
         elif message.audio:
-            bot.send_audio(user_id, message.audio.file_id, caption=caption)
+            send_captioned(bot.send_audio, message.audio.file_id)
         elif message.voice:
-            bot.send_voice(user_id, message.voice.file_id, caption=caption)
+            send_captioned(bot.send_voice, message.voice.file_id)
         elif message.animation:
-            bot.send_animation(user_id, message.animation.file_id, caption=caption)
+            send_captioned(bot.send_animation, message.animation.file_id)
         elif message.sticker:
+            bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
             bot.send_sticker(user_id, message.sticker.file_id)
         elif message.video_note:
+            bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
             bot.send_video_note(user_id, message.video_note.file_id)
         elif message.text:
-            bot.send_message(user_id, message.text)
+            formatted_text = header + escape_html(message.text)
+            if len(formatted_text) <= 4096:
+                bot.send_message(
+                    user_id, formatted_text, parse_mode="HTML", **NO_PREVIEW
+                )
+            else:
+                bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
+                bot.send_message(user_id, message.text, **NO_PREVIEW)
         else:
             return False, "Тип сообщения не поддерживается"
 
@@ -1559,7 +1913,7 @@ def process_broadcast_message(message):
     bot.send_message(message.chat.id, report)
 
 def process_send_to_one(message, target_user_id):
-    ok, error = copy_message_to_chat(target_user_id, message)
+    ok, error = send_content_to_user(target_user_id, message)
 
     if ok:
         bot.send_message(
@@ -1574,7 +1928,7 @@ def process_send_to_one(message, target_user_id):
         )
 
 def process_send_to_chat(message, target_chat_id):
-    ok, error = copy_message_to_chat(target_chat_id, message)
+    ok, error = send_content_to_user(target_chat_id, message)
 
     if ok:
         bot.send_message(
@@ -1788,7 +2142,6 @@ def start_support(chat_id, user):
             bot.send_message(
                 chat_id,
                 "Чат с поддержкой уже открыт. Напишите сообщение или нажмите кнопку завершения.",
-                reply_markup=_support_keyboard(),
                 **NO_PREVIEW,
             )
             return
@@ -1798,9 +2151,7 @@ def start_support(chat_id, user):
         bot.send_message(
             chat_id,
             "💬 <b>Чат с тех поддержкой открыт</b>\n\n"
-            "Напишите, с чем нужна помощь. Ваши сообщения и никнейм увидит поддержка. "
-            "Ответы придут сюда от имени бота, личный аккаунт специалиста вам не показывается.\n\n"
-            "Если вы проходите вход в MAX, сообщение с паролем двухэтапной проверки обрабатывается отдельно и поддержке не пересылается.\n\n"
+            "Напишите, с чем нужна помощь. "
             "Когда вопрос решён, нажмите кнопку ниже.",
             parse_mode="HTML",
             reply_markup=_support_keyboard(),
@@ -1907,7 +2258,7 @@ def start_bot(message):
     bot.send_message(message.chat.id, text, **NO_PREVIEW, reply_markup=start_keyboard())
 
 
-@bot.message_handler(commands=['help1'])
+@bot.message_handler(commands=['help', 'help1'])
 def help_command(message):
     start_support(message.chat.id, message.from_user)
 
@@ -1926,29 +2277,90 @@ def connect_command(message):
     )
 
 
-@bot.message_handler(commands=['mychats1'])
+@bot.message_handler(commands=['mychats', 'mychats1'])
 def my_chats_command(message):
     track_user(message)
     if message.chat.type != "private":
         bot.reply_to(message, "Список подключений показывается только в личном чате. Отправьте мне /mychats напрямую.")
         return
-    chats = get_user_chats(message.from_user.id)
+    _show_my_chats(message.chat.id, message.from_user.id)
+
+
+def _show_my_chats(chat_id, owner_id, message_id=None):
+    chats = get_user_chats(owner_id)
     if not chats:
-        bot.send_message(
-            message.chat.id,
-            "У вас пока нет подключённых Telegram-групп. Начните настройку командой /connect.",
-            **NO_PREVIEW,
-        )
+        text = "У вас пока нет подключённых Telegram-групп. Начните настройку командой /connect."
+        if message_id:
+            safe_edit_message(
+                text, chat_id, message_id,
+                reply_markup=types.InlineKeyboardMarkup(), **NO_PREVIEW
+            )
+        else:
+            bot.send_message(chat_id, text, **NO_PREVIEW)
         return
     lines = ["📬 <b>Ваши группы MAX_Parser</b>"]
-    for chat in chats:
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for index, chat in enumerate(chats, 1):
         state = "🟢 Парсинг включён" if chat.get("is_active") else "🟡 Ожидает настройки"
         mode = "ваш MAX-аккаунт" if chat.get("account_mode") != "project" else "аккаунт проекта"
         lines.append(
-            f"\n<b>{escape_html(chat.get('title') or 'Группа')}</b>\n"
+            f"\n<b>{index}. {escape_html(chat.get('title') or 'Группа')}</b>\n"
             f"{state} · {mode}"
         )
-    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML", **NO_PREVIEW)
+        keyboard.add(types.InlineKeyboardButton(
+            f"🗑 Удалить №{index}",
+            callback_data=f"mychat_delete_{chat['chat_id']}"
+        ))
+    if message_id:
+        safe_edit_message("\n".join(lines), chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+    else:
+        bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def _delete_chat_everywhere(chat_id):
+    chat_id = int(chat_id)
+    with CHAT_LIFECYCLE_LOCK:
+        chat = get_chat_by_id(chat_id)
+        if not chat:
+            return False
+        delete_chat(chat_id)
+        clear_chat_cache(chat_id)
+        with PARSE_DIAGNOSTICS_LOCK:
+            PARSE_DIAGNOSTICS.pop(chat_id, None)
+        with _poll_message_cache_lock:
+            prefix = f"{chat_id}:"
+            for key in [key for key in _poll_message_cache if key.startswith(prefix)]:
+                _poll_message_cache.pop(key, None)
+            _save_poll_message_cache_locked()
+        paths = []
+        if chat.get("account_mode") != "project":
+            paths.append(_session_path_for_chat(chat))
+        paths.extend((
+            os.path.join("sessions", f"parse_debug_{chat_id}.png"),
+            os.path.join("sessions", f"wrong_chat_debug_{chat_id}.png"),
+        ))
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                debug_logger.warning("CHAT_DELETE_FILE_FAILED chat_id=%s path=%s error=%s", chat_id, path, log_preview(error))
+    try:
+        bot.leave_chat(chat_id)
+    except Exception as error:
+        debug_logger.warning(
+            "CHAT_DELETE_LEAVE_FAILED chat_id=%s error=%s",
+            chat_id, log_preview(error),
+        )
+    return True
+
+
+def _chat_delete_allowed(user_id, chat):
+    try:
+        return is_admin(user_id) or int(chat.get("owner_id") or 0) == int(user_id)
+    except (TypeError, ValueError):
+        return False
 
 
 def _begin_customer_group_setup(chat_id, owner_id, account_mode):
@@ -2120,7 +2532,11 @@ def support_admin_reply(message):
 @bot.message_handler(
     func=lambda m: m.chat.type == "private"
     and m.from_user.id in support_sessions
-    and m.from_user.id not in set(awaiting_password_from.values()),
+    and m.from_user.id not in (
+        set(awaiting_password_from.values())
+        | set(awaiting_phone_from.values())
+        | set(awaiting_code_from.values())
+    ),
     content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
 )
 def support_user_message(message):
@@ -2170,6 +2586,131 @@ def admin_panel(message):
         return
     show_admin_menu(message.chat.id)
 
+def _waiting_login_target(waiting_map, user_id):
+    for target_id, owner_id in list(waiting_map.items()):
+        if owner_id == user_id:
+            return target_id
+    return None
+
+
+def _delete_auth_input(message):
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+
+
+def _ask_for_auth_password(target_chat_id, user_id):
+    _set_auth_waiter(awaiting_password_from, target_chat_id, user_id)
+    bot.send_message(
+        user_id,
+        "🔐 MAX просит дополнительный пароль. Отправьте его следующим сообщением.\n"
+        "После обработки сообщение с паролем удаляется из чата с ботом.",
+        reply_markup=_build_password_keyboard(target_chat_id),
+        **NO_PREVIEW,
+    )
+
+
+def _handle_auth_result(target_chat_id, user_id, status, data, stage):
+    if status == "success":
+        _complete_login(target_chat_id, user_id)
+    elif status == "awaiting_code":
+        _set_auth_waiter(awaiting_code_from, target_chat_id, user_id)
+        bot.send_message(
+            user_id,
+            "📩 MAX отправил код подтверждения. Введите код сюда. "
+            "Не пересылайте его другим людям; после обработки сообщение будет удалено.",
+            reply_markup=_build_password_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+    elif status == "wrong_code":
+        _set_auth_waiter(awaiting_code_from, target_chat_id, user_id)
+        bot.send_message(
+            user_id,
+            "❌ Код не подошёл. Отправьте актуальный код MAX ещё раз.",
+            reply_markup=_build_password_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+    elif status == "awaiting_password":
+        _ask_for_auth_password(target_chat_id, user_id)
+    elif status == "waiting":
+        bot.send_message(
+            user_id,
+            "⚠️ MAX пока не подтвердил вход. Проверьте экран авторизации и нажмите "
+            "«✅ Готово, я отсканировал» или снова выберите вход по телефону.",
+            reply_markup=_build_qr_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+    else:
+        bot.send_message(
+            user_id,
+            f"❌ Не удалось продолжить вход ({stage}): <code>{escape_html(data or 'ошибка MAX')}</code>",
+            parse_mode="HTML",
+            reply_markup=_build_qr_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.text is not None
+    and m.from_user.id in set(awaiting_phone_from.values())
+)
+def handle_phone_input(message):
+    target_chat_id = _waiting_login_target(awaiting_phone_from, message.from_user.id)
+    if target_chat_id is None:
+        return
+    phone_digits = re.sub(r"\D", "", message.text or "")
+    _delete_auth_input(message)
+    if not 7 <= len(phone_digits) <= 15:
+        bot.send_message(
+            message.chat.id,
+            "❌ Номер должен содержать от 7 до 15 цифр. Отправьте его ещё раз, например +79991234567.",
+            reply_markup=_build_password_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+        return
+    session = active_logins.get(target_chat_id)
+    if not session:
+        _clear_auth_waiters(target_chat_id)
+        bot.send_message(message.chat.id, "❌ Сессия авторизации уже закрыта.", **NO_PREVIEW)
+        return
+    _clear_auth_waiters(target_chat_id)
+    bot.send_message(message.chat.id, "⏳ Передаю номер в открытую страницу MAX…", **NO_PREVIEW)
+    status, data = session.enter_phone("+" + phone_digits)
+    _handle_auth_result(target_chat_id, message.from_user.id, status, data, "номер телефона")
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.text is not None
+    and m.from_user.id in set(awaiting_code_from.values())
+)
+def handle_login_code_input(message):
+    target_chat_id = _waiting_login_target(awaiting_code_from, message.from_user.id)
+    if target_chat_id is None:
+        return
+    code_digits = re.sub(r"\D", "", message.text or "")
+    _delete_auth_input(message)
+    if not 4 <= len(code_digits) <= 8:
+        bot.send_message(
+            message.chat.id,
+            "❌ Код должен содержать от 4 до 8 цифр. Отправьте его ещё раз.",
+            reply_markup=_build_password_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+        return
+    session = active_logins.get(target_chat_id)
+    if not session:
+        _clear_auth_waiters(target_chat_id)
+        bot.send_message(message.chat.id, "❌ Сессия авторизации уже закрыта.", **NO_PREVIEW)
+        return
+    _clear_auth_waiters(target_chat_id)
+    bot.send_message(message.chat.id, "⏳ Проверяю код в MAX…", **NO_PREVIEW)
+    status, data = session.enter_code(code_digits)
+    _handle_auth_result(target_chat_id, message.from_user.id, status, data, "код")
+
+
 @bot.message_handler(
     func=lambda m: m.text is not None
     and not m.text.startswith('/')
@@ -2185,6 +2726,7 @@ def handle_password_input(message):
     if target_chat_id is None:
         return
     password = message.text.strip()
+    _delete_auth_input(message)
     chat = get_chat_by_id(target_chat_id) if target_chat_id != "project_account" else None
     title = "аккаунта проекта" if target_chat_id == "project_account" else (chat["title"] if chat else "MAX")
     session = active_logins.get(target_chat_id)
@@ -2196,6 +2738,7 @@ def handle_password_input(message):
     status, data = session.enter_password(password)
     awaiting_password_from.pop(target_chat_id, None)
     if status == "success":
+        _clear_auth_waiters(target_chat_id)
         active_logins.pop(target_chat_id, None)
         if target_chat_id == "project_account":
             for customer_chat in get_all_chats():
@@ -2209,7 +2752,7 @@ def handle_password_input(message):
             parse_mode='HTML', **NO_PREVIEW
         )
     elif status == "wrong_password":
-        awaiting_password_from[target_chat_id] = user_id
+        _set_auth_waiter(awaiting_password_from, target_chat_id, user_id)
         try:
             photo_obj = io.BytesIO(data)
             kb = _build_password_keyboard(target_chat_id)
@@ -2285,7 +2828,33 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "⚠️ Не удалось удалить")
             print(f"Ошибка удаления: {e}")
         return
-    if action.startswith("qr_ready_"):
+    if action.startswith("qr_phone_"):
+        target_id = _qr_target_from_action(action)
+        session = active_logins.get(target_id)
+        if not session:
+            bot.answer_callback_query(call.id, "Сессия авторизации не найдена", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "📱 Переключаю на вход по номеру...")
+        status, data = session.start_phone_login()
+        if status == "awaiting_phone":
+            _set_auth_waiter(awaiting_phone_from, target_id, call.from_user.id)
+            bot.send_message(
+                call.message.chat.id,
+                "Введите номер телефона, на который зарегистрирован MAX "
+                "(например, +79991234567). Номер обрабатывается только для этого входа "
+                "и не записывается в базу MAX_Parser.",
+                reply_markup=_build_password_keyboard(target_id),
+                **NO_PREVIEW,
+            )
+        else:
+            bot.send_message(
+                call.message.chat.id,
+                f"❌ Не удалось открыть вход по телефону: <code>{escape_html(data or status)}</code>",
+                parse_mode="HTML",
+                reply_markup=_build_qr_keyboard(target_id),
+                **NO_PREVIEW,
+            )
+    elif action.startswith("qr_ready_"):
         target_id = _qr_target_from_action(action)
         bot.answer_callback_query(call.id, "⏳ Проверяю вход...")
         session = active_logins.get(target_id)
@@ -2297,7 +2866,7 @@ def admin_callbacks(call):
         status, data = session.check()
         if status == "success":
             active_logins.pop(target_id, None)
-            awaiting_password_from.pop(target_id, None)
+            _clear_auth_waiters(target_id)
             if target_id == "project_account":
                 for customer_chat in get_all_chats():
                     if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
@@ -2310,7 +2879,7 @@ def admin_callbacks(call):
                 parse_mode='HTML', **NO_PREVIEW
             )
         elif status == "awaiting_password":
-            awaiting_password_from[target_id] = call.from_user.id
+            _set_auth_waiter(awaiting_password_from, target_id, call.from_user.id)
             try:
                 photo_obj = io.BytesIO(data)
                 kb = _build_password_keyboard(target_id)
@@ -2328,6 +2897,23 @@ def admin_callbacks(call):
                 )
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}", **NO_PREVIEW)
+        elif status == "awaiting_code":
+            _set_auth_waiter(awaiting_code_from, target_id, call.from_user.id)
+            bot.send_message(
+                call.message.chat.id,
+                "📩 MAX отправил код подтверждения. Введите его следующим сообщением. "
+                "После обработки сообщение будет удалено.",
+                reply_markup=_build_password_keyboard(target_id),
+                **NO_PREVIEW,
+            )
+        elif status == "awaiting_phone":
+            _set_auth_waiter(awaiting_phone_from, target_id, call.from_user.id)
+            bot.send_message(
+                call.message.chat.id,
+                "Введите номер телефона MAX следующим сообщением.",
+                reply_markup=_build_password_keyboard(target_id),
+                **NO_PREVIEW,
+            )
         elif status == "waiting":
             bot.send_message(
                 call.message.chat.id,
@@ -2346,6 +2932,7 @@ def admin_callbacks(call):
             )
     elif action.startswith("qr_refresh_"):
         target_id = _qr_target_from_action(action)
+        _clear_auth_waiters(target_id)
         bot.answer_callback_query(call.id, "🔄 Обновляю QR-код...")
         session = active_logins.get(target_id)
         if not session:
@@ -2397,7 +2984,7 @@ def admin_callbacks(call):
                 session.close()
             except:
                 pass
-        awaiting_password_from.pop(target_id, None)
+        _clear_auth_waiters(target_id)
         bot.answer_callback_query(call.id, "❌ Авторизация отменена", show_alert=True)
         bot.send_message(call.message.chat.id, "❌ Процесс авторизации отменён.", **NO_PREVIEW)
     elif action == "admin_chats":
@@ -2457,8 +3044,25 @@ def admin_callbacks(call):
         threading.Thread(target=status_thread, daemon=True).start()
     elif action == "admin_admins":
         show_admins_list(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_admins_page_"):
+        show_admins_list(
+            call.message.chat.id, call.message.message_id,
+            int(action.rsplit("_", 1)[1]),
+        )
     elif action == "admin_users":
         show_users_list(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_users_page_"):
+        show_users_list(
+            call.message.chat.id, call.message.message_id,
+            int(action.rsplit("_", 1)[1]),
+        )
+    elif action == "admin_parse_diagnostics":
+        show_parse_diagnostics(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_parse_diag_"):
+        show_parse_diagnostics(
+            call.message.chat.id, call.message.message_id,
+            int(action.rsplit("_", 1)[1]),
+        )
     elif action == "admin_clear_cache":
         from max_playwright_parser import message_cache_by_chat
         stats = get_global_stats()
@@ -2504,30 +3108,48 @@ def admin_callbacks(call):
 
         bot.register_next_step_handler(prompt, process_broadcast_message)
     elif action == "admin_send_to_chat":
-        prompt = bot.send_message(
-            call.message.chat.id,
-            "Отправь ID чата, в который нужно отправить сообщение.\n\n"
-            "Пример для группы: <code>-1001234567890</code>",
-            parse_mode="HTML",
-            reply_markup=get_cancel_keyboard()
-        )
-
-        bot.register_next_step_handler(
-            prompt,
-            process_send_to_chat_id
+        show_chat_send_selector(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_send_chats_page_"):
+        show_chat_send_selector(
+            call.message.chat.id, call.message.message_id,
+            int(action.rsplit("_", 1)[1]),
         )
     elif action == "admin_send_to_user":
+        show_user_send_selector(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_send_users_page_"):
+        show_user_send_selector(
+            call.message.chat.id, call.message.message_id,
+            int(action.rsplit("_", 1)[1]),
+        )
+    elif action == "admin_send_user_manual":
         prompt = bot.send_message(
             call.message.chat.id,
-            "Отправь ID пользователя, которому нужно отправить сообщение.\n\n"
-            "Пример: <code>123456789</code>",
+            "Отправьте ID пользователя. Пример: <code>123456789</code>",
             parse_mode="HTML",
-            reply_markup=get_cancel_keyboard()
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
         )
-
-        bot.register_next_step_handler(
-            prompt,
-            process_send_to_user_id
+        bot.register_next_step_handler(prompt, process_send_to_user_id)
+    elif action == "admin_send_chat_manual":
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "Отправьте ID чата. Пример: <code>-1001234567890</code>",
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_send_to_chat_id)
+    elif action.startswith("admin_send_user_pick_"):
+        _prompt_send_to_user(
+            call.message.chat.id, int(action.rsplit("_", 1)[1])
+        )
+    elif action.startswith("admin_send_chat_pick_"):
+        _prompt_send_to_chat(
+            call.message.chat.id, int(action.rsplit("_", 1)[1])
+        )
+    elif action.startswith("admin_user_send_"):
+        _prompt_send_to_user(
+            call.message.chat.id, int(action.rsplit("_", 1)[1])
         )
     elif action.startswith("admin_chat_"):
         target_id = int(action.split("_")[-1])
@@ -2578,9 +3200,9 @@ def admin_callbacks(call):
         )
         safe_edit_message(text, call.message.chat.id, call.message.message_id,
                           reply_markup=kb, **NO_PREVIEW)
-    elif action.startswith("admin_yes_delete_"):
+    elif action.startswith("admin_yes_delete_") and not action.startswith("admin_yes_delete_admin_"):
         target_id = int(action.split("_")[-1])
-        delete_chat(target_id)
+        _delete_chat_everywhere(target_id)
         bot.answer_callback_query(call.id, "🗑 Чат удалён", show_alert=True)
         show_chats_list(call.message.chat.id, call.message.message_id)
     elif action.startswith("admin_ask_delete_admin_"):
@@ -2651,6 +3273,55 @@ def admin_callbacks(call):
         except Exception as e:
             bot.answer_callback_query(call.id, f"Ошибка: {str(e)[:50]}", show_alert=True)
             print(f"Ошибка статистики: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mychat_"))
+def my_chat_delete_callbacks(call):
+    track_user(call)
+    if not call.message or call.message.chat.type != "private":
+        bot.answer_callback_query(call.id, "Откройте список в личном чате с ботом.", show_alert=True)
+        return
+    try:
+        target_chat_id = int(call.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Некорректный ID группы", show_alert=True)
+        return
+    chat = get_chat_by_id(target_chat_id)
+    if not chat:
+        bot.answer_callback_query(call.id, "Группа уже удалена", show_alert=True)
+        _show_my_chats(call.message.chat.id, call.from_user.id, call.message.message_id)
+        return
+    if not _chat_delete_allowed(call.from_user.id, chat):
+        bot.answer_callback_query(call.id, "Удалить группу может только её владелец или администратор.", show_alert=True)
+        return
+    if call.data.startswith("mychat_delete_"):
+        cleanup_details = (
+            "Бот покинет Telegram-группу; её настройки, история парсинга и личная сессия будут удалены."
+            if chat.get("account_mode") != "project"
+            else "Бот покинет Telegram-группу; её настройки и история удалятся. Общий аккаунт проекта останется для других групп."
+        )
+        text = (
+            "⚠️ <b>Удалить подключённую группу?</b>\n\n"
+            f"<b>{escape_html(chat.get('title') or 'Группа')}</b>\n"
+            f"🆔 <code>{target_chat_id}</code>\n\n"
+            f"{cleanup_details}"
+        )
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"mychat_confirm_delete_{target_chat_id}", style="danger"),
+            types.InlineKeyboardButton("↩️ Отмена", callback_data=f"mychat_cancel_delete_{target_chat_id}")
+        )
+        safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+        bot.answer_callback_query(call.id)
+    elif call.data.startswith("mychat_cancel_delete_"):
+        _show_my_chats(call.message.chat.id, call.from_user.id, call.message.message_id)
+        bot.answer_callback_query(call.id, "Удаление отменено")
+    elif call.data.startswith("mychat_confirm_delete_"):
+        if _delete_chat_everywhere(target_chat_id):
+            bot.answer_callback_query(call.id, "Группа удалена")
+        else:
+            bot.answer_callback_query(call.id, "Группа уже удалена", show_alert=True)
+        _show_my_chats(call.message.chat.id, call.from_user.id, call.message.message_id)
+
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
@@ -2802,7 +3473,7 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "он нужен только для входа в MAX. После успешного входа парсер включится автоматически 🎉.\n\n"
                     "<b>Вариант 2 · Через готовый аккаунт MAX</b>\n"
                     "После того как вы добавили MAX_Pаrser в группу напишите в вашей группе в Telegram команду /bind и после, "
-                    "пришлите БОТУ ссылку, которая ведет на вашу группу. Настройка завершена 🎉.\n\n"
+                    "пришлите БОТУ В ЛС ссылку, которая ведет на вашу группу. Настройка завершена 🎉.\n\n"
                     "<b>Управление и помощь</b>\n"
                     "• /mychats — посмотреть свои подключения.\n"
                     "• /cancel — отменить текущий шаг настройки.\n"
