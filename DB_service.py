@@ -1,4 +1,5 @@
 import os
+import uuid
 
 import psycopg
 from dotenv import load_dotenv
@@ -74,6 +75,40 @@ def init_db():
             CREATE TABLE IF NOT EXISTS support_message_routes (
                 message_id BIGINT PRIMARY KEY,
                 user_id BIGINT NOT NULL
+            )
+        """)
+
+        # Separate names keep the Telegram payment schema independent from any
+        # earlier experimental payment tables that may still exist in Postgres.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_payment_orders (
+                payload TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                plan_code TEXT NOT NULL CHECK (plan_code IN ('self', 'project')),
+                amount BIGINT NOT NULL CHECK (amount > 0),
+                currency VARCHAR(3) NOT NULL DEFAULT 'RUB',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'checkout', 'paid')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '24 hours'),
+                paid_at TIMESTAMPTZ,
+                provider_payment_charge_id TEXT UNIQUE,
+                telegram_payment_charge_id TEXT UNIQUE
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telegram_payment_orders_user_created
+            ON telegram_payment_orders (user_id, created_at DESC)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_subscriptions (
+                user_id BIGINT PRIMARY KEY,
+                plan_code TEXT NOT NULL CHECK (plan_code IN ('self', 'project')),
+                active_until TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reminder_sent_at TIMESTAMPTZ
             )
         """)
 
@@ -311,6 +346,170 @@ def get_global_stats():
         "total_msgs": total_msgs,
         "today_msgs": total_msgs,
     }
+
+
+#! ============ TELEGRAM PAYMENTS / SUBSCRIPTIONS ============
+
+def create_payment_order(user_id: int, plan_code: str, amount: int) -> str:
+    if plan_code not in ("self", "project"):
+        raise ValueError("Некорректный тариф")
+    payload = f"maxparser_{uuid.uuid4().hex}"
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO telegram_payment_orders (payload, user_id, plan_code, amount)
+            VALUES (%s, %s, %s, %s)
+        """, (payload, int(user_id), plan_code, int(amount)))
+    return payload
+
+
+def get_payment_order(payload: str):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT payload, user_id, plan_code, amount, currency, status,
+                   created_at, expires_at, paid_at,
+                   provider_payment_charge_id, telegram_payment_charge_id
+            FROM telegram_payment_orders
+            WHERE payload = %s
+        """, (payload,)).fetchone()
+
+
+def claim_payment_order_for_checkout(
+    payload: str, user_id: int, currency: str, total_amount: int
+) -> bool:
+    """Atomically accept one checkout attempt for a pending, matching invoice."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            UPDATE telegram_payment_orders
+            SET status = 'checkout'
+            WHERE payload = %s
+              AND user_id = %s
+              AND currency = %s
+              AND amount = %s
+              AND status IN ('pending', 'checkout')
+              AND expires_at > CURRENT_TIMESTAMP
+            RETURNING payload
+        """, (payload, int(user_id), currency, int(total_amount))).fetchone()
+        return row is not None
+
+
+def complete_payment_order(
+    payload: str,
+    user_id: int,
+    currency: str,
+    total_amount: int,
+    provider_payment_charge_id: str,
+    telegram_payment_charge_id: str,
+):
+    """Record a successful payment and extend the account subscription once."""
+    with get_connection() as conn:
+        with conn.transaction():
+            order = conn.execute("""
+                SELECT payload, user_id, plan_code, amount, currency, status
+                FROM telegram_payment_orders
+                WHERE payload = %s
+                FOR UPDATE
+            """, (payload,)).fetchone()
+            if not order:
+                raise ValueError("Счёт не найден")
+            if int(order["user_id"]) != int(user_id):
+                raise ValueError("Счёт принадлежит другому пользователю")
+            if order["currency"] != currency or int(order["amount"]) != int(total_amount):
+                raise ValueError("Сумма или валюта платежа не совпадает со счётом")
+            if order["status"] == "paid":
+                subscription = get_subscription(user_id)
+                return {
+                    "already_paid": True,
+                    "plan_code": order["plan_code"],
+                    "active_until": subscription["active_until"] if subscription else None,
+                }
+            if order["status"] != "checkout":
+                raise ValueError("Счёт не был подтверждён перед оплатой")
+
+            subscription = conn.execute("""
+                INSERT INTO telegram_subscriptions (user_id, plan_code, active_until)
+                VALUES (%s, %s, CURRENT_TIMESTAMP + INTERVAL '30 days')
+                ON CONFLICT (user_id) DO UPDATE SET
+                    plan_code = EXCLUDED.plan_code,
+                    active_until = GREATEST(
+                        telegram_subscriptions.active_until, CURRENT_TIMESTAMP
+                    ) + INTERVAL '30 days',
+                    updated_at = CURRENT_TIMESTAMP,
+                    reminder_sent_at = NULL
+                RETURNING active_until
+            """, (int(user_id), order["plan_code"])).fetchone()
+
+            conn.execute("""
+                UPDATE telegram_payment_orders
+                SET status = 'paid',
+                    paid_at = CURRENT_TIMESTAMP,
+                    provider_payment_charge_id = %s,
+                    telegram_payment_charge_id = %s
+                WHERE payload = %s
+            """, (
+                provider_payment_charge_id,
+                telegram_payment_charge_id,
+                payload,
+            ))
+            return {
+                "already_paid": False,
+                "plan_code": order["plan_code"],
+                "active_until": subscription["active_until"],
+            }
+
+
+def get_subscription(user_id: int):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT user_id, plan_code, active_until, updated_at, reminder_sent_at
+            FROM telegram_subscriptions
+            WHERE user_id = %s
+        """, (int(user_id),)).fetchone()
+
+
+def is_subscription_active(user_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT 1 AS active
+            FROM telegram_subscriptions
+            WHERE user_id = %s AND active_until > CURRENT_TIMESTAMP
+        """, (int(user_id),)).fetchone()
+        return row is not None
+
+
+def get_active_subscription_user_ids():
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT user_id FROM telegram_subscriptions
+            WHERE active_until > CURRENT_TIMESTAMP
+        """).fetchall()
+        return {int(row["user_id"]) for row in rows}
+
+
+def get_due_subscription_reminders():
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT user_id, plan_code, active_until
+            FROM telegram_subscriptions
+            WHERE active_until > CURRENT_TIMESTAMP
+              AND active_until <= CURRENT_TIMESTAMP + INTERVAL '3 days'
+              AND reminder_sent_at IS NULL
+            ORDER BY active_until
+        """).fetchall()
+        return list(rows)
+
+
+def mark_subscription_reminder_sent(user_id: int):
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE telegram_subscriptions
+            SET reminder_sent_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s
+              AND active_until > CURRENT_TIMESTAMP
+              AND active_until <= CURRENT_TIMESTAMP + INTERVAL '3 days'
+              AND reminder_sent_at IS NULL
+        """, (int(user_id),))
+
+
 
 
 init_db()

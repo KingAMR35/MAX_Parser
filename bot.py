@@ -21,6 +21,19 @@ print("🚀 MAX Parser Bot запущен")
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='HTML')
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 add_admin(ADMIN_ID, "main_admin")
+TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "").strip()
+YOOKASSA_RECEIPTS_SETTING = os.getenv("YOOKASSA_RECEIPTS_ENABLED", "").strip().lower()
+YOOKASSA_RECEIPTS_SETTING_CONFIRMED = YOOKASSA_RECEIPTS_SETTING in {
+    "1", "true", "yes", "on", "0", "false", "no", "off"
+}
+YOOKASSA_RECEIPTS_ENABLED = YOOKASSA_RECEIPTS_SETTING in {"1", "true", "yes", "on"}
+YOOKASSA_RECEIPT_VAT_CODE = os.getenv("YOOKASSA_RECEIPT_VAT_CODE", "").strip()
+YOOKASSA_RECEIPT_PAYMENT_MODE = os.getenv("YOOKASSA_RECEIPT_PAYMENT_MODE", "").strip()
+YOOKASSA_RECEIPT_PAYMENT_SUBJECT = os.getenv("YOOKASSA_RECEIPT_PAYMENT_SUBJECT", "").strip()
+YOOKASSA_RECEIPT_TAX_SYSTEM_CODE = os.getenv("YOOKASSA_RECEIPT_TAX_SYSTEM_CODE", "").strip()
+PAYMENTS_ENABLED = bool(TELEGRAM_PAYMENT_PROVIDER_TOKEN)
+PAYMENT_ACCESS_ENFORCEMENT_ENABLED = os.getenv("PAYMENT_ACCESS_ENFORCEMENT_ENABLED").strip().lower() in {"1", "true", "yes", "on"}
+PAYMENT_ADMIN_BYPASS = os.getenv("PAYMENT_ADMIN_BYPASS", "true").strip().lower() in {"1", "true", "yes", "on"}
 _current_cycle_hashes = {}
 NO_PREVIEW = {"disable_web_page_preview": True}
 active_logins = {}
@@ -42,6 +55,7 @@ bot.set_my_commands([
     types.BotCommand("help", "Связаться с тех поддержкой"),
     types.BotCommand("connect", "Подключить группу MAX"),
     types.BotCommand("mychats", "Мои группы парсинга"),
+    types.BotCommand("subscription", "Подписка и продление"),
     types.BotCommand("admin", "Админ-панель")
 ])
 
@@ -831,8 +845,32 @@ def _session_path_for_chat(chat):
     return os.path.join("sessions", f"{chat['chat_id']}.json")
 
 
+def _user_needs_subscription(user_id):
+    if not PAYMENT_ACCESS_ENFORCEMENT_ENABLED:
+        return False
+    if PAYMENT_ADMIN_BYPASS and is_admin(user_id):
+        return False
+    return not is_subscription_active(user_id)
+
+
+def _get_payable_active_chats():
+    chats = get_active_chats()
+    if not PAYMENT_ACCESS_ENFORCEMENT_ENABLED:
+        return chats
+    active_owners = get_active_subscription_user_ids()
+    admin_ids = (
+        {int(admin["user_id"]) for admin in get_all_admins()}
+        if PAYMENT_ADMIN_BYPASS else set()
+    )
+    return [
+        chat for chat in chats
+        if not chat.get("owner_id")
+        or int(chat["owner_id"]) in (active_owners | admin_ids)
+    ]
+
+
 def run_one_parse_cycle():
-    active_chats = get_active_chats()
+    active_chats = _get_payable_active_chats()
     results = []
     if not active_chats:
         return "⚠️ Нет активных чатов для парсинга"
@@ -913,6 +951,9 @@ def process_single_chat(chat):
     max_url = chat["max_url"]
     title = chat["title"]
     try:
+        owner_id = int(chat.get("owner_id") or 0)
+        if owner_id and _user_needs_subscription(owner_id):
+            return False
         posts = parse_max_group_media(
             group_url=max_url,
             chat_id=chat_id,
@@ -930,7 +971,7 @@ def background_parser():
     time.sleep(5)
     while True:
         try:
-            active_chats = get_active_chats()
+            active_chats = _get_payable_active_chats()
             if not active_chats:
                 time.sleep(60)
                 continue
@@ -1191,7 +1232,6 @@ def track_user(message_or_callback):
 def _build_qr_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("✅ Готово, я отсканировал", callback_data=f"qr_ready_{target_chat_id}"))
-    kb.add(types.InlineKeyboardButton("📱 Войти по номеру телефона", callback_data=f"qr_phone_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🔄 Обновить QR", callback_data=f"qr_refresh_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
@@ -1205,6 +1245,26 @@ def _build_password_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
+
+
+def _build_auth_check_keyboard(target_chat_id):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🔄 Проверить вход MAX", callback_data=f"qr_ready_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_chat_id}"))
+    return kb
+
+
+def _auth_human_check_text(session, reason):
+    if reason == "captcha":
+        return (
+            "🛡 MAX запросил дополнительную проверку безопасности. Проверьте приложение MAX, "
+            "завершите подтверждение входа и затем нажмите «🔄 Проверить вход MAX». "
+            "Подключение по номеру телефона находится в разработке; сейчас используйте QR-код."
+        )
+    return (
+        "MAX пока не подтвердил вход. Отсканируйте QR-код в приложении MAX, затем нажмите "
+        "«✅ Готово, я отсканировал». Подключение по номеру телефона находится в разработке."
+    )
 
 def _clear_auth_waiters(target_chat_id):
     awaiting_password_from.pop(target_chat_id, None)
@@ -1261,7 +1321,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
     _clear_auth_waiters(target_chat_id)
     bot.send_message(
         admin_chat_id,
-        f"⏳ Открываю web.max.ru для <b>{escape_html(title)}</b>...\nЭто займет несколько секунд.",
+        f"⏳ Подготавливаю QR-код для <b>{escape_html(title)}</b>...\nЭто займет несколько секунд.",
         parse_mode='HTML', **NO_PREVIEW
     )
     session = QRLoginSession(target_chat_id)
@@ -1284,23 +1344,22 @@ def do_qr_login(target_chat_id, admin_chat_id):
         return
     active_logins[target_chat_id] = session
     try:
-        photo_obj = io.BytesIO(data)
-        kb = _build_qr_keyboard(target_chat_id)
         bot.send_photo(
             admin_chat_id,
-            photo_obj,
+            io.BytesIO(data),
             caption=(
-                f"📱 <b>Отсканируйте QR-код</b> на этом скриншоте через приложение MAX\n\n"
+                f"📱 <b>Отсканируйте QR-код</b> в приложении MAX\n\n"
                 f"MAX: <b>{escape_html(title)}</b>\n\n"
-                f"После сканирования нажмите <b>«✅ Готово, я отсканировал»</b>"
+                "После сканирования нажмите <b>«✅ Готово, я отсканировал»</b>.\n"
+                "Подключение по номеру телефона находится в разработке."
             ),
-            parse_mode='HTML',
-            reply_markup=kb
+            parse_mode="HTML",
+            reply_markup=_build_qr_keyboard(target_chat_id),
         )
-    except Exception as e:
-        bot.send_message(admin_chat_id, f"❌ Ошибка отправки скриншота: {e}", **NO_PREVIEW)
+    except Exception as error:
+        bot.send_message(admin_chat_id, f"❌ Ошибка отправки QR-кода: {error}", **NO_PREVIEW)
         session.close()
-        del active_logins[target_chat_id]
+        active_logins.pop(target_chat_id, None)
 
 def show_admin_menu(chat_id):
     stats = get_global_stats()
@@ -2070,6 +2129,118 @@ def parser_keyboard():
     return keyboard
 
 
+def subscription_renewal_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("Продлить · свой MAX-аккаунт · 250 ₽", callback_data="renew_self"))
+    keyboard.add(types.InlineKeyboardButton("Продлить · аккаунт проекта · 500 ₽", callback_data="renew_project"))
+    return keyboard
+
+
+def _subscription_plan(plan_code):
+    plans = {
+        "self": (25000, "подключение через ваш аккаунт MAX"),
+        "project": (50000, "подключение через аккаунт проекта MAX"),
+    }
+    if plan_code not in plans:
+        raise ValueError("Некорректный тариф подписки")
+    return plans[plan_code]
+
+
+def _yookassa_receipt_provider_data(plan_code, amount):
+    if not YOOKASSA_RECEIPTS_ENABLED:
+        return None
+    try:
+        vat_code = int(YOOKASSA_RECEIPT_VAT_CODE)
+    except (TypeError, ValueError):
+        raise RuntimeError("не задан YOOKASSA_RECEIPT_VAT_CODE")
+    if not YOOKASSA_RECEIPT_PAYMENT_MODE or not YOOKASSA_RECEIPT_PAYMENT_SUBJECT:
+        raise RuntimeError(
+            "задайте YOOKASSA_RECEIPT_PAYMENT_MODE и YOOKASSA_RECEIPT_PAYMENT_SUBJECT"
+        )
+
+    _, plan_description = _subscription_plan(plan_code)
+    receipt = {
+        "items": [{
+            "description": f"MAX_Parser — подписка на 30 дней ({plan_description})",
+            "quantity": "1.00",
+            "amount": {
+                "value": f"{amount // 100}.{amount % 100:02d}",
+                "currency": "RUB",
+            },
+            "vat_code": vat_code,
+            "payment_mode": YOOKASSA_RECEIPT_PAYMENT_MODE,
+            "payment_subject": YOOKASSA_RECEIPT_PAYMENT_SUBJECT,
+        }]
+    }
+    if YOOKASSA_RECEIPT_TAX_SYSTEM_CODE:
+        try:
+            receipt["tax_system_code"] = int(YOOKASSA_RECEIPT_TAX_SYSTEM_CODE)
+        except ValueError:
+            raise RuntimeError("YOOKASSA_RECEIPT_TAX_SYSTEM_CODE должен быть числом")
+    return json.dumps({"receipt": receipt}, ensure_ascii=False)
+
+
+def _send_subscription_invoice(user_id, plan_code):
+    if not TELEGRAM_PAYMENT_PROVIDER_TOKEN:
+        bot.send_message(
+            user_id,
+            "Оплата пока не настроена. Попросите администратора добавить платёжный токен в настройки бота.",
+            **NO_PREVIEW,
+        )
+        return False
+    if not YOOKASSA_RECEIPTS_SETTING_CONFIRMED:
+        bot.send_message(
+            user_id,
+            "Администратор ещё не подтвердил настройки фискальных чеков ЮKassa. "
+            "Счёт пока нельзя выставить; пожалуйста, обратитесь в поддержку командой /help.",
+            **NO_PREVIEW,
+        )
+        return False
+    amount, plan_description = _subscription_plan(plan_code)
+    try:
+        provider_data = _yookassa_receipt_provider_data(plan_code, amount)
+    except RuntimeError as error:
+        debug_logger.error("YOOKASSA_RECEIPT_CONFIGURATION_INCOMPLETE: %s", error)
+        bot.send_message(
+            user_id,
+            "Оплата временно недоступна: не завершена настройка фискального чека. "
+            "Администратору нужно проверить параметры ЮKassa.",
+            **NO_PREVIEW,
+        )
+        return False
+
+    try:
+        payload = create_payment_order(user_id, plan_code, amount)
+        invoice_options = {
+            "chat_id": user_id,
+            "title": "MAX_Parser — подписка",
+            "description": f"Доступ к MAX_Parser на 30 дней · {plan_description}",
+            "invoice_payload": payload,
+            "provider_token": TELEGRAM_PAYMENT_PROVIDER_TOKEN,
+            "currency": "RUB",
+            "prices": [types.LabeledPrice(label="Подписка на 30 дней", amount=amount)],
+            "start_parameter": payload,
+            "need_email": YOOKASSA_RECEIPTS_ENABLED,
+            "send_email_to_provider": YOOKASSA_RECEIPTS_ENABLED,
+            "is_flexible": False,
+        }
+        if provider_data:
+            invoice_options["provider_data"] = provider_data
+        bot.send_invoice(**invoice_options)
+        return True
+    except Exception as error:
+        debug_logger.error(
+            "TELEGRAM_INVOICE_SEND_FAILED user_id=%s plan=%s error_type=%s",
+            user_id, plan_code, type(error).__name__,
+        )
+        bot.send_message(
+            user_id,
+            "Не удалось выставить счёт. Попробуйте ещё раз чуть позже или напишите в поддержку командой /help.",
+            **NO_PREVIEW,
+        )
+        return False
+
+
 def _support_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
     keyboard.add(types.KeyboardButton(SUPPORT_END_TEXT))
@@ -2263,6 +2434,176 @@ def help_command(message):
     start_support(message.chat.id, message.from_user)
 
 
+@bot.message_handler(commands=['subscription'])
+def subscription_status_command(message):
+    track_user(message)
+    if message.chat.type != "private":
+        bot.reply_to(message, "Откройте личный чат со мной и отправьте /subscription.")
+        return
+    if not PAYMENTS_ENABLED:
+        bot.send_message(
+            message.chat.id,
+            "Оплата ещё не настроена. Подключение пока работает в тестовом режиме.",
+            **NO_PREVIEW,
+        )
+        return
+    subscription = get_subscription(message.from_user.id)
+    if subscription and subscription["active_until"] > datetime.now(timezone.utc):
+        active_until = subscription["active_until"].astimezone(timezone.utc)
+        text = (
+            "💳 <b>Ваша подписка MAX_Parser активна</b>\n\n"
+            f"Действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
+            "Подписка распространяется на все подключённые группы вашего аккаунта.\n\n"
+            "Продлить её можно заранее — оплаченный срок добавится к текущему."
+        )
+    else:
+        text = (
+            "💳 <b>Активной подписки нет</b>\n\n"
+            "Выберите тариф, чтобы оформить доступ или продлить его."
+        )
+    bot.send_message(
+        message.chat.id,
+        text,
+        parse_mode="HTML",
+        reply_markup=subscription_renewal_keyboard(),
+        **NO_PREVIEW,
+    )
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def handle_pre_checkout_query(query):
+    try:
+        accepted = claim_payment_order_for_checkout(
+            payload=query.invoice_payload,
+            user_id=query.from_user.id,
+            currency=query.currency,
+            total_amount=query.total_amount,
+        )
+    except Exception as error:
+        accepted = False
+        debug_logger.error(
+            "PRE_CHECKOUT_VALIDATION_FAILED user_id=%s error_type=%s",
+            query.from_user.id, type(error).__name__,
+        )
+    if accepted:
+        bot.answer_pre_checkout_query(query.id, ok=True)
+    else:
+        bot.answer_pre_checkout_query(
+            query.id,
+            ok=False,
+            error_message="Счёт устарел или уже обрабатывается. Вернитесь в бот и запросите новый счёт.",
+        )
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def handle_successful_payment(message):
+    payment = message.successful_payment
+    user_id = message.from_user.id
+    try:
+        result = complete_payment_order(
+            payload=payment.invoice_payload,
+            user_id=user_id,
+            currency=payment.currency,
+            total_amount=payment.total_amount,
+            provider_payment_charge_id=payment.provider_payment_charge_id,
+            telegram_payment_charge_id=payment.telegram_payment_charge_id,
+        )
+    except Exception as error:
+        debug_logger.error(
+            "SUCCESSFUL_PAYMENT_ACTIVATION_FAILED user_id=%s provider_charge_id=%s error_type=%s",
+            user_id,
+            getattr(payment, "provider_payment_charge_id", None),
+            type(error).__name__,
+        )
+        bot.send_message(
+            user_id,
+            "✅ Telegram подтвердил оплату, но не удалось автоматически обновить подписку. "
+            "Я уже передал информацию администратору; пожалуйста, напишите в поддержку командой /help.",
+            **NO_PREVIEW,
+        )
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                "⚠️ Платёж прошёл, но подписка не активировалась автоматически.\n"
+                f"Пользователь: <code>{user_id}</code>\n"
+                f"ID платежа ЮKassa: <code>{escape_html(getattr(payment, 'provider_payment_charge_id', '') or 'не получен')}</code>\n"
+                f"Payload: <code>{escape_html(payment.invoice_payload)}</code>",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        except Exception:
+            pass
+        return
+
+    if result["already_paid"]:
+        bot.send_message(user_id, "✅ Этот платёж уже был обработан. Подписка активна.", **NO_PREVIEW)
+        return
+
+    active_until = result["active_until"].astimezone(timezone.utc)
+    amount_rub = payment.total_amount / 100
+    bot.send_message(
+        user_id,
+        "✅ <b>Оплата прошла успешно</b>\n\n"
+        f"Сумма: <b>{amount_rub:.2f} ₽</b>\n"
+        f"Подписка действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
+        "Доступ распространяется на все группы вашего аккаунта.\n"
+        "Автоматического списания нет; перед окончанием срока я напомню о продлении.",
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            "💳 <b>Успешный платёж MAX_Parser</b>\n"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Сумма: <b>{amount_rub:.2f} ₽</b>\n"
+            f"ID платежа ЮKassa: <code>{escape_html(payment.provider_payment_charge_id or 'не получен')}</code>",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+    except Exception:
+        pass
+
+    if not get_user_chats(user_id):
+        pending_setup_modes[user_id] = result["plan_code"]
+        label = "ваш аккаунт MAX" if result["plan_code"] == "self" else "аккаунт проекта MAX"
+        bot.send_message(
+            user_id,
+            "Теперь можно подключить первую группу.\n\n"
+            f"Выбранный способ: <b>{label}</b>. Добавьте меня в нужную Telegram-группу и отправьте там /bind. "
+            "Если я уже нахожусь в ней, просто отправьте /bind. Затем пришлите ссылку на исходную группу MAX.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+
+
+def subscription_reminder_loop():
+    while True:
+        try:
+            for subscription in get_due_subscription_reminders():
+                user_id = int(subscription["user_id"])
+                active_until = subscription["active_until"].astimezone(timezone.utc)
+                try:
+                    bot.send_message(
+                        user_id,
+                        "⏰ <b>Скоро закончится подписка MAX_Parser</b>\n\n"
+                        f"Доступ действует до <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
+                        "Автоматического списания нет. Если хотите продолжить пользоваться парсером, продлите подписку заранее.",
+                        parse_mode="HTML",
+                        reply_markup=subscription_renewal_keyboard(),
+                        **NO_PREVIEW,
+                    )
+                    mark_subscription_reminder_sent(user_id)
+                except Exception as error:
+                    debug_logger.error(
+                        "SUBSCRIPTION_REMINDER_SEND_FAILED user_id=%s error_type=%s",
+                        user_id, type(error).__name__,
+                    )
+        except Exception as error:
+            debug_logger.error("SUBSCRIPTION_REMINDER_LOOP_FAILED error_type=%s", type(error).__name__)
+        time.sleep(6 * 60 * 60)
+
+
 @bot.message_handler(commands=['connect'])
 def connect_command(message):
     track_user(message)
@@ -2364,6 +2705,15 @@ def _chat_delete_allowed(user_id, chat):
 
 
 def _begin_customer_group_setup(chat_id, owner_id, account_mode):
+    if _user_needs_subscription(owner_id):
+        pending_setup_modes.pop(owner_id, None)
+        bot.send_message(
+            owner_id,
+            "Для подключения группы сначала оформите подписку командой /subscription.",
+            reply_markup=subscription_renewal_keyboard(),
+            **NO_PREVIEW,
+        )
+        return False
     title = None
     try:
         title = bot.get_chat(chat_id).title or f"Группа {chat_id}"
@@ -2419,6 +2769,15 @@ def customer_source_url(message):
     state = customer_setup_state.get(message.from_user.id)
     if not state:
         return
+    if _user_needs_subscription(message.from_user.id):
+        customer_setup_state.pop(message.from_user.id, None)
+        bot.send_message(
+            message.chat.id,
+            "Срок подписки истёк до завершения настройки. Продлите её командой /subscription, затем повторите подключение.",
+            reply_markup=subscription_renewal_keyboard(),
+            **NO_PREVIEW,
+        )
+        return
     url = (message.text or "").strip()
     if not re.match(r"^https?://(?:web\.)?max\.ru/", url, re.I):
         bot.send_message(
@@ -2435,8 +2794,9 @@ def customer_source_url(message):
     if mode == "self":
         bot.send_message(
             message.chat.id,
-            "<b>Шаг 3 из 3.</b> Сейчас открою страницу входа MAX и пришлю QR-код. "
-            "Отсканируйте его в приложении MAX; авторизация будет сохранена только для вашей группы.",
+            "<b>Шаг 3 из 3.</b> Сейчас пришлю QR-код для входа в MAX. Отсканируйте его в приложении MAX "
+            "и нажмите «Готово, я отсканировал». Авторизация будет сохранена только для вашей группы.\n\n"
+            "Подключение по номеру телефона находится в разработке.",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -2611,6 +2971,28 @@ def _ask_for_auth_password(target_chat_id, user_id):
     )
 
 
+def _ask_for_auth_phone(target_chat_id, user_id, source_message=None, note=None):
+    _set_auth_waiter(awaiting_phone_from, target_chat_id, user_id)
+    if source_message:
+        try:
+            bot.edit_message_reply_markup(
+                source_message.chat.id,
+                source_message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+    prefix = f"{note}\n\n" if note else ""
+    bot.send_message(
+        user_id,
+        prefix
+        + "📱 Введите номер телефона, на который зарегистрирован MAX "
+        "(например, +79991234567). Номер нужен только для входа и не сохраняется в базе MAX_Parser.",
+        reply_markup=_build_password_keyboard(target_chat_id),
+        **NO_PREVIEW,
+    )
+
+
 def _handle_auth_result(target_chat_id, user_id, status, data, stage):
     if status == "success":
         _complete_login(target_chat_id, user_id)
@@ -2618,8 +3000,8 @@ def _handle_auth_result(target_chat_id, user_id, status, data, stage):
         _set_auth_waiter(awaiting_code_from, target_chat_id, user_id)
         bot.send_message(
             user_id,
-            "📩 MAX отправил код подтверждения. Введите код сюда. "
-            "Не пересылайте его другим людям; после обработки сообщение будет удалено.",
+            "📩 MAX перешёл к вводу кода. Проверьте SMS и чат «Коды авторизации» в MAX. "
+            "Когда код придёт, отправьте его сюда; после обработки сообщение будет удалено.",
             reply_markup=_build_password_keyboard(target_chat_id),
             **NO_PREVIEW,
         )
@@ -2633,20 +3015,47 @@ def _handle_auth_result(target_chat_id, user_id, status, data, stage):
         )
     elif status == "awaiting_password":
         _ask_for_auth_password(target_chat_id, user_id)
-    elif status == "waiting":
+    elif status == "awaiting_phone":
         bot.send_message(
             user_id,
-            "⚠️ MAX пока не подтвердил вход. Проверьте экран авторизации и нажмите "
-            "«✅ Готово, я отсканировал» или снова выберите вход по телефону.",
+            "Подключение по номеру телефона находится в разработке. Используйте QR-код в сообщении выше.",
+            reply_markup=_build_qr_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+    elif status == "awaiting_human":
+        _clear_auth_waiters(target_chat_id)
+        session = active_logins.get(target_chat_id)
+        bot.send_message(
+            user_id,
+            _auth_human_check_text(session, data),
+            reply_markup=_build_auth_check_keyboard(target_chat_id),
+            **NO_PREVIEW,
+        )
+    elif status == "waiting":
+        session = active_logins.get(target_chat_id)
+        if session:
+            bot.send_message(
+                user_id,
+                "MAX пока не подтвердил вход. Отсканируйте QR-код и нажмите «✅ Готово, я отсканировал». "
+                "Подключение по номеру телефона находится в разработке.",
+                reply_markup=_build_qr_keyboard(target_chat_id),
+                **NO_PREVIEW,
+            )
+            return
+        bot.send_message(
+            user_id,
+            "⚠️ Сессия входа больше не активна. Начните подключение заново, чтобы получить новый QR-код.",
             reply_markup=_build_qr_keyboard(target_chat_id),
             **NO_PREVIEW,
         )
     else:
+        session = active_logins.get(target_chat_id)
         bot.send_message(
             user_id,
-            f"❌ Не удалось продолжить вход ({stage}): <code>{escape_html(data or 'ошибка MAX')}</code>",
+            f"❌ Не удалось продолжить вход ({stage}): <code>{escape_html(data or 'ошибка MAX')}</code>\n\n"
+            "Подключение по номеру телефона находится в разработке. Попробуйте войти по QR-коду.",
             parse_mode="HTML",
-            reply_markup=_build_qr_keyboard(target_chat_id),
+            reply_markup=_build_qr_keyboard(target_chat_id) if session else None,
             **NO_PREVIEW,
         )
 
@@ -2829,31 +3238,11 @@ def admin_callbacks(call):
             print(f"Ошибка удаления: {e}")
         return
     if action.startswith("qr_phone_"):
-        target_id = _qr_target_from_action(action)
-        session = active_logins.get(target_id)
-        if not session:
-            bot.answer_callback_query(call.id, "Сессия авторизации не найдена", show_alert=True)
-            return
-        bot.answer_callback_query(call.id, "📱 Переключаю на вход по номеру...")
-        status, data = session.start_phone_login()
-        if status == "awaiting_phone":
-            _set_auth_waiter(awaiting_phone_from, target_id, call.from_user.id)
-            bot.send_message(
-                call.message.chat.id,
-                "Введите номер телефона, на который зарегистрирован MAX "
-                "(например, +79991234567). Номер обрабатывается только для этого входа "
-                "и не записывается в базу MAX_Parser.",
-                reply_markup=_build_password_keyboard(target_id),
-                **NO_PREVIEW,
-            )
-        else:
-            bot.send_message(
-                call.message.chat.id,
-                f"❌ Не удалось открыть вход по телефону: <code>{escape_html(data or status)}</code>",
-                parse_mode="HTML",
-                reply_markup=_build_qr_keyboard(target_id),
-                **NO_PREVIEW,
-            )
+        bot.answer_callback_query(
+            call.id,
+            "Подключение по номеру телефона находится в разработке. Используйте QR-код.",
+            show_alert=True,
+        )
     elif action.startswith("qr_ready_"):
         target_id = _qr_target_from_action(action)
         bot.answer_callback_query(call.id, "⏳ Проверяю вход...")
@@ -2901,28 +3290,32 @@ def admin_callbacks(call):
             _set_auth_waiter(awaiting_code_from, target_id, call.from_user.id)
             bot.send_message(
                 call.message.chat.id,
-                "📩 MAX отправил код подтверждения. Введите его следующим сообщением. "
-                "После обработки сообщение будет удалено.",
+                "📩 MAX перешёл к вводу кода. Проверьте SMS и чат «Коды авторизации» в MAX. "
+                "Когда код придёт, отправьте его следующим сообщением; после обработки оно будет удалено.",
                 reply_markup=_build_password_keyboard(target_id),
                 **NO_PREVIEW,
             )
-        elif status == "awaiting_phone":
-            _set_auth_waiter(awaiting_phone_from, target_id, call.from_user.id)
+        elif status == "awaiting_human":
             bot.send_message(
                 call.message.chat.id,
-                "Введите номер телефона MAX следующим сообщением.",
-                reply_markup=_build_password_keyboard(target_id),
+                _auth_human_check_text(session, data),
+                reply_markup=_build_auth_check_keyboard(target_id),
+                **NO_PREVIEW,
+            )
+        elif status == "awaiting_phone":
+            bot.send_message(
+                call.message.chat.id,
+                "Подключение по номеру телефона находится в разработке. Используйте QR-код выше.",
+                reply_markup=_build_qr_keyboard(target_id),
                 **NO_PREVIEW,
             )
         elif status == "waiting":
             bot.send_message(
                 call.message.chat.id,
-                f" <b>Вход ещё не выполнен.</b>\n\n"
-                f"Убедитесь, что вы отсканировали QR-код в приложении MAX.\n"
-                f"Затем нажмите <b>«✅ Готово, я отсканировал»</b> снова.",
-                parse_mode='HTML',
+                "⚠️ MAX пока не подтвердил вход. Убедитесь, что QR-код отсканирован в приложении MAX, "
+                "и нажмите кнопку ещё раз. Подключение по номеру телефона находится в разработке.",
                 reply_markup=_build_qr_keyboard(target_id),
-                **NO_PREVIEW
+                **NO_PREVIEW,
             )
         else:
             bot.send_message(
@@ -3389,6 +3782,18 @@ MAX_Parser будет работать через <b>другой аккаунт
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
+        elif call.data in ("renew_self", "renew_project"):
+            if not call.message or call.message.chat.type != "private":
+                bot.answer_callback_query(
+                    call.id,
+                    "Продление доступно в личном чате с ботом.",
+                    show_alert=True,
+                )
+                return
+            mode = "self" if call.data == "renew_self" else "project"
+            track_user(call)
+            bot.answer_callback_query(call.id, "Готовлю счёт")
+            _send_subscription_invoice(call.from_user.id, mode)
         elif call.data in ("my_acc_250", "not_my_acc_250"):
             if call.message.chat.type != "private":
                 bot.answer_callback_query(
@@ -3398,8 +3803,12 @@ MAX_Parser будет работать через <b>другой аккаунт
                 )
                 return
             mode = "self" if call.data == "my_acc_250" else "project"
-            pending_setup_modes[call.from_user.id] = mode
             track_user(call)
+            if _user_needs_subscription(call.from_user.id):
+                bot.answer_callback_query(call.id, "Сначала оформите подписку")
+                _send_subscription_invoice(call.from_user.id, mode)
+                return
+            pending_setup_modes[call.from_user.id] = mode
             label = "настройку своего аккаунта MAX" if mode == "self" else "настройку через готовый аккаунт"
             bot.answer_callback_query(call.id, "Настройка запущена")
             bot.send_message(
@@ -3468,9 +3877,10 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "и скопируйте ссылку группы из её меню. Бот попросит прислать эту ссылку в личный чат. "
                     "Проверьте, что ссылка ведёт именно в нужную группу.\n\n"
                     "<b>Вариант 1 · Ваш аккаунт MAX</b>\n"
-                    "После отправки ссылки бот покажет QR-код. Отсканируйте его камерой приложения MAX и подтвердите вход кнопкой "
-                    "«Готово, я отсканировал». Если MAX запросит пароль двухэтапной проверки, отправьте его боту в этой личной переписке; "
-                    "он нужен только для входа в MAX. После успешного входа парсер включится автоматически 🎉.\n\n"
+                    "После отправки ссылки бот пришлёт QR-код. Отсканируйте его в приложении MAX и нажмите "
+                    "«Готово, я отсканировал». Если MAX запросит пароль двухэтапной проверки, отправьте его боту в этой "
+                    "личной переписке; он нужен только для входа в MAX. После успешного входа парсер включится автоматически 🎉.\n"
+                    "Подключение по номеру телефона находится в разработке.\n\n"
                     "<b>Вариант 2 · Через готовый аккаунт MAX</b>\n"
                     "После того как вы добавили MAX_Pаrser в группу напишите в вашей группе в Telegram команду /bind и после, "
                     "пришлите БОТУ В ЛС ссылку, которая ведет на вашу группу. Настройка завершена 🎉.\n\n"
@@ -3487,6 +3897,8 @@ MAX_Parser будет работать через <b>другой аккаунт
 if __name__ == "__main__":
     try:
         threading.Thread(target=background_parser, daemon=True).start()
+        if PAYMENTS_ENABLED:
+            threading.Thread(target=subscription_reminder_loop, daemon=True).start()
         print("✅ Запуск polling...")
         bot.infinity_polling(none_stop=True, timeout=60)
     except KeyboardInterrupt:

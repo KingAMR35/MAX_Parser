@@ -42,6 +42,50 @@ def _strip_browser_video_fallback(text: str) -> str:
     return _normalize_message_lines(text)
 
 
+def _auth_browser_should_be_headless() -> bool:
+    """Keep MAX authorization in the background on every host."""
+    return True
+
+
+def _has_auth_captcha(page) -> bool:
+    """Detect MAX's human verification without attempting to solve it."""
+    try:
+        body_text = page.locator("body").inner_text(timeout=500).casefold()
+    except Exception:
+        body_text = ""
+    if any(marker in body_text for marker in (
+        "not a robot",
+        "verify that you are human",
+        "проверка, что вы не робот",
+        "подтвердите, что вы не робот",
+        "captcha",
+    )):
+        return True
+
+    for selector in (
+        "[class*='captcha-widget' i]",
+        "[id*='captcha' i]",
+        "iframe[src*='captcha' i]",
+        "iframe[title*='captcha' i]",
+    ):
+        try:
+            if page.locator(selector).first.is_visible(timeout=150):
+                return True
+        except Exception:
+            continue
+
+    # MAX renders its verification challenge in a visible iframe whose URL
+    # may be an opaque one-time link without the word "captcha" in it.
+    try:
+        frames = page.locator("iframe")
+        for index in range(frames.count()):
+            if frames.nth(index).is_visible(timeout=150):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _normalize_message_lines(text: str) -> str:
     lines = [
         re.sub(r"[\t ]+", " ", line).strip()
@@ -59,45 +103,93 @@ def _is_logged_in(page) -> bool:
         if len(page_content) < 1000:
             return False
         current_url = page.url.lower()
-        if 'web.max.ru' in current_url and current_url.count('/') <= 3:
-            login_indicators = [
-                "input[type='password']",
-                "div[class*='qr' i]",
-                "div[class*='QR' i]",
-                "canvas[class*='qr' i]",
-                "img[class*='qr' i]",
-                "button:has-text('Войти')"
-            ]
-            for sel in login_indicators:
-                try:
-                    el = page.locator(sel).first
-                    if el.is_visible(timeout=500):
-                        return False
-                except:
-                    continue
+        current_path = urlparse(current_url).path.lower()
+        if re.search(r"/(?:auth|login|signin|sign-in)(?:/|$)", current_path):
+            return False
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=1000).casefold()
+        except Exception:
+            body_text = ""
+        login_text_markers = (
+            "sign in to max via qr code",
+            "scan the qr code to sign in",
+            "sign in with phone number",
+            "enter your phone number",
+            "enter the verification code",
+            "enter code",
+            "войти по номеру телефона",
+            "введите номер телефона",
+            "введите код",
+            "код подтверждения",
+        )
+        if any(marker in body_text for marker in login_text_markers):
+            return False
+
+        login_indicators = (
+            "input[type='password']",
+            "input[type='tel']",
+            "input[autocomplete='one-time-code']",
+            "input[name*='otp' i]",
+            "input[name*='code' i]",
+            "div[class*='qr' i]",
+            "canvas[class*='qr' i]",
+            "img[class*='qr' i]",
+            "button:has-text('Sign in')",
+            "button:has-text('Войти')",
+            "text=Sign in with phone number",
+        )
+        for selector in login_indicators:
+            try:
+                if page.locator(selector).first.is_visible(timeout=150):
+                    return False
+            except Exception:
+                continue
         return True
     except Exception as e:
         print(f"️ Ошибка проверки авторизации: {e}")
         return False
 
 def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int = 60000):
-    """Retry one transient MAX navigation failure and identify it in console logs."""
+    """Retry transient MAX network failures with a short exponential backoff."""
     retryable_errors = (
         "err_connection_closed",
         "err_connection_reset",
+        "err_connection_aborted",
+        "err_connection_refused",
         "err_timed_out",
         "err_network_changed",
         "err_name_not_resolved",
         "err_tunnel_connection_failed",
+        "err_internet_disconnected",
+        "err_ssl_protocol_error",
     )
-    for attempt in range(1, 3):
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
         try:
             return page.goto(url, timeout=timeout, wait_until="domcontentloaded")
         except Exception as exc:
             error_text = str(exc).lower()
-            if attempt >= 2 or not any(marker in error_text for marker in retryable_errors):
+            network_error = next(
+                (marker.upper() for marker in retryable_errors if marker in error_text),
+                type(exc).__name__,
+            )
+            if attempt >= max_attempts or not any(marker in error_text for marker in retryable_errors):
+                debug_logger.error(
+                    "MAX_NAVIGATION_FAILED chat_id=%s stage=%s attempts=%s error=%s",
+                    chat_id, stage, attempt, network_error,
+                )
                 raise
-            page.wait_for_timeout(2000)
+            delay_seconds = min(2 ** attempt, 8)
+            debug_logger.warning(
+                "MAX_NAVIGATION_RETRY chat_id=%s stage=%s attempt=%s/%s delay_seconds=%s error=%s",
+                chat_id, stage, attempt + 1, max_attempts, delay_seconds, network_error,
+            )
+            print(
+                f"[{chat_id}] ⚠️ Сетевой сбой при этапе «{stage}». "
+                f"Повтор {attempt + 1}/{max_attempts} через {delay_seconds} сек."
+            )
+            time.sleep(delay_seconds)
 
 def _get_password_input(page):
     password_selectors = [
@@ -113,7 +205,7 @@ def _get_password_input(page):
     for sel in password_selectors:
         try:
             el = page.locator(sel).first
-            if el.is_visible(timeout=1000):
+            if el.is_visible(timeout=150):
                 return el
         except:
             continue
@@ -123,6 +215,8 @@ def _get_phone_input(page):
     selectors = [
         "input[type='tel']",
         "input[autocomplete='tel']",
+        "input[autocomplete='tel-national']",
+        "input[inputmode='tel']",
         "input[name*='phone' i]",
         "input[placeholder*='телефон' i]",
         "input[placeholder*='phone' i]",
@@ -132,54 +226,150 @@ def _get_phone_input(page):
     for selector in selectors:
         try:
             element = page.locator(selector).first
-            if element.is_visible(timeout=700):
+            if element.is_visible(timeout=250):
                 return element
         except Exception:
             continue
     return None
 
 
+def _wait_for_phone_input(page, timeout_seconds: float = 15.0):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        phone_input = _get_phone_input(page)
+        if phone_input:
+            return phone_input
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        page.wait_for_timeout(min(250, max(1, int(remaining * 1000))))
+
+
 def _get_login_code_input(page):
-    selectors = [
+    try:
+        body_text = page.locator("body").inner_text(timeout=500).casefold()
+    except Exception:
+        body_text = ""
+    code_prompt_markers = (
+        "verification code",
+        "enter code",
+        "enter the code",
+        "code was sent",
+        "code has been sent",
+        "we sent a code",
+        "we've sent a code",
+        "enter the code we sent",
+        "check your phone",
+        "text message",
+        "check your messages",
+        "sms code",
+        "код подтверждения",
+        "введите код",
+        "код отправлен",
+        "мы отправили код",
+        "код отправлен на",
+        "проверьте телефон",
+        "смс",
+        "проверьте сообщения",
+    )
+    code_prompt_visible = any(marker in body_text for marker in code_prompt_markers)
+    explicit_code_selectors = [
         "input[autocomplete='one-time-code']",
-        "input[inputmode='numeric']",
         "input[name*='otp' i]",
         "input[name*='verification' i]",
         "input[name*='code' i]",
         "input[placeholder*='код' i]",
         "input[placeholder*='code' i]",
+        "input[aria-label*='код' i]",
+        "input[aria-label*='code' i]",
     ]
+    # A semantic OTP field is strong evidence that MAX advanced, even if the
+    # UI keeps the phone number visible beside it during a transition.
+    for selector in explicit_code_selectors:
+        try:
+            element = page.locator(selector).first
+            if not element.is_visible(timeout=150):
+                continue
+            hints = " ".join(
+                str(element.get_attribute(attribute) or "")
+                for attribute in ("name", "placeholder", "aria-label", "autocomplete")
+            )
+            if re.search(r"phone|телефон|номер", hints, re.I):
+                continue
+            return element
+        except Exception:
+            continue
+
+    # Do not mistake a generic/numeric phone field for the code form. MAX must
+    # have removed the phone input and shown explicit code-step text first.
+    if _get_phone_input(page):
+        return None
+    if code_prompt_visible:
+        selectors = [
+            "input[inputmode='numeric']",
+            "input[maxlength='1']",
+            "input[type='text']",
+            "[role='textbox']",
+            "[contenteditable='true']",
+        ]
+    else:
+        selectors = []
     for selector in selectors:
         try:
             element = page.locator(selector).first
-            if not element.is_visible(timeout=700):
+            if not element.is_visible(timeout=150):
                 continue
-            if selector == "input[inputmode='numeric']":
-                hints = " ".join(
-                    str(element.get_attribute(attribute) or "")
-                    for attribute in ("name", "placeholder", "aria-label", "autocomplete")
-                )
-                if re.search(r"phone|телефон|номер", hints, re.I):
-                    continue
             return element
         except Exception:
             continue
     return None
 
 
+def _fill_login_code(page, code_input, digits: str) -> bool:
+    try:
+        if str(code_input.get_attribute("maxlength") or "") == "1":
+            candidates = page.locator("input[maxlength='1']")
+            fields = []
+            for index in range(candidates.count()):
+                field = candidates.nth(index)
+                try:
+                    if field.is_visible(timeout=150):
+                        fields.append(field)
+                except Exception:
+                    continue
+            if len(fields) >= len(digits):
+                for field, digit in zip(fields, digits):
+                    field.fill(digit, timeout=1500)
+                return True
+            return False
+        code_input.fill(digits, timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
 def _click_phone_login_option(page):
     selectors = [
         "button:has-text('Войти по номеру телефона')",
         "button:has-text('Войти по телефону')",
+        "button:has-text('Вход по номеру телефона')",
+        "button:has-text('Вход по телефону')",
         "text=Войти по номеру телефона",
+        "text=Вход по номеру телефона",
         "text=Sign in with phone number",
         "text=Log in with phone number",
+        "[aria-label*='phone number' i]",
+        "[aria-label*='номер телефона' i]",
     ]
     for selector in selectors:
         try:
             element = page.locator(selector).first
-            if element.is_visible(timeout=700):
-                element.click()
+            if element.is_visible(timeout=250) and element.is_enabled(timeout=250):
+                try:
+                    element.click(timeout=1500)
+                except Exception:
+                    # The click may already have been dispatched before a slow transition.
+                    return True
                 return True
         except Exception:
             continue
@@ -202,8 +392,13 @@ def _click_submit_button(page):
     for sel in submit_selectors:
         try:
             el = page.locator(sel).first
-            if el.is_visible(timeout=1000):
-                el.click()
+            if el.is_visible(timeout=250) and el.is_enabled(timeout=250):
+                try:
+                    el.click(timeout=1500)
+                except Exception:
+                    # The click may have been dispatched before navigation or
+                    # a re-render timed out; do not submit the same form twice.
+                    return True
                 return True
         except:
             continue
@@ -211,6 +406,66 @@ def _click_submit_button(page):
         page.keyboard.press("Enter")
         return True
     except:
+        return False
+
+
+def _submit_phone_number(phone_input) -> bool:
+    """Submit the phone field using its own form, never a page-wide button."""
+    try:
+        form = phone_input.locator("xpath=ancestor::form[1]")
+        if form.count():
+            for selector in (
+                "button[type='submit']",
+                "input[type='submit']",
+                "[data-testid='submit-button']",
+                "button:has-text('Continue')",
+                "button:has-text('Next')",
+                "button:has-text('Send code')",
+                "button:has-text('Sign in')",
+                "button:has-text('Продолжить')",
+                "button:has-text('Далее')",
+                "button:has-text('Отправить код')",
+                "button:has-text('Войти')",
+            ):
+                try:
+                    button = form.locator(selector).first
+                    if not button.is_visible(timeout=200) or not button.is_enabled(timeout=200):
+                        continue
+                    try:
+                        button.click(timeout=3000)
+                    except Exception:
+                        # A slow page transition can time out after the click
+                        # has already reached MAX. Do not submit a second time.
+                        return True
+                    return True
+                except Exception:
+                    continue
+            # Some MAX builds use a custom div[role=button]. Click it only
+            # when it is the sole visible enabled action in the phone form.
+            try:
+                role_buttons = form.locator("[role='button']")
+                visible_buttons = []
+                for index in range(role_buttons.count()):
+                    button = role_buttons.nth(index)
+                    if button.is_visible(timeout=200) and button.is_enabled(timeout=200):
+                        visible_buttons.append(button)
+                if len(visible_buttons) == 1:
+                    try:
+                        visible_buttons[0].click(timeout=3000)
+                    except Exception:
+                        return True
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # If the form uses a custom submit control, submit from the focused phone
+    # field. This avoids accidentally clicking another visible page button.
+    try:
+        phone_input.press("Enter", timeout=3000)
+        return True
+    except Exception:
         return False
 
 class QRLoginSession:
@@ -271,8 +526,10 @@ class QRLoginSession:
     def _do_init(self):
         print(f"🔐 [Поток {self.chat_id}] Инициализация браузера...")
         self.pw = sync_playwright().start()
+        self.auth_browser_headless = True
+        print(f"🔐 [Поток {self.chat_id}] Браузер авторизации: headless")
         self.browser = self.pw.chromium.launch(
-            headless=True,
+            headless=self.auth_browser_headless,
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
         )
         self.context = self.browser.new_context(
@@ -295,53 +552,72 @@ class QRLoginSession:
         if self.status not in ("waiting", "awaiting_phone"):
             self.result_queue.put(("error", "Сессия входа не активна"))
             return
+        if _wait_for_phone_input(self.page, timeout_seconds=1.0):
+            self.status = "awaiting_phone"
+            self.result_queue.put(("awaiting_phone", None))
+            return
         if not _click_phone_login_option(self.page):
             self.result_queue.put(("error", "Кнопка входа по номеру телефона не найдена"))
             return
-        self.page.wait_for_timeout(800)
-        if not _get_phone_input(self.page):
-            self.screenshot_bytes = self.page.screenshot(full_page=True)
+        if not _wait_for_phone_input(self.page):
             self.result_queue.put(("error", "MAX не показал поле номера телефона"))
             return
         self.status = "awaiting_phone"
-        self.screenshot_bytes = self.page.screenshot(full_page=True)
-        self.result_queue.put(("awaiting_phone", self.screenshot_bytes))
+        self.result_queue.put(("awaiting_phone", None))
 
     def _do_enter_phone(self, phone: str):
-        if self.status != "awaiting_phone":
+        if self.status not in ("waiting", "awaiting_phone"):
             self.result_queue.put(("error", "Сейчас номер телефона не запрашивается"))
             return
         try:
+            if _is_logged_in(self.page):
+                self.context.storage_state(path=self.session_file)
+                self._do_close()
+                self.result_queue.put(("success", self.session_file))
+                return
             digits = re.sub(r"\D", "", str(phone or ""))
             if not 7 <= len(digits) <= 15:
                 self.result_queue.put(("error", "Проверьте формат номера телефона"))
                 return
             phone_input = _get_phone_input(self.page)
             if not phone_input:
+                # MAX can finish rendering the phone form after the bot has
+                # already prompted the user. Re-open it before reporting failure.
+                _click_phone_login_option(self.page)
+                phone_input = _wait_for_phone_input(self.page, timeout_seconds=12.0)
+            if not phone_input:
                 self.result_queue.put(("error", "Поле номера телефона не найдено"))
                 return
-            phone_input.fill("+" + digits)
-            if not _click_submit_button(self.page):
-                self.page.keyboard.press("Enter")
-            self.page.wait_for_timeout(5000)
-            if _is_logged_in(self.page):
-                self.context.storage_state(path=self.session_file)
-                self._do_close()
-                self.result_queue.put(("success", self.session_file))
+            phone_input.fill("+" + digits, timeout=5000)
+            if not _submit_phone_number(phone_input):
+                self.result_queue.put(("error", "Не удалось отправить номер в форме MAX"))
                 return
-            if _get_password_input(self.page):
-                self.status = "awaiting_password"
-                self.screenshot_bytes = self.page.screenshot(full_page=True)
-                self.result_queue.put(("awaiting_password", self.screenshot_bytes))
-                return
-            if _get_login_code_input(self.page):
-                self.status = "awaiting_code"
-                self.screenshot_bytes = self.page.screenshot(full_page=True)
-                self.result_queue.put(("awaiting_code", self.screenshot_bytes))
-                return
-            self.status = "waiting"
-            self.screenshot_bytes = self.page.screenshot(full_page=True)
-            self.result_queue.put(("waiting", self.screenshot_bytes))
+            deadline = time.monotonic() + 25
+            while True:
+                if _is_logged_in(self.page):
+                    self.context.storage_state(path=self.session_file)
+                    self._do_close()
+                    self.result_queue.put(("success", self.session_file))
+                    return
+                if _has_auth_captcha(self.page):
+                    self.status = "awaiting_human"
+                    self.result_queue.put(("awaiting_human", "captcha"))
+                    return
+                if _get_password_input(self.page):
+                    self.status = "awaiting_password"
+                    self.result_queue.put(("awaiting_password", None))
+                    return
+                if _get_login_code_input(self.page):
+                    self.status = "awaiting_code"
+                    self.result_queue.put(("awaiting_code", None))
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                self.page.wait_for_timeout(500)
+            # Do not loop the user back to re-enter the number. A challenge,
+            # rate limit, or changed MAX screen needs inspection first.
+            self.status = "awaiting_human"
+            self.result_queue.put(("awaiting_human", "transition_timeout"))
         except Exception as e:
             self.result_queue.put(("error", f"Не удалось отправить номер в MAX: {str(e)[:200]}"))
 
@@ -356,26 +632,41 @@ class QRLoginSession:
                 return
             code_input = _get_login_code_input(self.page)
             if not code_input:
-                self.result_queue.put(("error", "Поле кода подтверждения не найдено"))
+                deadline = time.monotonic() + 10
+                while not code_input and time.monotonic() < deadline:
+                    self.page.wait_for_timeout(300)
+                    code_input = _get_login_code_input(self.page)
+                if not code_input:
+                    self.result_queue.put(("error", "Поле кода подтверждения не найдено"))
+                    return
+            if not _fill_login_code(self.page, code_input, digits):
+                self.result_queue.put(("error", "Не удалось заполнить поле кода MAX полностью"))
                 return
-            code_input.fill(digits)
             if not _click_submit_button(self.page):
                 self.page.keyboard.press("Enter")
-            self.page.wait_for_timeout(6000)
-            if _is_logged_in(self.page):
-                self.context.storage_state(path=self.session_file)
-                self._do_close()
-                self.result_queue.put(("success", self.session_file))
-                return
-            if _get_password_input(self.page):
-                self.status = "awaiting_password"
-                self.screenshot_bytes = self.page.screenshot(full_page=True)
-                self.result_queue.put(("awaiting_password", self.screenshot_bytes))
-                return
+            deadline = time.monotonic() + 20
+            while True:
+                if _is_logged_in(self.page):
+                    self.context.storage_state(path=self.session_file)
+                    self._do_close()
+                    self.result_queue.put(("success", self.session_file))
+                    return
+                if _get_password_input(self.page):
+                    self.status = "awaiting_password"
+                    self.screenshot_bytes = self.page.screenshot(full_page=True)
+                    self.result_queue.put(("awaiting_password", self.screenshot_bytes))
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                self.page.wait_for_timeout(500)
             if _get_login_code_input(self.page):
                 self.status = "awaiting_code"
                 self.screenshot_bytes = self.page.screenshot(full_page=True)
                 self.result_queue.put(("wrong_code", self.screenshot_bytes))
+                return
+            if _get_phone_input(self.page):
+                self.status = "awaiting_phone"
+                self.result_queue.put(("awaiting_phone", None))
                 return
             self.status = "waiting"
             self.screenshot_bytes = self.page.screenshot(full_page=True)
@@ -399,13 +690,17 @@ class QRLoginSession:
         self.result_queue.put(("waiting", self.screenshot_bytes))
 
     def _do_check(self):
-        if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code"):
+        if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code", "awaiting_human"):
             self.result_queue.put(("error", "Сессия не активна"))
             return
         if _is_logged_in(self.page):
             self.context.storage_state(path=self.session_file)
             self._do_close()
             self.result_queue.put(("success", self.session_file))
+            return
+        if _has_auth_captcha(self.page):
+            self.status = "awaiting_human"
+            self.result_queue.put(("awaiting_human", "captcha"))
             return
         password_input = _get_password_input(self.page)
         if password_input:
@@ -423,7 +718,10 @@ class QRLoginSession:
             self.screenshot_bytes = self.page.screenshot(full_page=True)
             self.result_queue.put(("awaiting_phone", self.screenshot_bytes))
             return
-        self.result_queue.put(("waiting", None))
+        if self.status == "awaiting_human":
+            self.result_queue.put(("awaiting_human", "transition_timeout"))
+        else:
+            self.result_queue.put(("waiting", None))
 
     def _do_enter_password(self, password: str):
         """Вводит пароль в поле и нажимает кнопку подтверждения"""
@@ -441,21 +739,28 @@ class QRLoginSession:
             submit_clicked = _click_submit_button(self.page)
             if not submit_clicked:
                 self.page.keyboard.press("Enter")
-            self.page.wait_for_timeout(7000)
-            current_url = self.page.url.lower()
-            url_changed = 'auth' not in current_url and 'login' not in current_url
-            logged_in = _is_logged_in(self.page)
-            password_gone = _get_password_input(self.page) is None
-            success_signals = sum([url_changed, logged_in, password_gone])
-            if success_signals >= 2:
-                self.context.storage_state(path=self.session_file)
-                self._do_close()
-                self.result_queue.put(("success", self.session_file))
-                return
-            if not password_gone:
+            deadline = time.monotonic() + 20
+            while True:
+                if _is_logged_in(self.page):
+                    self.context.storage_state(path=self.session_file)
+                    self._do_close()
+                    self.result_queue.put(("success", self.session_file))
+                    return
+                if _get_login_code_input(self.page):
+                    self.status = "awaiting_code"
+                    self.result_queue.put(("awaiting_code", None))
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                self.page.wait_for_timeout(500)
+            if _get_password_input(self.page):
                 self.screenshot_bytes = self.page.screenshot(full_page=True)
                 self.status = "awaiting_password"
                 self.result_queue.put(("wrong_password", self.screenshot_bytes))
+                return
+            if _get_phone_input(self.page):
+                self.status = "awaiting_phone"
+                self.result_queue.put(("awaiting_phone", None))
                 return
             self.screenshot_bytes = self.page.screenshot(full_page=True)
             self.status = "waiting"
@@ -504,14 +809,14 @@ class QRLoginSession:
     def start_phone_login(self):
         self.command_queue.put(("phone_login", None))
         try:
-            return self.result_queue.get(timeout=15)
+            return self.result_queue.get(timeout=30)
         except queue.Empty:
             return ("error", "Таймаут переключения на вход по номеру")
 
     def enter_phone(self, phone: str):
         self.command_queue.put(("phone", phone))
         try:
-            return self.result_queue.get(timeout=20)
+            return self.result_queue.get(timeout=60)
         except queue.Empty:
             return ("error", "Таймаут ввода номера телефона")
 
