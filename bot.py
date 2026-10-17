@@ -8,6 +8,8 @@ import json
 import threading
 import traceback
 import unicodedata
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from telebot import types
 from dotenv import load_dotenv
@@ -43,6 +45,64 @@ awaiting_password_from = {}
 awaiting_phone_from = {}
 awaiting_code_from = {}
 support_sessions = set(get_open_support_sessions())
+
+
+def _video_upload_details(media: dict, post: dict) -> dict:
+    """Build Telegram video duration and thumbnail metadata from the actual file."""
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return {}
+    result = {}
+    try:
+        duration = float(media.get("duration") or post.get("media_duration_seconds") or 0)
+        if duration > 0:
+            result["duration"] = max(1, int(round(duration)))
+    except (TypeError, ValueError):
+        pass
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    if not ffmpeg:
+        return result
+
+    try:
+        probe = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-i", "pipe:0", "-frames:v", "1",
+                "-vf", "scale=320:320:force_original_aspect_ratio=decrease,setsar=1",
+                "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+            ],
+            input=bytes(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=18, check=False,
+        )
+        details = probe.stderr.decode("utf-8", "replace")
+        duration_match = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", details)
+        if duration_match and "duration" not in result:
+            seconds = (
+                int(duration_match.group(1)) * 3600
+                + int(duration_match.group(2)) * 60
+                + float(duration_match.group(3))
+            )
+            if seconds > 0:
+                result["duration"] = max(1, int(round(seconds)))
+        dimensions = re.search(r"Video:.*?\b(\d{2,5})x(\d{2,5})(?:\s|,|\[|$)", details)
+        if dimensions:
+            result["width"] = int(dimensions.group(1))
+            result["height"] = int(dimensions.group(2))
+        thumbnail = probe.stdout
+        if thumbnail.startswith(b"\xff\xd8\xff") and len(thumbnail) < 200_000:
+            result["thumbnail"] = thumbnail
+    except Exception as exc:
+        debug_logger.warning(
+            "VIDEO_METADATA_PROBE_FAILED source_id=%s error=%s",
+            post.get("source_id") or post.get("idx") or "?", log_preview(exc, 180),
+        )
+    return result
 support_message_routes = get_support_message_routes()
 support_state_lock = threading.RLock()
 PARSE_DIAGNOSTICS = {}
@@ -578,11 +638,18 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 _telegram_call(bot.send_video_note,chat_id,obj)
                 caption_pending=False
             elif media_type=="video":
+                video_details = _video_upload_details(media, post)
+                thumbnail = video_details.pop("thumbnail", None)
+                if thumbnail:
+                    thumbnail_file = io.BytesIO(thumbnail)
+                    thumbnail_file.name = "video-thumbnail.jpg"
+                    video_details["thumbnail"] = thumbnail_file
+                video_options = {"supports_streaming": True, **video_details}
                 if caption_pending and len(msg_text)<=1024:
-                    _telegram_call(bot.send_video,chat_id,obj,caption=msg_text,supports_streaming=True)
+                    _telegram_call(bot.send_video,chat_id,obj,caption=msg_text,**video_options)
                     caption_pending=False
                 else:
-                    _telegram_call(bot.send_video,chat_id,obj,supports_streaming=True)
+                    _telegram_call(bot.send_video,chat_id,obj,**video_options)
             elif media_type=="voice":
                 try:
                     _telegram_call(bot.send_voice,chat_id,obj)
@@ -4246,9 +4313,9 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "<b>Подключение MAX → Telegram</b>\n\n"
                     "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
                     "<blockquote><b>1️⃣ Ваш аккаунт MAX</b>\n"
-                    "Основной вход — по QR-коду. На экране входа можно открыть защищённую страницу и войти по номеру телефона самостоятельно.</blockquote>\n"
+                    "В данном способе вы даете доступ к своему аккаунту, после бот будет просмотривать ТОЛЬКО ту группу, которую вы указали.</blockquote>\n"
                     "<blockquote><b>2️⃣ Аккаунт проекта</b>\n"
-                    f"В исходную группу добавляется аккаунт MAX проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>. "
+                    f"В группу добавляется аккаунт MAX проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>. "
                     "После отправки ссылки бот проверит, может ли аккаунт открыть источник.</blockquote>\n\n"
                     "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
                 ),

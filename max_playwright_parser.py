@@ -587,6 +587,59 @@ class QRLoginSession:
             value = args.get("text")
             if not isinstance(value, str) or not value or len(value) > 256 or "\x00" in value:
                 raise ValueError("Недопустимый текст ввода")
+            focused = self.page.evaluate("""() => {
+                const isVisible = el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.visibility !== 'collapse';
+                };
+                const isEditable = el => {
+                    if (!(el instanceof HTMLElement) || !isVisible(el)) return false;
+                    if (el.tagName === 'INPUT') {
+                        return !el.disabled && !el.readOnly &&
+                            !['hidden', 'button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'search'].includes(el.type);
+                    }
+                    return el.tagName === 'TEXTAREA'
+                        ? !el.disabled && !el.readOnly
+                        : el.isContentEditable || el.getAttribute('role') === 'textbox';
+                };
+                const score = el => {
+                    if (!isEditable(el)) return -1000;
+                    const details = [el.type, el.name, el.id, el.placeholder,
+                        el.getAttribute('aria-label'), el.getAttribute('autocomplete'),
+                        el.getAttribute('inputmode'), el.getAttribute('data-testid')].join(' ').toLowerCase();
+                    if (/search|поиск/.test(details) && !/code|otp|код|phone|телефон|номер/.test(details)) return -1000;
+                    let value = el.tagName === 'INPUT' ? 10 : 0;
+                    if (/one-time-code|otp|verification|verify|sms|код|подтверж/.test(details)) value += 100;
+                    if (/phone|телефон|номер/.test(details)) value += 80;
+                    if (el.type === 'tel') value += 35;
+                    if (/numeric|decimal|tel/.test(el.getAttribute('inputmode') || '')) value += 30;
+                    if (el.type === 'password') value += 25;
+                    if (el.type === 'text') value += 10;
+                    return value;
+                };
+                const candidates = [...document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')];
+                if (!candidates.length) return false;
+                const active = document.activeElement;
+                const activeScore = candidates.includes(active) ? score(active) : -1000;
+                let best = null, bestScore = -1000;
+                for (const candidate of candidates) {
+                    const candidateScore = score(candidate);
+                    if (candidateScore > bestScore) {
+                        best = candidate;
+                        bestScore = candidateScore;
+                    }
+                }
+                if (activeScore >= bestScore && activeScore >= 0) return true;
+                if (!best || bestScore < 0) return false;
+                best.focus({preventScroll: true});
+                return document.activeElement === best;
+            }""")
+            if not focused:
+                raise ValueError("Поле ввода MAX не найдено; откройте форму телефона или кода")
             # Use real, ordered key events so MAX's code/phone inputs process
             # each character. A single insert_text call behaves like paste
             # and is ignored by some of MAX's segmented verification fields.
@@ -3109,11 +3162,9 @@ def _extract_live_rich_media(page, msg: dict, chat_id: int = 0) -> list[dict]:
             if not url or url in seen: continue
             seen.add(url)
             low=str(item.get('meta') or '').lower()
-            w=float(item.get('width') or 0); h=float(item.get('height') or 0)
-            square=item.get('tag') in ('video','canvas') and w>20 and h>20 and abs(w-h)<=24
-            if re.search(r'video.?note|videonote|video[_ -]?message|кружок|circle|round.?video|roundvideo',low,re.I) or square: typ='video_note'
+            if re.search(r'video.?note|videonote|кружок|кружочек|round.?video|roundvideo',low,re.I): typ='video_note'
             elif re.search(r'voice|voice.?message|voice_message|attach.?audio|waveform|голосов(?:ое|ая|ым|ого)|аудиосообщ',low,re.I): typ='voice'
-            elif item.get('tag')=='video': typ='video'
+            elif item.get('tag')=='video' or re.search(r'(^|[\s_-])video(?:[\s_-]|message|$)|movie|mp4',low,re.I): typ='video'
             else: typ='audio'
             media=_download_document_to_memory(page=page,context=page.context,url=url,filename='',chat_id=chat_id,media_type=typ)
             if media and media.get('bytes'):
@@ -4099,6 +4150,13 @@ def parse_max_group_media(
                         const bubble = row.querySelector(".bubbleContent");
                         if (!bubble) return {text:"", links:[], emojiTexts:[]};
                         const clone = bubble.cloneNode(true);
+                        const reactionSelectors = [
+                            '[class*="reaction" i]', '[data-testid*="reaction" i]',
+                            '[data-reaction]', '[data-reaction-id]', '[data-reaction-count]',
+                            '[aria-label*="reaction" i]', '[title*="reaction" i]',
+                            '[aria-label*="реакц" i]', '[title*="реакц" i]'
+                        ].join(",");
+                        try { clone.querySelectorAll(reactionSelectors).forEach(el => el.remove()); } catch(e) {}
                         [
                             ".header", ".meta", "button.mark",
                             '[class*="reply" i]', '[class*="quoted" i]', '[class*="quote" i]', pollSelector
@@ -4467,10 +4525,10 @@ def parse_max_group_media(
                     }
                     function classify(meta, tag) {
                         meta = String(meta || "").toLowerCase();
-                        if (/video.?note|videonote|video[_ -]?message|кружок|circle|round.?video|roundvideo/.test(meta)) return "video_note";
+                        if (/video.?note|videonote|кружок|кружочек|round.?video|roundvideo/.test(meta)) return "video_note";
                         if (/voice|voice.?message|voice_message|голосов|аудиосообщ/.test(meta)) return "voice";
                         if (/emoji|эмодзи|animated.?emoji/.test(meta) && !/sticker|стикер/.test(meta)) return "emoji";
-                        if (tag === "video" || /(^|[ _-])video([ _-]|$)|movie|mp4/.test(meta)) return "video";
+                        if (tag === "video" || /(^|[ _-])video(?:[ _-]|message|$)|movie|mp4/.test(meta)) return "video";
                         if (tag === "audio" || /(^|[ _-])audio([ _-]|$)|ogg|opus|m4a|mp3/.test(meta)) return "audio";
                         if (/sticker/.test(meta)) return "image";
                         return "document";
@@ -4497,13 +4555,7 @@ def parse_max_group_media(
                             ancestorMeta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
                             if (!ancestorUrl) ancestorUrl = candidate(node);
                         }
-                        let shapeHint = "";
-                        try {
-                            const mediaElement = el.closest("video,audio") || el;
-                            const r = mediaElement.getBoundingClientRect();
-                            if (mediaTag === "video" && r.width > 0 && r.height > 0 && Math.abs(r.width-r.height) <= 8) shapeHint = " roundvideo";
-                        } catch(e) {}
-                        const meta = `${ancestorMeta}${shapeHint}`;
+                        const meta = ancestorMeta;
                         const url = candidate(el) || ancestorUrl;
                         if (url) push(classify(meta, mediaTag), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || safeAttr(el.parentElement || el,"data-filename") || "");
                     });
@@ -5068,13 +5120,7 @@ def parse_max_group_media(
                         let text = richContent.text;
                         // Emoji-only сообщения часто не имеют отдельного .text в MAX.
                         // Сохраняем сами эмодзи, не превращая время/служебный текст в сообщение.
-                        if (!text) {
-                            try {
-                                const emojiMatches = emojiClusters(fullRowText);
-                                if (emojiMatches.length) text = emojiMatches.join("");
-                            } catch(e) {}
-                            if (!text && emojiTexts.length) text = emojiTexts.join("");
-                        }
+                        if (!text && emojiTexts.length) text = emojiTexts.join("");
                         const time = getTime(row);
                         const date = getDate(row);
                         const replyBlock = getReplyBlock(row);
@@ -5115,26 +5161,11 @@ def parse_max_group_media(
                             .map(el=>clean(el.textContent)).filter(value=>/^\d{1,2}:\d{2}$/.test(value)).join(" ");
                         const hasDuration = Boolean(mediaDurationText);
                         const durationMatch = mediaDurationText.match(/^(\d{1,2}):(\d{2})/);
-                        const mediaDurationSeconds = durationMatch ? Number(durationMatch[1])*60 + Number(durationMatch[2]) : 0;
-                        const hasSquareMediaBox = !callLike && Array.from(bubble.querySelectorAll("video,[class*='video' i],[class*='круж' i],[data-testid*='video' i]")).some(el=>{
-                            try {
-                                const r=el.getBoundingClientRect();
-                                return r.width>55 && r.height>55 && Math.abs(r.width-r.height)<=24;
-                            } catch(e) { return false; }
-                        });
-                        const durationWithSquareParent = !callLike && hasDuration && Array.from(bubble.querySelectorAll("*"))
-                            .filter(el=>String(el.textContent||'').trim().match(/^\d{1,2}:\d{2}$/))
-                            .some(el=>{
-                                let n=el;
-                                for(let d=0; n && d<5; d++, n=n.parentElement){
-                                    try {
-                                        const r=n.getBoundingClientRect();
-                                        if(r.width>70 && r.height>70 && Math.abs(r.width-r.height)<=28) return true;
-                                    } catch(e) {}
-                                }
-                                return false;
-                            });
-                        let videoNoteHint = !callLike && (/video.?note|videonote|video[_ -]?message|кружок|кружочек|round.?video|roundvideo/.test(mediaMeta) || richAttachments.some(a=>a.type==="video_note") || hasSquareMediaBox || durationWithSquareParent || !!Array.from(bubble.querySelectorAll('video')).some(el=>{try{const r=el.getBoundingClientRect();return r.width>30&&r.height>30&&Math.abs(r.width-r.height)<=18;}catch(e){return false;}}));
+                        const liveVideoDuration = Array.from(bubble.querySelectorAll("video"))
+                            .map(el => Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 0)
+                            .find(value => value > 0) || 0;
+                        const mediaDurationSeconds = (durationMatch ? Number(durationMatch[1])*60 + Number(durationMatch[2]) : 0) || liveVideoDuration;
+                        let videoNoteHint = !callLike && (/video.?note|videonote|кружок|кружочек|round.?video|roundvideo/.test(mediaMeta) || richAttachments.some(a=>a.type==="video_note"));
                         let voiceHint = !videoNoteHint && !callLike && (/(?:voice|voice.?message|voice_message|attach.?audio|waveform|голосов(?:ое|ая|ым|ого)(?:\s+(?:сообщение|запись|файл))?|аудиосообщ)/.test(deepMediaMeta) || richAttachments.some(a=>a.type==="voice") || bubble.querySelector('audio')!=null || (hasDuration && /audio|attach.?audio|waveform|голосов(?:ое|ая)/.test(deepMediaMeta)));
                         const special = getSpecialContent(bubble, row);
                         // Vote controls include the Russian word "голосовать"; they must
@@ -5155,7 +5186,7 @@ def parse_max_group_media(
                         // Не выбрасываем такую строку здесь: Python объединит её с основным
                         // опросом и удалит после переноса количества голосов.
                         // Длительность кружка/голосового не является текстом сообщения.
-                        if (videoNoteHint || voiceHint || richAttachments.some(a => a.type === "video_note" || a.type === "voice")) {
+                        if (videoNoteHint || voiceHint || bubble.querySelector("video") || richAttachments.some(a => a.type === "video" || a.type === "video_note" || a.type === "voice")) {
                             if (/^\s*\d{1,2}:\d{2}\s*$/.test(text)) text = "";
                         }
                         if (special.location) {
@@ -5433,24 +5464,18 @@ def parse_max_group_media(
                 for a in (msg.get("attachments") or [])
             )
             emoji_image_urls = {str(u).strip() for u in (msg.get("emoji_image_urls") or []) if str(u).strip()}
-            emoji_fallback_urls = set()
-            if not (msg.get("emoji_texts") or []):
-                # A custom MAX emoji can hide its Unicode value. Preserve its visual
-                # instead of silently dropping the message; animated assets are reduced
-                # to a static emoji photo below, while sticker animations stay videos.
-                emoji_fallback_urls = set(emoji_image_urls)
-                image_urls.extend(sorted(emoji_fallback_urls))
-                seen_image_urls.update(emoji_fallback_urls)
+            # MAX emoji assets are inline glyphs, not standalone photo attachments.
+            # Keep Unicode in the message text and omit assets whose glyph MAX hides.
             for u in (msg.get("images", []) or []):
                 u=str(u or "").strip()
-                if not u or (u in emoji_image_urls and u not in emoji_fallback_urls):
+                if not u or u in emoji_image_urls:
                     continue
                 if u not in seen_image_urls:
                     seen_image_urls.add(u); image_urls.append(u)
             # Повторно читаем живую карточку: именно captioned-photo часто получает
             # настоящий src только после того, как карточка попала в viewport.
             for u in _refresh_card_image_urls(page, msg, chat_id=chat_id):
-                if u in emoji_image_urls and u not in emoji_fallback_urls:
+                if u in emoji_image_urls:
                     continue
                 if u not in seen_image_urls:
                     seen_image_urls.add(u); image_urls.append(u)
@@ -5488,8 +5513,6 @@ def parse_max_group_media(
                     page=page,
                 )
                 if media and media.get("bytes"):
-                    if img_url in emoji_fallback_urls:
-                        media["_emoji_fallback"] = True
                     detected_type = media.get("type")
                     if detected_type in {"video", "audio"}:
                         non_image_urls.add(img_url)
@@ -5541,9 +5564,7 @@ def parse_max_group_media(
                     continue
                 att_type = attachment.get("type") or "document"
                 if att_type == "emoji":
-                    if msg.get("emoji_texts"):
-                        continue
-                    att_type = "image"
+                    continue
                 if att_type == "video" and msg.get("video_note_hint"):
                     att_type = "video_note"
                 elif att_type == "audio" and msg.get("voice_hint"):
@@ -5557,8 +5578,6 @@ def parse_max_group_media(
                     media_type=att_type,
                 )
                 if media and media.get("bytes"):
-                    if attachment.get("type") == "emoji":
-                        media["_emoji_fallback"] = True
                     media_kind = _media_payload_kind(media)
                     expected_type = "video" if msg.get("video_note_hint") else "audio" if msg.get("voice_hint") else ""
                     if expected_type and media_kind != expected_type:
@@ -5653,7 +5672,7 @@ def parse_max_group_media(
             visual_duplicate_count = 0
             if msg.get("sticker_hint"):
                 for media in media_files:
-                    if media.get("type") in {"image", "sticker"} and not media.get("_emoji_fallback"):
+                    if media.get("type") in {"image", "sticker"}:
                         media["_sticker_fallback"] = True
             for media in media_files:
                 if (msg.get("video_note_hint") or msg.get("voice_hint")) and not _media_satisfies_hint(media, msg):
@@ -5669,9 +5688,7 @@ def parse_max_group_media(
                     media["type"] = "video_note"
                 elif msg.get("voice_hint") and media.get("type") == "audio":
                     media["type"] = "voice"
-                if media.get("_emoji_fallback"):
-                    media = _prepare_static_emoji_image(media, chat_id=chat_id)
-                elif media.get("_sticker_fallback"):
+                if media.get("_sticker_fallback"):
                     media = _record_animated_image_as_video(media, chat_id=chat_id)
                     if media.get("type") in {"image", "sticker"}:
                         media = _prepare_static_sticker_image(media, chat_id=chat_id)
