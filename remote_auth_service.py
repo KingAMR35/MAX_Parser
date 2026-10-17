@@ -21,45 +21,43 @@ COOKIE_NAME = "max_remote_auth"
 PAGE = r"""<!doctype html>
 <html lang="ru">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=4,user-scalable=yes">
 <meta name="referrer" content="no-referrer"><title>Вход в MAX</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#101522;color:#f4f6fb;font:16px/1.45 system-ui,-apple-system,sans-serif}
-main{max-width:1080px;margin:auto;padding:18px}h1{font-size:21px;margin:0 0 8px}.notice{color:#d9e0ef;font-size:14px;margin:0 0 14px}
-.toolbar{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap}button{border:0;border-radius:10px;background:#3275d9;color:white;padding:11px 14px;font-weight:650;font-size:15px}
-#screen{display:block;width:100%;max-height:72vh;object-fit:contain;background:#05070b;border-radius:12px;touch-action:none;user-select:none;-webkit-user-select:none}
-#state{min-height:24px;margin-top:10px;color:#cbd6eb}#keyboard{display:block;width:100%;height:44px;margin-top:9px;border:1px solid #64718a;border-radius:9px;background:#182131;color:#fff;padding:9px 11px;font:16px system-ui,sans-serif;resize:none}
-.warning{background:#282231;border:1px solid #644653;padding:12px;border-radius:10px;font-size:13px;margin-top:14px}
+main{max-width:1080px;margin:auto;padding:clamp(9px,2vw,18px)}h1{font-size:21px;margin:0 0 8px}.notice{color:#d9e0ef;font-size:14px;margin:0 0 12px}
+.toolbar{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}button{border:0;border-radius:10px;background:#3275d9;color:white;padding:11px 14px;font-weight:650;font-size:15px;touch-action:manipulation}button:disabled{opacity:.6}
+#screenFrame{width:100%;max-height:68vh;overflow:auto;background:#05070b;border-radius:12px}#screen{display:block;width:100%;height:auto;max-height:68vh;object-fit:contain;user-select:none;-webkit-user-select:none;touch-action:pan-x pan-y}#screenFrame.zoomed #screen{width:160%;max-height:none}
+#state{min-height:24px;margin-top:8px;color:#cbd6eb}.inputRow{display:flex;gap:8px;align-items:stretch;margin-top:8px}#keyboard{display:block;flex:1;min-width:0;width:100%;height:54px;border:1px solid #64718a;border-radius:9px;background:#182131;color:#fff;padding:11px;font:18px system-ui,sans-serif;resize:vertical}#sendButton{min-width:150px;min-height:54px;background:#16845a}
+.warning{background:#282231;border:1px solid #644653;padding:12px;border-radius:10px;font-size:13px;margin-top:12px}
+@media(max-width:600px){main{padding:10px}h1{font-size:19px}.notice{font-size:14px;line-height:1.4}.toolbar{gap:6px}.toolbar button{padding:10px 11px;font-size:14px}#screenFrame{max-height:58dvh}#screen{max-height:58dvh}.inputRow{gap:6px}#keyboard{height:56px;padding:10px;font-size:18px}#sendButton{min-width:108px;padding:9px;font-size:14px}.warning{padding:10px;font-size:12px}}
 </style></head>
 <body><main>
 <h1>🔐 Вход в MAX</h1>
-<p class="notice">Управляйте страницей MAX ниже. Нажмите «Клавиатура», затем вводите номер, код или пароль в поле ввода — текст отправится в выбранное поле MAX. Не отправляйте их в Telegram.</p>
-<div class="toolbar"><button id="keyboardButton" type="button">⌨️ Клавиатура</button><button id="refreshButton" type="button">🔄 Обновить экран</button></div>
-<img id="screen" alt="Экран входа MAX">
-<textarea id="keyboard" rows="1" placeholder="Поле ввода MAX · сначала выберите поле на экране" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Ввод на странице MAX"></textarea>
+<p class="notice">Сначала нажмите на нужное поле на экране MAX. Затем нажмите «Ввести текст», введите или исправьте текст ниже и отправьте его целиком кнопкой. Enter отправляет текст и нажимает Enter в MAX. Не отправляйте код в Telegram.</p>
+<div class="toolbar"><button id="keyboardButton" type="button">⌨️ Ввести текст</button><button id="refreshButton" type="button">🔄 Обновить экран</button><button id="zoomButton" type="button">🔍 Увеличить экран</button></div>
+<div id="screenFrame"><img id="screen" alt="Экран входа MAX"></div>
+<div class="inputRow"><textarea id="keyboard" rows="1" maxlength="256" placeholder="Введите номер, код или пароль" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Черновик текста для MAX"></textarea><button id="sendButton" type="button">📨 Отправить в MAX</button></div>
 <div id="state">Подключаем защищённую сессию…</div>
 <div class="warning">Ссылка одноразовая и действительна 10 минут. Не пересылайте её. Страница/MAX и удалённый браузер технически обрабатывают введённые данные; сервис не записывает введённый текст в базу и не передаёт его в Telegram. После входа браузер сохранит сессию MAX на сервере и завершится.</div>
 </main><script>
-const screen=document.getElementById('screen'), box=document.getElementById('keyboard'), state=document.getElementById('state');
+const screen=document.getElementById('screen'), screenFrame=document.getElementById('screenFrame'), box=document.getElementById('keyboard'), state=document.getElementById('state'), sendButton=document.getElementById('sendButton'), zoomButton=document.getElementById('zoomButton');
 let stopped=false, ready=false, previousImageUrl=null;
-let typingTimer=null, actionQueue=Promise.resolve(), pendingActions=0;
-let observedText='', unsentText='', textDrainPromise=null;
+let actionQueue=Promise.resolve(), pendingActions=0, sendingDraft=false;
 function httpError(prefix,status){const reasons={400:'действие отклонено',401:'сессия авторизации не найдена',403:'сервер отклонил запрос страницы',404:'маршрут API не найден',410:'удалённая сессия завершена',500:'ошибка удалённого браузера',504:'удалённый браузер не ответил вовремя'};return prefix+': '+(reasons[status]||'ошибка сервера')+' (HTTP '+status+')';}
 async function post(path,data={}){const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok)throw new Error(httpError('Не удалось управлять MAX',r.status));return r.json().catch(()=>({}));}
 function action(name,values={}){if(!ready)return Promise.resolve(false);const run=async()=>{try{await post('/api/action',{action:name,...values});return true;}catch(e){if(e.message.includes('HTTP 401')){const s=await fetch('/api/status',{cache:'no-store',credentials:'same-origin'}).then(x=>x.json()).catch(()=>({}));if(s.status==='complete'){state.textContent='✅ Вход подтверждён. Можно закрыть эту страницу.';stopped=true;return false;}}state.textContent=e.message;return false;}finally{pendingActions--;}};pendingActions++;const queued=actionQueue.then(run,run);actionQueue=queued.catch(()=>false);return queued;}
-async function flushText(){if(typingTimer){clearTimeout(typingTimer);typingTimer=null;}if(textDrainPromise)return textDrainPromise;textDrainPromise=(async()=>{while(unsentText){const text=unsentText.slice(0,256);unsentText=unsentText.slice(text.length);const ok=await action('text',{text});if(!ok){unsentText=text+unsentText;return false;}if(box.value.startsWith(text)){box.value=box.value.slice(text.length);observedText=box.value;}else if(!box.value){observedText='';}}return true;})();try{return await textDrainPromise;}finally{textDrainPromise=null;}}
+async function sendDraft(andEnter=false){if(sendingDraft||!ready)return false;const text=box.value;if(!text&&!andEnter){state.textContent='Сначала введите текст в поле ниже.';box.focus({preventScroll:true});return false;}sendingDraft=true;sendButton.disabled=true;let ok=true;if(text){ok=await action('text',{text});if(ok&&box.value.startsWith(text))box.value=box.value.slice(text.length);}if(ok&&andEnter)ok=await action('key',{key:'Enter'});sendingDraft=false;sendButton.disabled=false;if(ok){state.textContent=text?'✅ Текст отправлен в MAX.':'↵ Enter отправлен в MAX.';box.focus({preventScroll:true});}return ok;}
 async function refreshScreen(manual=false){if(stopped||!ready)return false;if(manual)await actionQueue;else if(pendingActions)return false;try{const r=await fetch('/api/snapshot',{cache:'no-store',credentials:'same-origin'});if(r.ok){const nextUrl=URL.createObjectURL(await r.blob());screen.onload=()=>{if(previousImageUrl)URL.revokeObjectURL(previousImageUrl);previousImageUrl=nextUrl;};screen.src=nextUrl;if(manual)state.textContent='Экран MAX обновлён.';return true;}const s=await fetch('/api/status',{cache:'no-store',credentials:'same-origin'}).then(x=>x.json()).catch(()=>({}));if(s.status==='complete'){state.textContent='✅ Вход подтверждён. Можно закрыть эту страницу.';stopped=true;return false;}state.textContent=httpError('Не удалось получить экран MAX',r.status);if(r.status===401||r.status===410)stopped=true;return false;}catch(e){state.textContent='Нет связи с сервером удалённого входа: '+e.message;return false;}}
 async function poll(){if(stopped||!ready)return;await refreshScreen();if(!stopped)setTimeout(poll,1200);}
-document.getElementById('keyboardButton').onclick=()=>{box.focus();state.textContent='Клавиатура включена. Ввод направляется в MAX.';};
-document.getElementById('refreshButton').onclick=async()=>{if(await flushText())await refreshScreen(true);};
-screen.addEventListener('pointerdown',e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/1280,r.height/800),ox=(r.width-1280*scale)/2,oy=(r.height-800*scale)/2,x=Math.round((e.clientX-r.left-ox)/scale),y=Math.round((e.clientY-r.top-oy)/scale);if(x>=0&&x<1280&&y>=0&&y<800)flushText().then(ok=>{if(ok)action('click',{x,y});});});
-function scheduleTextFlush(){if(typingTimer)clearTimeout(typingTimer);typingTimer=setTimeout(()=>{flushText();},45);}
-function captureInput(e){if(e&&e.isComposing)return;const current=box.value;if(current.startsWith(observedText)){unsentText+=current.slice(observedText.length);}else if(!current){observedText='';}else{unsentText+=current;}observedText=current;if(unsentText)scheduleTextFlush();}
-box.addEventListener('input',captureInput);
-box.addEventListener('compositionend',()=>captureInput());
-box.addEventListener('keydown',async e=>{if(e.key.length===1||e.key==='Process')return;const allowed=['Enter','Tab','Backspace','Delete','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown',' '];if(allowed.includes(e.key)){e.preventDefault();if(await flushText())await action('key',{key:e.key===' '?'Space':e.key});}});
-screen.addEventListener('wheel',e=>{e.preventDefault();const deltaY=Math.max(-900,Math.min(900,Math.round(e.deltaY)));flushText().then(ok=>{if(ok)action('scroll',{deltaY});});},{passive:false});
-async function start(){const token=location.hash.slice(1);if(!token){state.textContent='Одноразовая ссылка не найдена. Запросите новую у бота.';stopped=true;return;}try{await post('/api/claim',{token});history.replaceState(null,'','/auth');ready=true;state.textContent='Страница MAX подключена. Используйте кнопки и нажимайте прямо на экран.';if(unsentText)flushText();poll();}catch(e){state.textContent='Ссылка уже использована, истекла или недоступна. Запросите новую у бота.';stopped=true;}}
+document.getElementById('keyboardButton').onclick=()=>{box.focus();state.textContent='Черновик можно исправлять до отправки.';};
+sendButton.onclick=()=>{box.focus({preventScroll:true});sendDraft(false);};
+document.getElementById('refreshButton').onclick=()=>refreshScreen(true);
+zoomButton.onclick=()=>{const zoomed=screenFrame.classList.toggle('zoomed');zoomButton.textContent=zoomed?'🔎 Уменьшить экран':'🔍 Увеличить экран';};
+screen.addEventListener('click',e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/1280,r.height/800),ox=(r.width-1280*scale)/2,oy=(r.height-800*scale)/2,x=Math.round((e.clientX-r.left-ox)/scale),y=Math.round((e.clientY-r.top-oy)/scale);if(x>=0&&x<1280&&y>=0&&y<800)action('click',{x,y});});
+box.addEventListener('keydown',async e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();await sendDraft(true);return;}if(box.value)return;const allowed=['Tab','Backspace','Delete','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown'];if(allowed.includes(e.key)){e.preventDefault();await action('key',{key:e.key});}});
+screen.addEventListener('wheel',e=>{if(screenFrame.classList.contains('zoomed'))return;e.preventDefault();action('scroll',{deltaY:Math.max(-900,Math.min(900,Math.round(e.deltaY)))});},{passive:false});
+async function start(){const token=location.hash.slice(1);if(!token){state.textContent='Одноразовая ссылка не найдена. Запросите новую у бота.';stopped=true;return;}try{await post('/api/claim',{token});history.replaceState(null,'','/auth');ready=true;state.textContent='Страница MAX подключена. Сначала выберите поле на экране, затем введите текст и отправьте его.';poll();}catch(e){state.textContent='Ссылка уже использована, истекла или недоступна. Запросите новую у бота.';stopped=true;}}
 start();
 </script></body></html>"""
 
