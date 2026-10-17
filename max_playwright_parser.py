@@ -107,6 +107,11 @@ def _is_logged_in(page) -> bool:
         if re.search(r"/(?:auth|login|signin|sign-in)(?:/|$)", current_path):
             return False
 
+        # Never treat an unfinished challenge as a successful login. MAX may
+        # remove the phone form briefly while switching to its code/CAPTCHA step.
+        if _get_password_input(page) or _get_login_code_input(page) or _get_phone_input(page):
+            return False
+
         try:
             body_text = page.locator("body").inner_text(timeout=1000).casefold()
         except Exception:
@@ -118,10 +123,25 @@ def _is_logged_in(page) -> bool:
             "enter your phone number",
             "enter the verification code",
             "enter code",
+            "code was sent",
+            "code has been sent",
+            "we sent a code",
+            "we've sent a code",
+            "enter the code we sent",
+            "check your phone",
+            "text message",
+            "sms code",
+            "verify your phone",
             "войти по номеру телефона",
             "введите номер телефона",
             "введите код",
             "код подтверждения",
+            "код отправлен",
+            "мы отправили код",
+            "выслали код",
+            "проверьте телефон",
+            "смс",
+            "подтвердите номер",
         )
         if any(marker in body_text for marker in login_text_markers):
             return False
@@ -485,6 +505,7 @@ class QRLoginSession:
         self.pw = None
         self.screenshot_bytes = None
         self.status = "init"
+        self._logged_in_confirmation_count = 0
 
     def start(self):
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -607,7 +628,7 @@ class QRLoginSession:
         self.page = self.context.new_page()
         self.page.goto("https://web.max.ru", timeout=30000)
         self.page.wait_for_timeout(5000)
-        if _is_logged_in(self.page):
+        if not _has_auth_captcha(self.page) and _is_logged_in(self.page):
             self.context.storage_state(path=self.session_file)
             self._do_close()
             self.result_queue.put(("already_logged_in", self.session_file))
@@ -638,7 +659,7 @@ class QRLoginSession:
             self.result_queue.put(("error", "Сейчас номер телефона не запрашивается"))
             return
         try:
-            if _is_logged_in(self.page):
+            if not _has_auth_captcha(self.page) and _is_logged_in(self.page):
                 self.context.storage_state(path=self.session_file)
                 self._do_close()
                 self.result_queue.put(("success", self.session_file))
@@ -662,11 +683,6 @@ class QRLoginSession:
                 return
             deadline = time.monotonic() + 25
             while True:
-                if _is_logged_in(self.page):
-                    self.context.storage_state(path=self.session_file)
-                    self._do_close()
-                    self.result_queue.put(("success", self.session_file))
-                    return
                 if _has_auth_captcha(self.page):
                     self.status = "awaiting_human"
                     self.result_queue.put(("awaiting_human", "captcha"))
@@ -678,6 +694,15 @@ class QRLoginSession:
                 if _get_login_code_input(self.page):
                     self.status = "awaiting_code"
                     self.result_queue.put(("awaiting_code", None))
+                    return
+                if _get_phone_input(self.page):
+                    self.status = "awaiting_phone"
+                    self.result_queue.put(("awaiting_phone", None))
+                    return
+                if _is_logged_in(self.page):
+                    self.context.storage_state(path=self.session_file)
+                    self._do_close()
+                    self.result_queue.put(("success", self.session_file))
                     return
                 if time.monotonic() >= deadline:
                     break
@@ -714,15 +739,19 @@ class QRLoginSession:
                 self.page.keyboard.press("Enter")
             deadline = time.monotonic() + 20
             while True:
-                if _is_logged_in(self.page):
-                    self.context.storage_state(path=self.session_file)
-                    self._do_close()
-                    self.result_queue.put(("success", self.session_file))
+                if _has_auth_captcha(self.page):
+                    self.status = "awaiting_human"
+                    self.result_queue.put(("awaiting_human", "captcha"))
                     return
                 if _get_password_input(self.page):
                     self.status = "awaiting_password"
                     self.screenshot_bytes = self.page.screenshot(full_page=True)
                     self.result_queue.put(("awaiting_password", self.screenshot_bytes))
+                    return
+                if not _get_login_code_input(self.page) and not _get_phone_input(self.page) and _is_logged_in(self.page):
+                    self.context.storage_state(path=self.session_file)
+                    self._do_close()
+                    self.result_queue.put(("success", self.session_file))
                     return
                 if time.monotonic() >= deadline:
                     break
@@ -748,7 +777,7 @@ class QRLoginSession:
             return
         self.page.reload()
         self.page.wait_for_timeout(4000)
-        if _is_logged_in(self.page):
+        if not _has_auth_captcha(self.page) and _is_logged_in(self.page):
             self.context.storage_state(path=self.session_file)
             self._do_close()
             self.result_queue.put(("success", self.session_file))
@@ -761,31 +790,40 @@ class QRLoginSession:
         if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code", "awaiting_human"):
             self.result_queue.put(("error", "Сессия не активна"))
             return
-        if _is_logged_in(self.page):
-            self.context.storage_state(path=self.session_file)
-            self._do_close()
-            self.result_queue.put(("success", self.session_file))
-            return
         if _has_auth_captcha(self.page):
+            self._logged_in_confirmation_count = 0
             self.status = "awaiting_human"
             self.result_queue.put(("awaiting_human", "captcha"))
             return
         password_input = _get_password_input(self.page)
         if password_input:
+            self._logged_in_confirmation_count = 0
             self.status = "awaiting_password"
             self.screenshot_bytes = self.page.screenshot(full_page=True)
             self.result_queue.put(("awaiting_password", self.screenshot_bytes))
             return
         if _get_login_code_input(self.page):
+            self._logged_in_confirmation_count = 0
             self.status = "awaiting_code"
             self.screenshot_bytes = self.page.screenshot(full_page=True)
             self.result_queue.put(("awaiting_code", self.screenshot_bytes))
             return
         if _get_phone_input(self.page):
+            self._logged_in_confirmation_count = 0
             self.status = "awaiting_phone"
             self.screenshot_bytes = self.page.screenshot(full_page=True)
             self.result_queue.put(("awaiting_phone", self.screenshot_bytes))
             return
+        if _is_logged_in(self.page):
+            self._logged_in_confirmation_count += 1
+            if self._logged_in_confirmation_count >= 3:
+                self.context.storage_state(path=self.session_file)
+                self._do_close()
+                self.result_queue.put(("success", self.session_file))
+                return
+            self.result_queue.put(("waiting", None))
+            return
+        self._logged_in_confirmation_count = 0
         if self.status == "awaiting_human":
             self.result_queue.put(("awaiting_human", "transition_timeout"))
         else:
@@ -809,14 +847,18 @@ class QRLoginSession:
                 self.page.keyboard.press("Enter")
             deadline = time.monotonic() + 20
             while True:
-                if _is_logged_in(self.page):
-                    self.context.storage_state(path=self.session_file)
-                    self._do_close()
-                    self.result_queue.put(("success", self.session_file))
+                if _has_auth_captcha(self.page):
+                    self.status = "awaiting_human"
+                    self.result_queue.put(("awaiting_human", "captcha"))
                     return
                 if _get_login_code_input(self.page):
                     self.status = "awaiting_code"
                     self.result_queue.put(("awaiting_code", None))
+                    return
+                if not _get_password_input(self.page) and not _get_phone_input(self.page) and _is_logged_in(self.page):
+                    self.context.storage_state(path=self.session_file)
+                    self._do_close()
+                    self.result_queue.put(("success", self.session_file))
                     return
                 if time.monotonic() >= deadline:
                     break
