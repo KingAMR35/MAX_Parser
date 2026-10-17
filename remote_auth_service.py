@@ -43,12 +43,14 @@ main{max-width:1080px;margin:auto;padding:18px}h1{font-size:21px;margin:0 0 8px}
 const screen=document.getElementById('screen'), box=document.getElementById('keyboard'), state=document.getElementById('state');
 let stopped=false, ready=false, previousImageUrl=null;
 let typingTimer=null;
-async function post(path,data={}){const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok)throw new Error('Сессия недоступна');return r.json().catch(()=>({}));}
+function httpError(prefix,status){const reasons={400:'удалённый браузер не выполнил действие',401:'сессия авторизации не найдена',403:'сервер отклонил запрос страницы',404:'маршрут API не найден',410:'удалённая сессия завершена'};return prefix+': '+(reasons[status]||'ошибка сервера')+' (HTTP '+status+')';}
+async function post(path,data={}){const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok)throw new Error(httpError('Не удалось управлять MAX',r.status));return r.json().catch(()=>({}));}
 async function action(name,values={}){if(!ready)return;try{await post('/api/action',{action:name,...values});}catch(e){state.textContent=e.message;}}
 async function flushText(){if(typingTimer){clearTimeout(typingTimer);typingTimer=null;}const text=box.value;if(text){box.value='';await action('text',{text});}}
-async function poll(){if(stopped||!ready)return;try{const r=await fetch('/api/snapshot',{cache:'no-store',credentials:'same-origin'});if(r.ok){const nextUrl=URL.createObjectURL(await r.blob());screen.onload=()=>{if(previousImageUrl)URL.revokeObjectURL(previousImageUrl);previousImageUrl=nextUrl;};screen.src=nextUrl;}else{const s=await fetch('/api/status',{cache:'no-store',credentials:'same-origin'}).then(x=>x.json()).catch(()=>({}));if(s.status==='complete'){state.textContent='✅ Вход подтверждён. Можно закрыть эту страницу.';stopped=true;return;}throw new Error('Ссылка истекла или сессия завершена');}}catch(e){state.textContent=e.message;stopped=true;return;}setTimeout(poll,850);}
+async function refreshScreen(manual=false){if(stopped||!ready)return false;try{const r=await fetch('/api/snapshot',{cache:'no-store',credentials:'same-origin'});if(r.ok){const nextUrl=URL.createObjectURL(await r.blob());screen.onload=()=>{if(previousImageUrl)URL.revokeObjectURL(previousImageUrl);previousImageUrl=nextUrl;};screen.src=nextUrl;if(manual)state.textContent='Экран MAX обновлён.';return true;}const s=await fetch('/api/status',{cache:'no-store',credentials:'same-origin'}).then(x=>x.json()).catch(()=>({}));if(s.status==='complete'){state.textContent='✅ Вход подтверждён. Можно закрыть эту страницу.';stopped=true;return false;}state.textContent=httpError('Не удалось получить экран MAX',r.status);if(r.status===401||r.status===410)stopped=true;return false;}catch(e){state.textContent='Нет связи с сервером удалённого входа: '+e.message;return false;}}
+async function poll(){if(stopped||!ready)return;await refreshScreen();if(!stopped)setTimeout(poll,850);}
 document.getElementById('keyboardButton').onclick=()=>{box.focus();state.textContent='Клавиатура включена. Ввод направляется в MAX.';};
-document.getElementById('refreshButton').onclick=()=>action('refresh');
+document.getElementById('refreshButton').onclick=()=>refreshScreen(true);
 screen.addEventListener('pointerdown',e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/1280,r.height/800),ox=(r.width-1280*scale)/2,oy=(r.height-800*scale)/2,x=Math.round((e.clientX-r.left-ox)/scale),y=Math.round((e.clientY-r.top-oy)/scale);if(x>=0&&x<1280&&y>=0&&y<800)action('click',{x,y});});
 box.addEventListener('input',()=>{if(typingTimer)clearTimeout(typingTimer);typingTimer=setTimeout(()=>{flushText();},120);});
 box.addEventListener('keydown',async e=>{if(e.key.length===1||e.key==='Process')return;const allowed=['Enter','Tab','Backspace','Delete','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown',' '];if(allowed.includes(e.key)){e.preventDefault();await flushText();await action('key',{key:e.key===' '?'Space':e.key});}});
@@ -244,7 +246,7 @@ class RemoteAuthService:
                 if expiry > now
             }
             self._records[digest] = record
-        return f"{self.base_url}/auth/#{token}", record
+        return f"{self.base_url}/auth#{token}", record
 
     def claim(self, token):
         if not isinstance(token, str) or len(token) > 128:
