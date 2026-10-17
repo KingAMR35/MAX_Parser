@@ -476,6 +476,7 @@ class QRLoginSession:
             raise ValueError("Некорректный идентификатор сессии MAX")
         self.session_file = os.path.join(SESSIONS_DIR, f"{session_key}.json")
         self.command_queue = queue.Queue()
+        self.remote_command_queue = queue.Queue()
         self.result_queue = queue.Queue()
         self.thread = None
         self.browser = None
@@ -498,7 +499,20 @@ class QRLoginSession:
     def _worker(self):
         try:
             while True:
-                cmd, args = self.command_queue.get()
+                try:
+                    remote_action, remote_args, response_queue = self.remote_command_queue.get_nowait()
+                except queue.Empty:
+                    remote_action = None
+                if remote_action is not None:
+                    try:
+                        response_queue.put(self._do_remote_action(remote_action, remote_args))
+                    except Exception as error:
+                        response_queue.put(error)
+                    continue
+                try:
+                    cmd, args = self.command_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if cmd == "init":
                     self._do_init()
                 elif cmd == "refresh":
@@ -522,6 +536,58 @@ class QRLoginSession:
                 self.result_queue.put(("error", str(e)))
             except:
                 pass
+
+    def _do_remote_action(self, action, args):
+        if not self.page or self.status == "closed":
+            raise RuntimeError("Браузер авторизации уже закрыт")
+        args = args if isinstance(args, dict) else {}
+        if action == "screenshot":
+            return self.page.screenshot(full_page=False, animations="disabled")
+        if action == "click":
+            x, y = int(args.get("x", -1)), int(args.get("y", -1))
+            if not (0 <= x < 1280 and 0 <= y < 800):
+                raise ValueError("Координаты клика вне окна")
+            self.page.mouse.click(x, y, timeout=3000)
+            return True
+        if action == "key":
+            key = str(args.get("key", ""))
+            allowed = {
+                "Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowUp",
+                "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End",
+                "PageUp", "PageDown", "Space",
+            }
+            if key not in allowed:
+                raise ValueError("Клавиша не разрешена")
+            self.page.keyboard.press(key)
+            return True
+        if action == "text":
+            value = args.get("text")
+            if not isinstance(value, str) or not value or len(value) > 256 or "\x00" in value:
+                raise ValueError("Недопустимый текст ввода")
+            self.page.keyboard.insert_text(value)
+            return True
+        if action == "scroll":
+            delta_y = int(args.get("deltaY", 0))
+            if not -900 <= delta_y <= 900:
+                raise ValueError("Недопустимое значение прокрутки")
+            self.page.mouse.wheel(0, delta_y)
+            return True
+        if action == "refresh":
+            self.page.reload(wait_until="domcontentloaded", timeout=20000)
+            self.page.wait_for_timeout(1500)
+            return True
+        raise ValueError("Неизвестное действие")
+
+    def remote_action(self, action, args=None, timeout=8):
+        response_queue = queue.Queue(maxsize=1)
+        self.remote_command_queue.put((action, args or {}, response_queue))
+        try:
+            result = response_queue.get(timeout=timeout)
+        except queue.Empty as error:
+            raise TimeoutError("Таймаут управления удалённым браузером") from error
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def _do_init(self):
         print(f"🔐 [Поток {self.chat_id}] Инициализация браузера...")

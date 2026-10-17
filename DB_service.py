@@ -112,6 +112,28 @@ def init_db():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS customer_reviews (
+                user_id BIGINT PRIMARY KEY,
+                status TEXT NOT NULL CHECK (status IN (
+                    'eligible', 'invited', 'writing', 'pending', 'approved', 'rejected', 'skipped'
+                )),
+                review_text TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            ALTER TABLE customer_reviews
+            DROP CONSTRAINT IF EXISTS customer_reviews_status_check
+        """)
+        conn.execute("""
+            ALTER TABLE customer_reviews
+            ADD CONSTRAINT customer_reviews_status_check CHECK (status IN (
+                'eligible', 'invited', 'writing', 'pending', 'approved', 'rejected', 'skipped'
+            ))
+        """)
+
 #! ============ АДМИНЫ ============
 
 def add_admin(user_id: int, username: str = None):
@@ -141,7 +163,8 @@ def get_all_admins():
 
 def delete_admin(user_id: int):
     with get_connection() as conn:
-        conn.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+        cursor = conn.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+        return cursor.rowcount == 1
 
 
 #! ============ ПОЛЬЗОВАТЕЛИ ============
@@ -212,6 +235,104 @@ def select_users():
     with get_connection() as conn:
         rows = conn.execute("SELECT user_id, username FROM users ORDER BY user_id ASC").fetchall()
         return list(rows)
+
+
+#! ============ ОТЗЫВЫ ПОЛЬЗОВАТЕЛЕЙ ============
+
+def offer_review(user_id: int) -> bool:
+    """Create one review invitation after the user's first successful connection."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            INSERT INTO customer_reviews (user_id, status)
+            VALUES (%s, 'eligible')
+            ON CONFLICT (user_id) DO NOTHING
+            RETURNING user_id
+        """, (int(user_id),)).fetchone()
+        return row is not None
+
+
+def begin_review(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_reviews SET status = 'writing', updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status IN ('eligible', 'invited', 'writing')
+        """, (int(user_id),))
+        return cursor.rowcount == 1
+
+
+def claim_review_invitation(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_reviews SET status = 'invited', updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status = 'eligible'
+        """, (int(user_id),))
+        return cursor.rowcount == 1
+
+
+def release_review_invitation(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_reviews SET status = 'eligible', updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status = 'invited'
+        """, (int(user_id),))
+        return cursor.rowcount == 1
+
+
+def get_review_status(user_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM customer_reviews WHERE user_id = %s", (int(user_id),)
+        ).fetchone()
+        return row["status"] if row else None
+
+
+def skip_review(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_reviews SET status = 'skipped', updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status IN ('eligible', 'invited')
+        """, (int(user_id),))
+        return cursor.rowcount == 1
+
+
+def cancel_review(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_reviews SET status = 'skipped', updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status = 'writing'
+        """, (int(user_id),))
+        return cursor.rowcount == 1
+
+
+def save_pending_review(user_id: int, review_text: str) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_reviews
+            SET status = 'pending', review_text = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status = 'writing'
+        """, (str(review_text), int(user_id)))
+        return cursor.rowcount == 1
+
+
+def moderate_review(user_id: int, decision: str):
+    if decision not in ('approved', 'rejected'):
+        raise ValueError('Некорректное решение по отзыву')
+    with get_connection() as conn:
+        return conn.execute("""
+            UPDATE customer_reviews
+            SET status = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND status = 'pending'
+            RETURNING user_id, review_text, status, created_at, updated_at
+        """, (decision, int(user_id))).fetchone()
+
+
+def get_approved_reviews():
+    with get_connection() as conn:
+        return list(conn.execute("""
+            SELECT user_id, review_text, created_at
+            FROM customer_reviews WHERE status = 'approved'
+            ORDER BY created_at DESC
+        """).fetchall())
 
 
 #! ============ ЧАТЫ ============

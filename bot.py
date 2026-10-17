@@ -15,8 +15,10 @@ import concurrent.futures
 from max_playwright_parser import *
 from DB_service import *
 from debug_log import logger as debug_logger, preview as log_preview
+from remote_auth_service import RemoteAuthService, SESSION_TTL_SECONDS
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+remote_auth_service = RemoteAuthService()
 print("🚀 MAX Parser Bot запущен")
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='HTML')
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
@@ -48,7 +50,11 @@ PARSE_DIAGNOSTICS_LOCK = threading.RLock()
 CHAT_LIFECYCLE_LOCK = threading.RLock()
 pending_setup_modes = {}
 customer_setup_state = {}
+awaiting_review_text = set()
+remote_auth_monitors = set()
+remote_auth_monitor_lock = threading.Lock()
 SUPPORT_END_TEXT = "✅ Завершить чат с поддержкой"
+MAX_PROJECT_ACCOUNT_PHONE = "+7 939 752 85 95"
 
 bot.set_my_commands([
     types.BotCommand("start", "Запустить бота"),
@@ -960,6 +966,14 @@ def process_single_chat(chat):
             session_path=_session_path_for_chat(chat),
         )
         _process_chat_posts_if_present(chat_id, title, posts)
+        if chat.get("is_active") and owner_id > 0:
+            try:
+                _maybe_offer_review(owner_id)
+            except Exception as notify_error:
+                debug_logger.warning(
+                    "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
+                    owner_id, type(notify_error).__name__,
+                )
         return True
     except Exception as error:
         _record_parse_failure_if_present(chat_id, title, error)
@@ -1232,6 +1246,7 @@ def track_user(message_or_callback):
 def _build_qr_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("✅ Готово, я отсканировал", callback_data=f"qr_ready_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("📱 Войти по номеру телефона", callback_data=f"qr_phone_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🔄 Обновить QR", callback_data=f"qr_refresh_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
@@ -1259,11 +1274,11 @@ def _auth_human_check_text(session, reason):
         return (
             "🛡 MAX запросил дополнительную проверку безопасности. Проверьте приложение MAX, "
             "завершите подтверждение входа и затем нажмите «🔄 Проверить вход MAX». "
-            "Подключение по номеру телефона находится в разработке; сейчас используйте QR-код."
+            "Либо отмените попытку и начните вход по номеру через защищённую страницу."
         )
     return (
         "MAX пока не подтвердил вход. Отсканируйте QR-код в приложении MAX, затем нажмите "
-        "«✅ Готово, я отсканировал». Подключение по номеру телефона находится в разработке."
+        "«✅ Готово, я отсканировал», или выберите вход по номеру через защищённую страницу."
     )
 
 def _clear_auth_waiters(target_chat_id):
@@ -1282,9 +1297,6 @@ def _complete_login(target_chat_id, output_chat_id):
     _clear_auth_waiters(target_chat_id)
     chat = get_chat_by_id(target_chat_id) if target_chat_id != "project_account" else None
     if target_chat_id == "project_account":
-        for customer_chat in get_all_chats():
-            if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
-                toggle_chat(customer_chat["chat_id"], True)
         title = "аккаунта проекта"
     else:
         title = chat["title"] if chat else "MAX"
@@ -1296,6 +1308,94 @@ def _complete_login(target_chat_id, output_chat_id):
         parse_mode="HTML",
         **NO_PREVIEW,
     )
+    if target_chat_id == "project_account":
+        bot.send_message(
+            output_chat_id,
+            "Теперь проверю доступ аккаунта проекта к каждой исходной группе. "
+            "Парсинг включится для группы только после успешного открытия в MAX.",
+            **NO_PREVIEW,
+        )
+        threading.Thread(
+            target=_verify_project_chats_after_login,
+            args=(output_chat_id,),
+            daemon=True,
+        ).start()
+    elif chat and chat.get("owner_id"):
+        owner_id = int(chat["owner_id"])
+        if not is_admin(owner_id):
+            try:
+                _maybe_offer_review(owner_id)
+            except Exception as error:
+                debug_logger.warning(
+                    "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
+                    owner_id, type(error).__name__,
+                )
+
+
+def _monitor_remote_login(target_chat_id, session, output_chat_id):
+    monitor_key = (str(target_chat_id), id(session))
+    deadline = time.monotonic() + SESSION_TTL_SECONDS
+    try:
+        while time.monotonic() < deadline:
+            if active_logins.get(target_chat_id) is not session:
+                remote_auth_service.revoke_session(session)
+                return
+            try:
+                status, data = session.check()
+            except Exception as error:
+                status, data = "error", error
+            if status == "success":
+                remote_auth_service.revoke_session(session, completed=True)
+                _complete_login(target_chat_id, output_chat_id)
+                return
+            if status == "error":
+                if active_logins.get(target_chat_id) is session:
+                    active_logins.pop(target_chat_id, None)
+                remote_auth_service.revoke_session(session)
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                bot.send_message(
+                    output_chat_id,
+                    "⚠️ Не удалось проверить вход в MAX. Авторизация завершена; начните её заново.",
+                    **NO_PREVIEW,
+                )
+                debug_logger.warning(
+                    "REMOTE_MAX_LOGIN_CHECK_FAILED target=%s error_type=%s",
+                    target_chat_id, type(data).__name__,
+                )
+                return
+            time.sleep(1.5)
+        if active_logins.get(target_chat_id) is session:
+            active_logins.pop(target_chat_id, None)
+        remote_auth_service.revoke_session(session)
+        try:
+            session.close()
+        except Exception:
+            pass
+        bot.send_message(
+            output_chat_id,
+            "⌛ Время удалённого входа истекло. Запустите подключение ещё раз, чтобы получить новую одноразовую ссылку.",
+            **NO_PREVIEW,
+        )
+    finally:
+        with remote_auth_monitor_lock:
+            remote_auth_monitors.discard(monitor_key)
+
+
+def _start_remote_login_monitor(target_chat_id, session, output_chat_id):
+    monitor_key = (str(target_chat_id), id(session))
+    with remote_auth_monitor_lock:
+        if monitor_key in remote_auth_monitors:
+            return
+        remote_auth_monitors.add(monitor_key)
+    threading.Thread(
+        target=_monitor_remote_login,
+        args=(target_chat_id, session, output_chat_id),
+        daemon=True,
+        name=f"max-remote-auth-{target_chat_id}",
+    ).start()
 
 
 def do_qr_login(target_chat_id, admin_chat_id):
@@ -1314,6 +1414,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
     title = "аккаунта проекта" if is_project_account else chat["title"]
     session = active_logins.pop(target_chat_id, None)
     if session:
+        remote_auth_service.revoke_session(session)
         try:
             session.close()
         except:
@@ -1334,6 +1435,15 @@ def do_qr_login(target_chat_id, admin_chat_id):
             f"✅ <b>Уже авторизован!</b>\nСессия для <b>{escape_html(title)}</b> актуальна.",
             parse_mode='HTML', **NO_PREVIEW
         )
+        if is_project_account:
+            threading.Thread(
+                target=_verify_project_chats_after_login,
+                args=(admin_chat_id,),
+                daemon=True,
+            ).start()
+        elif chat and chat.get("owner_id") and not is_admin(int(chat["owner_id"])):
+            owner_id = int(chat["owner_id"])
+            _maybe_offer_review(owner_id)
         return
     if status == "error":
         bot.send_message(
@@ -1350,8 +1460,8 @@ def do_qr_login(target_chat_id, admin_chat_id):
             caption=(
                 f"📱 <b>Отсканируйте QR-код</b> в приложении MAX\n\n"
                 f"MAX: <b>{escape_html(title)}</b>\n\n"
-                "После сканирования нажмите <b>«✅ Готово, я отсканировал»</b>.\n"
-                "Подключение по номеру телефона находится в разработке."
+                "После сканирования нажмите <b>«✅ Готово, я отсканировал»</b>, "
+                "или выберите вход по номеру через защищённую страницу."
             ),
             parse_mode="HTML",
             reply_markup=_build_qr_keyboard(target_chat_id),
@@ -1624,11 +1734,7 @@ def show_admins_list(chat_id, message_id, page=0):
         text += "\n\nСписок пока пуст."
     kb = types.InlineKeyboardMarkup(row_width=1)
     for admin in shown:
-        kb.add(types.InlineKeyboardButton(
-            f"📋 Копировать ID {admin['user_id']}",
-            copy_text=types.CopyTextButton(text=str(admin["user_id"])),
-        ))
-        if admin["user_id"] not in (5213315899, ADMIN_ID):
+        if admin["user_id"] != ADMIN_ID:
             label = _short_button_label(f"🗑 Удалить @{admin.get('username') or admin['user_id']}", 32)
             kb.add(types.InlineKeyboardButton(
                 label,
@@ -1661,17 +1767,6 @@ def show_users_list(chat_id, message_id, page=0):
     else:
         text += "\n\nПользователей пока нет."
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for user in shown:
-        kb.row(
-            types.InlineKeyboardButton(
-                "✉️ Написать",
-                callback_data=f"admin_user_send_{user['user_id']}"
-            ),
-            types.InlineKeyboardButton(
-                "📋 ID",
-                copy_text=types.CopyTextButton(text=str(user["user_id"])),
-            ),
-        )
     _page_buttons(kb, page, page_count, "admin_users_page")
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
@@ -1694,16 +1789,10 @@ def show_user_send_selector(chat_id, message_id, page=0):
         text += "\n\nСписок пользователей пока пуст."
     kb = types.InlineKeyboardMarkup(row_width=1)
     for user in shown:
-        kb.row(
-            types.InlineKeyboardButton(
-                "👤 Выбрать",
-                callback_data=f"admin_send_user_pick_{user['user_id']}"
-            ),
-            types.InlineKeyboardButton(
-                "📋 ID",
-                copy_text=types.CopyTextButton(text=str(user["user_id"])),
-            ),
-        )
+        kb.add(types.InlineKeyboardButton(
+            "👤 Выбрать",
+            callback_data=f"admin_send_user_pick_{user['user_id']}"
+        ))
     _page_buttons(kb, page, page_count, "admin_send_users_page")
     kb.add(types.InlineKeyboardButton("✍️ Ввести ID вручную", callback_data="admin_send_user_manual"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
@@ -1725,16 +1814,10 @@ def show_chat_send_selector(chat_id, message_id, page=0):
         text += "\n\nЧатов пока нет."
     kb = types.InlineKeyboardMarkup(row_width=1)
     for chat in shown:
-        kb.row(
-            types.InlineKeyboardButton(
-                "💬 Выбрать",
-                callback_data=f"admin_send_chat_pick_{chat['chat_id']}"
-            ),
-            types.InlineKeyboardButton(
-                "📋 ID",
-                copy_text=types.CopyTextButton(text=str(chat["chat_id"])),
-            ),
-        )
+        kb.add(types.InlineKeyboardButton(
+            "💬 Выбрать",
+            callback_data=f"admin_send_chat_pick_{chat['chat_id']}"
+        ))
     _page_buttons(kb, page, page_count, "admin_send_chats_page")
     kb.add(types.InlineKeyboardButton("✍️ Ввести ID вручную", callback_data="admin_send_chat_manual"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
@@ -2112,6 +2195,7 @@ def start_keyboard():
     keyboard.add(types.InlineKeyboardButton("✔ Подключить MAX_Parser", callback_data="parse_setup"))
     keyboard.add(types.InlineKeyboardButton("🔎 О парсинге", callback_data="about_bot"))
     keyboard.add(types.InlineKeyboardButton("💬 Тех поддержка", callback_data="support_start"))
+    keyboard.add(types.InlineKeyboardButton("⭐ Отзывы", callback_data="reviews_show"))
     return keyboard
 
 def return_start():
@@ -2239,6 +2323,99 @@ def _send_subscription_invoice(user_id, plan_code):
             **NO_PREVIEW,
         )
         return False
+
+
+def _send_review_invitation(user_id):
+    if get_review_status(user_id) != "eligible" or not claim_review_invitation(user_id):
+        return False
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "✍️ Оставить отзыв", callback_data=f"review_write_{int(user_id)}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "Не хочу", callback_data=f"review_skip_{int(user_id)}"
+    ))
+    try:
+        bot.send_message(
+            int(user_id),
+            "🎉 <b>Подключение завершено</b>\n\n"
+            "Расскажите, пожалуйста, как всё прошло и удобно ли настраивать MAX_Parser. "
+            "Отзыв появится в общем списке только после проверки администратором.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            **NO_PREVIEW,
+        )
+    except Exception:
+        release_review_invitation(user_id)
+        raise
+    return True
+
+
+def _maybe_offer_review(user_id):
+    status = get_review_status(user_id)
+    if status is None:
+        offer_review(user_id)
+        status = get_review_status(user_id)
+    if status == "eligible":
+        return _send_review_invitation(user_id)
+    return False
+
+
+def show_approved_reviews(chat_id, message_id, page=0):
+    reviews = get_approved_reviews()
+    if not reviews:
+        text = "⭐ <b>Отзывы</b>\n\nПока нет опубликованных отзывов."
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
+        safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+        return
+    page_size = 1
+    page_count = (len(reviews) + page_size - 1) // page_size
+    page = max(0, min(int(page), page_count - 1))
+    review = reviews[page]
+    created_at = review.get("created_at")
+    date_label = created_at.strftime("%d.%m.%Y") if created_at else ""
+    review_text = escape_html(str(review.get("review_text") or "").strip()[:700])
+    text = (
+        f"⭐ <b>Отзывы о MAX_Parser</b> · {page + 1}/{len(reviews)}\n\n"
+        f"<blockquote>{review_text}</blockquote>"
+    )
+    if date_label:
+        text += f"\n\n<i>{date_label}</i>"
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    row = []
+    if page > 0:
+        row.append(types.InlineKeyboardButton("◀️", callback_data=f"reviews_page_{page - 1}"))
+    if page + 1 < page_count:
+        row.append(types.InlineKeyboardButton("▶️", callback_data=f"reviews_page_{page + 1}"))
+    if row:
+        keyboard.row(*row)
+    keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
+    safe_edit_message(
+        text,
+        chat_id,
+        message_id,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+
+
+def _send_review_for_moderation(user_id, review_text):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"review_approve_{int(user_id)}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"review_reject_{int(user_id)}"),
+    )
+    bot.send_message(
+        ADMIN_ID,
+        "📝 <b>Новый отзыв на проверку</b>\n"
+        f"👤 User ID: <code>{int(user_id)}</code>\n\n"
+        f"<blockquote>{escape_html(review_text[:500])}</blockquote>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        **NO_PREVIEW,
+    )
 
 
 def _support_keyboard():
@@ -2541,13 +2718,32 @@ def handle_successful_payment(message):
 
     active_until = result["active_until"].astimezone(timezone.utc)
     amount_rub = payment.total_amount / 100
+    plan_label = (
+        "Подключение через ваш аккаунт MAX"
+        if result["plan_code"] == "self"
+        else "Подключение через аккаунт проекта MAX"
+    )
+    paid_at = datetime.fromtimestamp(message.date, tz=timezone.utc)
+    provider_charge_id = escape_html(payment.provider_payment_charge_id or "не получен")
+    fiscal_receipt_note = (
+        "🧾 Данные для фискального чека переданы платёжному провайдеру."
+        if YOOKASSA_RECEIPTS_ENABLED
+        else "ℹ️ Это подтверждение оплаты от MAX_Parser. Фискальные чеки ЮKassa в текущих настройках не подключены."
+    )
     bot.send_message(
         user_id,
-        "✅ <b>Оплата прошла успешно</b>\n\n"
-        f"Сумма: <b>{amount_rub:.2f} ₽</b>\n"
-        f"Подписка действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
-        "Доступ распространяется на все группы вашего аккаунта.\n"
-        "Автоматического списания нет; перед окончанием срока я напомню о продлении.",
+        "🧾 <b>Квитанция MAX_Parser</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✅ <b>Статус:</b> оплачено\n"
+        "📦 <b>Услуга:</b> подписка на 30 дней\n"
+        f"🔧 <b>Способ:</b> {plan_label}\n"
+        f"💳 <b>Сумма:</b> {amount_rub:.2f} ₽\n"
+        f"🕒 <b>Оплачено:</b> {paid_at:%d.%m.%Y %H:%M} UTC\n"
+        f"📅 <b>Действует до:</b> {active_until:%d.%m.%Y %H:%M} UTC\n"
+        f"🔖 <b>ID платежа:</b> <code>{provider_charge_id}</code>\n\n"
+        f"<blockquote>Доступ распространяется на все группы вашего аккаунта.\n"
+        "Автоматического списания нет — заранее напомню о продлении.</blockquote>\n"
+        f"<i>{fiscal_receipt_note}</i>",
         parse_mode="HTML",
         **NO_PREVIEW,
     )
@@ -2704,6 +2900,100 @@ def _chat_delete_allowed(user_id, chat):
         return False
 
 
+def _project_access_help():
+    return (
+        "Добавьте аккаунт MAX проекта <code>"
+        f"{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> в исходный чат. "
+        "Если поиск по номеру не срабатывает, попросите владельца или администратора MAX "
+        "прислать аккаунту ссылку-приглашение. В канале аккаунт должен иметь доступ к публикациям "
+        "(обычно его добавляют подписчиком/участником). Если добавить нельзя, владелец может "
+        "временно разрешить доступ по публичной ссылке; если MAX всё равно не показывает сообщения, "
+        "вариант с аккаунтом проекта для этого источника не заработает. "
+        "Проверка подтверждает, что аккаунт может открыть и читать источник, но для публичной группы "
+        "сама по себе не доказывает членство в ней."
+    )
+
+
+def _verify_project_chat_access(chat_id, notify_chat_id=None):
+    chat = get_chat_by_id(chat_id)
+    if not chat or chat.get("account_mode") != "project" or not chat.get("max_url"):
+        return False
+    owner_id = int(chat.get("owner_id") or 0)
+    destination = int(notify_chat_id or owner_id or ADMIN_ID)
+    session_path = _session_path_for_chat(chat)
+    if not os.path.exists(session_path):
+        if destination:
+            bot.send_message(
+                destination,
+                "Ссылка на группу сохранена, но аккаунт проекта ещё не авторизован. "
+                "Подключение включится после настройки сессии администратором.",
+                **NO_PREVIEW,
+            )
+        return False
+    try:
+        posts = parse_max_group_media(
+            group_url=chat["max_url"],
+            chat_id=chat_id,
+            session_path=session_path,
+        )
+        current = get_chat_by_id(chat_id)
+        if (
+            not current
+            or current.get("account_mode") != "project"
+            or current.get("max_url") != chat.get("max_url")
+            or int(current.get("owner_id") or 0) != owner_id
+        ):
+            return False
+        _process_chat_posts_if_present(chat_id, current.get("title") or "MAX", posts)
+        toggle_chat(chat_id, True)
+        bot.send_message(
+            destination,
+            "✅ <b>Доступ к парсингу проверен.</b> Аккаунт проекта смог открыть исходную группу, и парсинг запущен.\n\n"
+            "Если в группе пока нет сообщений, парсер продолжит проверять её автоматически.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        if owner_id > 0 and not is_admin(owner_id):
+            try:
+                _maybe_offer_review(owner_id)
+            except Exception as notify_error:
+                debug_logger.warning(
+                    "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
+                    owner_id, type(notify_error).__name__,
+                )
+        return True
+    except Exception as error:
+        debug_logger.warning(
+            "PROJECT_GROUP_ACCESS_CHECK_FAILED chat_id=%s owner_id=%s error_type=%s",
+            chat_id, owner_id, type(error).__name__,
+        )
+        if destination:
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton(
+                "🔁 Проверить подключение",
+                callback_data=f"project_retry_{chat_id}",
+            ))
+            bot.send_message(
+                destination,
+                "⚠️ Не удалось подтвердить доступ аккаунта проекта к исходной группе. "
+                "Подключение оставил выключенным.\n\n"
+                f"{_project_access_help()}",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                **NO_PREVIEW,
+            )
+        return False
+
+
+def _verify_project_chats_after_login(notify_chat_id):
+    for chat in get_all_chats():
+        if chat.get("account_mode") == "project" and chat.get("max_url"):
+            _verify_project_chat_access(
+                chat["chat_id"],
+                int(chat.get("owner_id") or notify_chat_id),
+            )
+
+
 def _begin_customer_group_setup(chat_id, owner_id, account_mode):
     if _user_needs_subscription(owner_id):
         pending_setup_modes.pop(owner_id, None)
@@ -2735,7 +3025,12 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         f"<b>Шаг 2 из {2 if account_mode == 'project' else 3}.</b> Пришлите сюда ссылку на группу MAX, из которой нужно получать сообщения.\n"
         "Как скопировать ссылку: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
         "зайдите в нужную группу и скопируйте её ссылку из меню группы.\n\n"
-        "Для отмены отправьте /cancel.",
+        + (f"Для этого способа аккаунт MAX проекта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> "
+           "должен иметь доступ к исходной группе. Если его нельзя добавить напрямую, попросите владельца "
+           "или администратора выдать ссылку-приглашение либо разрешить чтение по публичной ссылке. "
+           "После настройки бот отдельно проверит, может ли аккаунт открыть источник.\n\n"
+           if account_mode == "project" else "")
+        + "Для отмены отправьте /cancel.",
         parse_mode="HTML",
         **NO_PREVIEW,
     )
@@ -2795,8 +3090,8 @@ def customer_source_url(message):
         bot.send_message(
             message.chat.id,
             "<b>Шаг 3 из 3.</b> Сейчас пришлю QR-код для входа в MAX. Отсканируйте его в приложении MAX "
-            "и нажмите «Готово, я отсканировал». Авторизация будет сохранена только для вашей группы.\n\n"
-            "Подключение по номеру телефона находится в разработке.",
+            "и нажмите «Готово, я отсканировал». Авторизация будет сохранена только для вашей группы. "
+            "Если удобнее входить по номеру, на QR-экране выберите защищённую страницу и завершите вход там.",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -2805,19 +3100,27 @@ def customer_source_url(message):
 
     project_session = os.path.join("sessions", "project_account.json")
     if os.path.exists(project_session):
-        toggle_chat(chat_id, True)
         bot.send_message(
             message.chat.id,
-            "✅ Ссылка сохранена. Группа добавлена в очередь парсинга. Проверьте, что аккаунт проекта MAX приглашён в исходную группу.",
+            "✅ Ссылка сохранена. Сейчас проверю, может ли аккаунт проекта открыть эту группу MAX. "
+            "Парсинг включится только после успешной проверки.\n\n"
+            f"{_project_access_help()}",
+            parse_mode="HTML",
             **NO_PREVIEW,
         )
+        threading.Thread(
+            target=_verify_project_chat_access,
+            args=(chat_id, message.chat.id),
+            daemon=True,
+        ).start()
     else:
-        account_name = os.getenv("MAX_PROJECT_ACCOUNT_USERNAME", "").strip()
-        account_line = f"Аккаунт проекта: <b>{escape_html(account_name)}</b>.\n" if account_name else ""
         bot.send_message(
             message.chat.id,
-            "✅ Ссылка сохранена. Подключение включится, когда администратор настроит сессию аккаунта проекта.\n\n"
-            f"{account_line}Если аккаунт ещё не добавлен в исходную MAX-группу, напишите в поддержку командой /help.",
+            "✅ Ссылка сохранена. Подключение включится после настройки сессии аккаунта проекта "
+            "и проверки доступа к исходной группе.\n\n"
+            f"{_project_access_help()}\n\n"
+            "Когда сессия будет готова, бот проверит доступ автоматически. Если MAX всё ещё не видит группу, "
+            "в сообщении появится кнопка повторной проверки.",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -2825,6 +3128,10 @@ def customer_source_url(message):
 
 @bot.message_handler(commands=['cancel'])
 def cancel_customer_setup(message):
+    if cancel_review(message.from_user.id):
+        awaiting_review_text.discard(message.from_user.id)
+        bot.send_message(message.chat.id, "Отзыв отменён. Спасибо, что подключились!", **NO_PREVIEW)
+        return
     state = customer_setup_state.pop(message.from_user.id, None)
     pending_setup_modes.pop(message.from_user.id, None)
     if state:
@@ -2841,6 +3148,51 @@ def end_support_button(message):
         bot.send_message(message.chat.id, "Спасибо за обращение!", **NO_PREVIEW)
     else:
         bot.send_message(message.chat.id, "Чат с поддержкой сейчас не открыт.", reply_markup=types.ReplyKeyboardRemove(), **NO_PREVIEW)
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private" and m.from_user.id in awaiting_review_text,
+    content_types=["text"],
+)
+def handle_customer_review(message):
+    user_id = int(message.from_user.id)
+    review_text = (message.text or "").strip()
+    if review_text.startswith("/"):
+        bot.send_message(
+            message.chat.id,
+            "Отправьте отзыв обычным текстом или используйте /cancel для отмены.",
+            **NO_PREVIEW,
+        )
+        return
+    if not review_text:
+        bot.send_message(message.chat.id, "Отзыв пустой. Напишите пару слов или отправьте /cancel.", **NO_PREVIEW)
+        return
+    if len(review_text) > 500:
+        bot.send_message(message.chat.id, "Отзыв слишком длинный. Сократите его до 500 символов.", **NO_PREVIEW)
+        return
+    if not save_pending_review(user_id, review_text):
+        awaiting_review_text.discard(user_id)
+        bot.send_message(message.chat.id, "Не удалось сохранить отзыв. Откройте приглашение и попробуйте ещё раз.", **NO_PREVIEW)
+        return
+    awaiting_review_text.discard(user_id)
+    try:
+        _send_review_for_moderation(user_id, review_text)
+    except Exception as error:
+        debug_logger.warning(
+            "REVIEW_MODERATION_NOTIFY_FAILED user_id=%s error_type=%s",
+            user_id, type(error).__name__,
+        )
+        bot.send_message(
+            message.chat.id,
+            "Отзыв сохранён, но не удалось отправить его администратору. Напишите в /help, пожалуйста.",
+            **NO_PREVIEW,
+        )
+        return
+    bot.send_message(
+        message.chat.id,
+        "Спасибо! Отзыв отправлен администратору на проверку. После одобрения он появится в общем списке.",
+        **NO_PREVIEW,
+    )
 
 
 @bot.message_handler(
@@ -3018,7 +3370,7 @@ def _handle_auth_result(target_chat_id, user_id, status, data, stage):
     elif status == "awaiting_phone":
         bot.send_message(
             user_id,
-            "Подключение по номеру телефона находится в разработке. Используйте QR-код в сообщении выше.",
+            "Для входа по номеру нажмите кнопку «📱 Войти по номеру телефона» и введите данные непосредственно в окне MAX.",
             reply_markup=_build_qr_keyboard(target_chat_id),
             **NO_PREVIEW,
         )
@@ -3037,7 +3389,7 @@ def _handle_auth_result(target_chat_id, user_id, status, data, stage):
             bot.send_message(
                 user_id,
                 "MAX пока не подтвердил вход. Отсканируйте QR-код и нажмите «✅ Готово, я отсканировал». "
-                "Подключение по номеру телефона находится в разработке.",
+                "Также можно выбрать вход по номеру через защищённую страницу.",
                 reply_markup=_build_qr_keyboard(target_chat_id),
                 **NO_PREVIEW,
             )
@@ -3053,7 +3405,7 @@ def _handle_auth_result(target_chat_id, user_id, status, data, stage):
         bot.send_message(
             user_id,
             f"❌ Не удалось продолжить вход ({stage}): <code>{escape_html(data or 'ошибка MAX')}</code>\n\n"
-            "Подключение по номеру телефона находится в разработке. Попробуйте войти по QR-коду.",
+            "Попробуйте войти по QR-коду или снова открыть защищённую страницу входа по номеру.",
             parse_mode="HTML",
             reply_markup=_build_qr_keyboard(target_chat_id) if session else None,
             **NO_PREVIEW,
@@ -3147,19 +3499,7 @@ def handle_password_input(message):
     status, data = session.enter_password(password)
     awaiting_password_from.pop(target_chat_id, None)
     if status == "success":
-        _clear_auth_waiters(target_chat_id)
-        active_logins.pop(target_chat_id, None)
-        if target_chat_id == "project_account":
-            for customer_chat in get_all_chats():
-                if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
-                    toggle_chat(customer_chat["chat_id"], True)
-        elif chat and chat.get("max_url"):
-            toggle_chat(target_chat_id, True)
-        bot.send_message(
-            message.chat.id,
-            f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> сохранена.\nТеперь фоновый парсер сможет работать автоматически!",
-            parse_mode='HTML', **NO_PREVIEW
-        )
+        _complete_login(target_chat_id, message.chat.id)
     elif status == "wrong_password":
         _set_auth_waiter(awaiting_password_from, target_chat_id, user_id)
         try:
@@ -3182,11 +3522,13 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
     is_allowed_customer_qr = False
+    is_allowed_customer_review = action == "reviews_show" or action.startswith("reviews_page_")
+    is_allowed_project_retry = False
     if not is_admin(call.from_user.id) and action.startswith("qr_"):
         try:
             qr_target = _qr_target_from_action(action)
@@ -3198,7 +3540,22 @@ def admin_callbacks(call):
             )
         except (ValueError, IndexError, TypeError):
             is_allowed_customer_qr = False
-    if not is_admin(call.from_user.id) and not is_allowed_customer_qr:
+    if not is_admin(call.from_user.id) and action.startswith(("review_write_", "review_skip_")):
+        try:
+            is_allowed_customer_review = int(action.rsplit("_", 1)[1]) == int(call.from_user.id)
+        except (ValueError, IndexError):
+            is_allowed_customer_review = False
+    if not is_admin(call.from_user.id) and action.startswith("project_retry_"):
+        try:
+            retry_chat = get_chat_by_id(int(action.rsplit("_", 1)[1]))
+            is_allowed_project_retry = bool(
+                retry_chat
+                and retry_chat.get("account_mode") == "project"
+                and int(retry_chat.get("owner_id") or 0) == int(call.from_user.id)
+            )
+        except (ValueError, IndexError, TypeError):
+            is_allowed_project_retry = False
+    if not is_admin(call.from_user.id) and not is_allowed_customer_qr and not is_allowed_customer_review and not is_allowed_project_retry:
         bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
         return
     if action.startswith("support_close_"):
@@ -3237,12 +3594,140 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "⚠️ Не удалось удалить")
             print(f"Ошибка удаления: {e}")
         return
-    if action.startswith("qr_phone_"):
-        bot.answer_callback_query(
-            call.id,
-            "Подключение по номеру телефона находится в разработке. Используйте QR-код.",
-            show_alert=True,
+    if action.startswith("project_retry_"):
+        try:
+            retry_chat_id = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Некорректный ID группы", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Проверяю доступ к MAX-группе")
+        threading.Thread(
+            target=_verify_project_chat_access,
+            args=(retry_chat_id, call.from_user.id),
+            daemon=True,
+        ).start()
+        return
+    if action == "reviews_show":
+        bot.answer_callback_query(call.id)
+        show_approved_reviews(call.message.chat.id, call.message.message_id)
+        return
+    if action.startswith("reviews_page_"):
+        try:
+            page = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            page = 0
+        bot.answer_callback_query(call.id)
+        show_approved_reviews(call.message.chat.id, call.message.message_id, page)
+        return
+    if action.startswith("review_write_"):
+        try:
+            target_user = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Некорректное приглашение", show_alert=True)
+            return
+        if target_user != int(call.from_user.id) or not begin_review(target_user):
+            bot.answer_callback_query(call.id, "Приглашение уже использовано или недоступно", show_alert=True)
+            return
+        awaiting_review_text.add(target_user)
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "✍️ Напишите отзыв одним текстовым сообщением (до 500 символов).\n"
+            "Чтобы отменить, отправьте /cancel.",
+            **NO_PREVIEW,
         )
+        return
+    if action.startswith("review_skip_"):
+        try:
+            target_user = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Некорректное приглашение", show_alert=True)
+            return
+        if target_user != int(call.from_user.id) or not skip_review(target_user):
+            bot.answer_callback_query(call.id, "Приглашение уже использовано", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Хорошо, пропускаем")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(call.message.chat.id, "Хорошо, отзыв пропущен. Спасибо, что подключились!", **NO_PREVIEW)
+        return
+    if action.startswith("review_approve_") or action.startswith("review_reject_"):
+        try:
+            target_user = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Некорректный отзыв", show_alert=True)
+            return
+        decision = "approved" if action.startswith("review_approve_") else "rejected"
+        review = moderate_review(target_user, decision)
+        if not review:
+            bot.answer_callback_query(call.id, "Отзыв уже обработан или не найден", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Отзыв опубликован" if decision == "approved" else "Отзыв отклонён")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        if decision == "approved":
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton("⭐ Смотреть отзывы", callback_data="reviews_show"))
+            try:
+                bot.send_message(target_user, "✅ Ваш отзыв одобрен и опубликован. Спасибо!", reply_markup=keyboard, **NO_PREVIEW)
+            except Exception:
+                pass
+        else:
+            try:
+                bot.send_message(target_user, "Спасибо за отзыв. Администратор решил не публиковать его.", **NO_PREVIEW)
+            except Exception:
+                pass
+        return
+    if action.startswith("qr_phone_"):
+        target_id = _qr_target_from_action(action)
+        session = active_logins.get(target_id)
+        if not session:
+            bot.answer_callback_query(call.id, "Сессия авторизации не найдена", show_alert=True)
+            return
+        try:
+            link, _record = remote_auth_service.create_link(
+                session, target_id, call.from_user.id, call.message.chat.id
+            )
+        except RuntimeError as error:
+            bot.answer_callback_query(call.id, "Нужна настройка HTTPS-ссылки сервера", show_alert=True)
+            bot.send_message(
+                call.message.chat.id,
+                "Вход по номеру откроется через защищённую страницу удалённого браузера. "
+                "Администратору нужно указать публичный HTTPS-домен и запустить сервис на сервере. "
+                "Пока можно продолжить вход по QR-коду.\n\n"
+                f"Причина: <code>{escape_html(str(error)[:300])}</code>",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            return
+        bot.answer_callback_query(call.id, "Защищённая страница готова")
+        cancel_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        cancel_keyboard.add(types.InlineKeyboardButton(
+            "❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_id}"
+        ))
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=cancel_keyboard)
+        except Exception:
+            pass
+        link_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        link_keyboard.add(types.InlineKeyboardButton("🔐 Открыть MAX и войти", url=link))
+        bot.send_message(
+            call.message.chat.id,
+            "📱 <b>Вход в MAX по номеру</b>\n\n"
+            "Откройте защищённую страницу и проходите вход прямо в окне MAX: выберите вход по номеру, "
+            "введите номер, код и при необходимости пароль там же. Не отправляйте их боту.\n\n"
+            "Ссылка одноразовая и действует 10 минут. Не пересылайте её. После успешного входа браузер "
+            "закроется, а MAX-сессия сохранится на сервере. Сервер браузера обрабатывает ввод, "
+            "но бот не получает номер/код через Telegram и не записывает текст ввода.",
+            parse_mode="HTML",
+            reply_markup=link_keyboard,
+            **NO_PREVIEW,
+        )
+        _start_remote_login_monitor(target_id, session, call.message.chat.id)
     elif action.startswith("qr_ready_"):
         target_id = _qr_target_from_action(action)
         bot.answer_callback_query(call.id, "⏳ Проверяю вход...")
@@ -3254,19 +3739,7 @@ def admin_callbacks(call):
         title = "аккаунта проекта" if target_id == "project_account" else chat["title"]
         status, data = session.check()
         if status == "success":
-            active_logins.pop(target_id, None)
-            _clear_auth_waiters(target_id)
-            if target_id == "project_account":
-                for customer_chat in get_all_chats():
-                    if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
-                        toggle_chat(customer_chat["chat_id"], True)
-            elif chat and chat.get("max_url"):
-                toggle_chat(target_id, True)
-            bot.send_message(
-                call.message.chat.id,
-                f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> сохранена.",
-                parse_mode='HTML', **NO_PREVIEW
-            )
+            _complete_login(target_id, call.message.chat.id)
         elif status == "awaiting_password":
             _set_auth_waiter(awaiting_password_from, target_id, call.from_user.id)
             try:
@@ -3305,7 +3778,8 @@ def admin_callbacks(call):
         elif status == "awaiting_phone":
             bot.send_message(
                 call.message.chat.id,
-                "Подключение по номеру телефона находится в разработке. Используйте QR-код выше.",
+                "MAX показывает форму ввода номера. Чтобы пройти вход самостоятельно, выберите «Войти по номеру телефона» "
+                "и откройте защищённую страницу. Номер и код вводите только там, не в Telegram.",
                 reply_markup=_build_qr_keyboard(target_id),
                 **NO_PREVIEW,
             )
@@ -3313,7 +3787,7 @@ def admin_callbacks(call):
             bot.send_message(
                 call.message.chat.id,
                 "⚠️ MAX пока не подтвердил вход. Убедитесь, что QR-код отсканирован в приложении MAX, "
-                "и нажмите кнопку ещё раз. Подключение по номеру телефона находится в разработке.",
+                "и нажмите кнопку ещё раз. Либо откройте защищённую страницу для входа по номеру телефона.",
                 reply_markup=_build_qr_keyboard(target_id),
                 **NO_PREVIEW,
             )
@@ -3335,18 +3809,7 @@ def admin_callbacks(call):
         title = "аккаунта проекта" if target_id == "project_account" else chat["title"]
         status, data = session.refresh()
         if status == "success":
-            active_logins.pop(target_id, None)
-            if target_id == "project_account":
-                for customer_chat in get_all_chats():
-                    if customer_chat.get("account_mode") == "project" and customer_chat.get("max_url"):
-                        toggle_chat(customer_chat["chat_id"], True)
-            elif chat and chat.get("max_url"):
-                toggle_chat(target_id, True)
-            bot.send_message(
-                call.message.chat.id,
-                f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> обновлена!",
-                parse_mode='HTML', **NO_PREVIEW
-            )
+            _complete_login(target_id, call.message.chat.id)
             return
         if status == "error":
             bot.send_message(
@@ -3373,6 +3836,7 @@ def admin_callbacks(call):
         target_id = _qr_target_from_action(action)
         session = active_logins.pop(target_id, None)
         if session:
+            remote_auth_service.revoke_session(session)
             try:
                 session.close()
             except:
@@ -3561,6 +4025,16 @@ def admin_callbacks(call):
                         show_alert=True,
                     )
                     return
+                if chat.get("account_mode") == "project":
+                    toggle_chat(target_id, False)
+                    bot.answer_callback_query(call.id, "Проверяю доступ аккаунта проекта…")
+                    threading.Thread(
+                        target=_verify_project_chat_access,
+                        args=(target_id, call.message.chat.id),
+                        daemon=True,
+                    ).start()
+                    show_chat_details(call.message.chat.id, call.message.message_id, target_id)
+                    return
             toggle_chat(target_id, not bool(chat['is_active']))
         show_chat_details(call.message.chat.id, call.message.message_id, target_id)
     elif action.startswith("admin_clear_chat_cache_"):
@@ -3573,7 +4047,7 @@ def admin_callbacks(call):
         target_id = int(action.split("_")[-1])
         bot.answer_callback_query(call.id, "⏳ Открываю страницу...")
         do_qr_login(target_id, call.message.chat.id)
-    elif action.startswith("admin_ask_delete_"):
+    elif action.startswith("admin_ask_delete_") and not action.startswith("admin_ask_delete_admin_"):
         target_id = int(action.split("_")[-1])
         chat = get_chat_by_id(target_id)
         if not chat:
@@ -3600,7 +4074,7 @@ def admin_callbacks(call):
         show_chats_list(call.message.chat.id, call.message.message_id)
     elif action.startswith("admin_ask_delete_admin_"):
         target_id = int(action.split("_")[-1])
-        if target_id == 5213315899:
+        if target_id == ADMIN_ID:
             bot.answer_callback_query(call.id, "⛔️ Нельзя удалить главного администратора!", show_alert=True)
             show_admins_list(call.message.chat.id, call.message.message_id)
             return
@@ -3626,15 +4100,14 @@ def admin_callbacks(call):
                           reply_markup=kb, **NO_PREVIEW)
     elif action.startswith("admin_yes_delete_admin_"):
         target_id = int(action.split("_")[-1])
-        if target_id == 5213315899:
+        if target_id == ADMIN_ID:
             bot.answer_callback_query(call.id, "⛔️ Нельзя удалить главного администратора!", show_alert=True)
             show_admins_list(call.message.chat.id, call.message.message_id)
             return
-        if target_id == ADMIN_ID:
-            bot.answer_callback_query(call.id, "️ Нельзя удалить главного админа!", show_alert=True)
+        if not delete_admin(target_id):
+            bot.answer_callback_query(call.id, "Админ уже удалён или не найден", show_alert=True)
             show_admins_list(call.message.chat.id, call.message.message_id)
             return
-        delete_admin(target_id)
         bot.answer_callback_query(call.id, "🗑 Админ удалён", show_alert=True)
         show_admins_list(call.message.chat.id, call.message.message_id)
     elif action.startswith("admin_set_url_"):
@@ -3773,9 +4246,10 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "<b>Подключение MAX → Telegram</b>\n\n"
                     "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
                     "<blockquote><b>1️⃣ Ваш аккаунт MAX</b>\n"
-                    "Вы сканируете QR-код для своей группы. Сессия и сообщения привязаны к вашей Telegram-группе.</blockquote>\n"
+                    "Основной вход — по QR-коду. На экране входа можно открыть защищённую страницу и войти по номеру телефона самостоятельно.</blockquote>\n"
                     "<blockquote><b>2️⃣ Аккаунт проекта</b>\n"
-                    "В исходную группу добавляется отдельный аккаунт MAX проекта. Его имя можно получить у поддержки.</blockquote>\n\n"
+                    f"В исходную группу добавляется аккаунт MAX проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>. "
+                    "После отправки ссылки бот проверит, может ли аккаунт открыть источник.</blockquote>\n\n"
                     "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
                 ),
                 reply_markup=parser_keyboard(),
@@ -3880,10 +4354,17 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "После отправки ссылки бот пришлёт QR-код. Отсканируйте его в приложении MAX и нажмите "
                     "«Готово, я отсканировал». Если MAX запросит пароль двухэтапной проверки, отправьте его боту в этой "
                     "личной переписке; он нужен только для входа в MAX. После успешного входа парсер включится автоматически 🎉.\n"
-                    "Подключение по номеру телефона находится в разработке.\n\n"
+                    "Вместо QR откройте защищённую ссылку с экрана входа и самостоятельно выберите вход по номеру. "
+                    "Номер, код и пароль вводятся в удалённой странице MAX, не в Telegram. Сервер MAX_Parser технически "
+                    "обрабатывает ввод, но приложение не сохраняет его и не пересылает в Telegram.\n\n"
                     "<b>Вариант 2 · Через готовый аккаунт MAX</b>\n"
-                    "После того как вы добавили MAX_Pаrser в группу напишите в вашей группе в Telegram команду /bind и после, "
-                    "пришлите БОТУ В ЛС ссылку, которая ведет на вашу группу. Настройка завершена 🎉.\n\n"
+                    f"Добавьте аккаунт MAX проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code> в исходную группу или канал. "
+                    "Если поиск по номеру не срабатывает, попросите владельца/администратора прислать аккаунту ссылку-приглашение. "
+                    "В канале аккаунту нужно выдать доступ к публикациям. Если добавить его нельзя, владелец может разрешить "
+                    "чтение по публичной ссылке; иначе этот способ для источника не подойдёт.\n"
+                    "В личном чате с ботом выберите вариант 2, добавьте бота в Telegram-группу назначения и отправьте там /bind. "
+                    "Затем пришлите ссылку исходной группы MAX. Бот проверит чтение и включит парсинг только при успехе. "
+                    "Для публичного источника эта проверка доказывает доступ к чтению, но не членство аккаунта в группе.\n\n"
                     "<b>Управление и помощь</b>\n"
                     "• /mychats — посмотреть свои подключения.\n"
                     "• /cancel — отменить текущий шаг настройки.\n"
@@ -3896,6 +4377,15 @@ MAX_Parser будет работать через <b>другой аккаунт
 
 if __name__ == "__main__":
     try:
+        if remote_auth_service.enabled:
+            try:
+                if remote_auth_service.start():
+                    print("🔐 Сервис защищённого входа по номеру запущен на loopback")
+            except OSError as error:
+                debug_logger.error("REMOTE_AUTH_SERVICE_START_FAILED error_type=%s", type(error).__name__)
+                print("⚠️ Сервис входа по номеру не запустился; QR-вход остаётся доступен")
+        else:
+            print("ℹ️ Вход по номеру ждёт REMOTE_AUTH_BASE_URL с HTTPS-доменом; QR-вход доступен")
         threading.Thread(target=background_parser, daemon=True).start()
         if PAYMENTS_ENABLED:
             threading.Thread(target=subscription_reminder_loop, daemon=True).start()
