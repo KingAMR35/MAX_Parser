@@ -587,7 +587,10 @@ class QRLoginSession:
             value = args.get("text")
             if not isinstance(value, str) or not value or len(value) > 256 or "\x00" in value:
                 raise ValueError("Недопустимый текст ввода")
-            self.page.keyboard.insert_text(value)
+            # Use real, ordered key events so MAX's code/phone inputs process
+            # each character. A single insert_text call behaves like paste
+            # and is ignored by some of MAX's segmented verification fields.
+            self.page.keyboard.type(value, delay=8)
             return True
         if action == "scroll":
             delta_y = int(args.get("deltaY", 0))
