@@ -43,7 +43,7 @@ main{max-width:1080px;margin:auto;padding:18px}h1{font-size:21px;margin:0 0 8px}
 const screen=document.getElementById('screen'), box=document.getElementById('keyboard'), state=document.getElementById('state');
 let stopped=false, ready=false, previousImageUrl=null;
 let typingTimer=null;
-function httpError(prefix,status){const reasons={400:'удалённый браузер не выполнил действие',401:'сессия авторизации не найдена',403:'сервер отклонил запрос страницы',404:'маршрут API не найден',410:'удалённая сессия завершена'};return prefix+': '+(reasons[status]||'ошибка сервера')+' (HTTP '+status+')';}
+function httpError(prefix,status){const reasons={400:'действие отклонено',401:'сессия авторизации не найдена',403:'сервер отклонил запрос страницы',404:'маршрут API не найден',410:'удалённая сессия завершена',500:'ошибка удалённого браузера',504:'удалённый браузер не ответил вовремя'};return prefix+': '+(reasons[status]||'ошибка сервера')+' (HTTP '+status+')';}
 async function post(path,data={}){const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok)throw new Error(httpError('Не удалось управлять MAX',r.status));return r.json().catch(()=>({}));}
 async function action(name,values={}){if(!ready)return;try{await post('/api/action',{action:name,...values});}catch(e){state.textContent=e.message;}}
 async function flushText(){if(typingTimer){clearTimeout(typingTimer);typingTimer=null;}const text=box.value;if(text){box.value='';await action('text',{text});}}
@@ -174,8 +174,15 @@ class RemoteAuthService:
                     try:
                         image = record["session"].remote_action("screenshot", timeout=8)
                         self._send(200, image, "image/png")
-                    except Exception:
+                    except RuntimeError as error:
+                        print(f"REMOTE_AUTH_SNAPSHOT_CLOSED error_type={type(error).__name__}")
                         self._send(410)
+                    except TimeoutError as error:
+                        print(f"REMOTE_AUTH_SNAPSHOT_TIMEOUT error_type={type(error).__name__}")
+                        self._send(504)
+                    except Exception as error:
+                        print(f"REMOTE_AUTH_SNAPSHOT_FAILED error_type={type(error).__name__}")
+                        self._send(500)
                     return
                 if route == "/api/status":
                     status = service.status(self._cookie())
@@ -211,10 +218,18 @@ class RemoteAuthService:
                 try:
                     result = record["session"].remote_action(body.get("action"), body, timeout=6)
                     self._send(200, json.dumps({"ok": bool(result)}).encode("utf-8"))
-                except (ValueError, RuntimeError, TimeoutError):
+                except ValueError as error:
+                    print(f"REMOTE_AUTH_ACTION_REJECTED error_type={type(error).__name__}")
                     self._send(400)
-                except Exception:
+                except RuntimeError as error:
+                    print(f"REMOTE_AUTH_ACTION_CLOSED error_type={type(error).__name__}")
                     self._send(410)
+                except TimeoutError as error:
+                    print(f"REMOTE_AUTH_ACTION_TIMEOUT error_type={type(error).__name__}")
+                    self._send(504)
+                except Exception as error:
+                    print(f"REMOTE_AUTH_ACTION_FAILED error_type={type(error).__name__}")
+                    self._send(500)
 
         self._server = ThreadingHTTPServer((self.bind_host, self.port), Handler)
         self._server.daemon_threads = True

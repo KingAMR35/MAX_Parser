@@ -547,7 +547,9 @@ class QRLoginSession:
             x, y = int(args.get("x", -1)), int(args.get("y", -1))
             if not (0 <= x < 1280 and 0 <= y < 800):
                 raise ValueError("Координаты клика вне окна")
-            self.page.mouse.click(x, y, timeout=3000)
+            # Playwright Mouse.click does not accept a timeout keyword.
+            # Passing one raises TypeError, which made every remote click fail.
+            self.page.mouse.click(x, y)
             return True
         if action == "key":
             key = str(args.get("key", ""))
