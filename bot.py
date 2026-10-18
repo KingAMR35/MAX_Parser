@@ -11,6 +11,7 @@ import unicodedata
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from telebot import types
 from dotenv import load_dotenv
 import concurrent.futures
@@ -119,7 +120,7 @@ MAX_PROJECT_ACCOUNT_PHONE = "+7 939 752 85 95"
 bot.set_my_commands([
     types.BotCommand("start", "Запустить бота"),
     types.BotCommand("help", "Связаться с тех поддержкой"),
-    types.BotCommand("connect", "Подключить группу MAX"),
+    types.BotCommand("connect", "Подключить чат MAX"),
     types.BotCommand("mychats", "Мои группы парсинга"),
     types.BotCommand("subscription", "Подписка и продление"),
     types.BotCommand("admin", "Админ-панель")
@@ -1564,6 +1565,7 @@ def show_admin_menu(chat_id):
     kb.row(types.InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast"))
     kb.row(types.InlineKeyboardButton("💬 Отправить в чат", callback_data="admin_send_to_chat"))
     kb.row(types.InlineKeyboardButton("👤 Отправить пользователю", callback_data="admin_send_to_user"))
+    kb.add(types.InlineKeyboardButton("🎁 Бесплатная подписка", callback_data="admin_free_subscriptions"))
     kb.add(types.InlineKeyboardButton("🔑 MAX-аккаунт проекта", callback_data="admin_project_login"))
     kb.add(types.InlineKeyboardButton("🗑 Очистить весь кэш", callback_data="admin_clear_cache", style="danger"))
     bot.send_message(chat_id, text, reply_markup=kb, **NO_PREVIEW)
@@ -1837,6 +1839,67 @@ def show_users_list(chat_id, message_id, page=0):
     _page_buttons(kb, page, page_count, "admin_users_page")
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+
+
+def show_free_subscription_users(chat_id, message_id, page=0):
+    users = get_all_users()
+    page_count = max(1, (len(users) + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    first = page * ADMIN_LIST_PAGE_SIZE
+    shown = users[first:first + ADMIN_LIST_PAGE_SIZE]
+    text = f"🎁 <b>Выдать бесплатную подписку</b> · {len(users)} пользователей\n\nВыберите пользователя:"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for user in shown:
+        name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
+        display = f"@{user['username']}" if user.get("username") else (name or str(user["user_id"]))
+        text += f"\n\n<b>{escape_html(name or display)}</b> · <code>{user['user_id']}</code>"
+        keyboard.add(types.InlineKeyboardButton(
+            _short_button_label(f"🎁 {display}", 32),
+            callback_data=f"admin_free_sub_user_{user['user_id']}"
+        ))
+    if not users:
+        text = "🎁 <b>Бесплатная подписка</b>\n\nПользователей пока нет."
+    _page_buttons(keyboard, page, page_count, "admin_free_sub_page")
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, **NO_PREVIEW)
+
+
+def show_free_subscription_options(chat_id, message_id, user_id):
+    user = next((item for item in get_all_users() if int(item["user_id"]) == int(user_id)), None)
+    if not user:
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔙 К списку", callback_data="admin_free_subscriptions"))
+        safe_edit_message(
+            "Пользователь не найден. Обновите список и попробуйте ещё раз.",
+            chat_id, message_id,
+            reply_markup=keyboard,
+            **NO_PREVIEW,
+        )
+        return
+    name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
+    username = f"@{escape_html(user['username'])}" if user.get("username") else "без username"
+    text = (
+        "🎁 <b>Выдача бесплатной подписки</b>\n\n"
+        f"Пользователь: <b>{escape_html(name or 'Имя не указано')}</b> ({username})\n"
+        f"ID: <code>{user_id}</code>\n\n"
+        "Выберите срок и способ подключения. Если подписка уже активна, новый срок добавится к ней."
+    )
+    current = get_subscription(user_id)
+    if current and current["active_until"] > datetime.now(timezone.utc):
+        active_until = current["active_until"].astimezone(timezone.utc)
+        text += f"\n\nСейчас действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>."
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for days, period in ((30, "30 дней"), (90, "3 месяца"), (365, "1 год")):
+        keyboard.add(types.InlineKeyboardButton(
+            f"🎁 {period} · ваш MAX",
+            callback_data=f"admin_free_sub_grant_self_{days}_{user_id}"
+        ))
+        keyboard.add(types.InlineKeyboardButton(
+            f"🎁 {period} · MAX проекта",
+            callback_data=f"admin_free_sub_grant_project_{days}_{user_id}"
+        ))
+    keyboard.add(types.InlineKeyboardButton("🔙 К списку", callback_data="admin_free_subscriptions"))
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, **NO_PREVIEW)
 
 
 def show_user_send_selector(chat_id, message_id, page=0):
@@ -2834,7 +2897,7 @@ def handle_successful_payment(message):
             user_id,
             "Теперь можно подключить первую группу.\n\n"
             f"Выбранный способ: <b>{label}</b>. Добавьте меня в нужную Telegram-группу и отправьте там /bind. "
-            "Если я уже нахожусь в ней, просто отправьте /bind. Затем пришлите ссылку на исходную группу MAX.",
+            "Если я уже нахожусь в ней, просто отправьте /bind. Затем пришлите ссылку на источник MAX.",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -2875,10 +2938,30 @@ def connect_command(message):
         return
     bot.send_message(
         message.chat.id,
-        "Выберите способ подключения.",
+        f"Выберите способ подключения. Подключено чатов: {len(get_user_chats(message.from_user.id))}/{MAX_CUSTOMER_CHATS}.",
         reply_markup=parser_keyboard(),
         **NO_PREVIEW,
     )
+
+
+def _chat_limit_notice():
+    return (
+        f"К вашему аккаунту можно подключить до {MAX_CUSTOMER_CHATS} чатов. "
+        "Если нужно больше, напишите в поддержку командой /help."
+    )
+
+
+def _is_max_source_url(value):
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return (
+            parsed.scheme.lower() in {"http", "https"}
+            and (host == "max.ru" or host.endswith(".max.ru"))
+            and bool(parsed.path)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 @bot.message_handler(commands=['mychats'])
@@ -2969,15 +3052,13 @@ def _chat_delete_allowed(user_id, chat):
 
 def _project_access_help():
     return (
-        "Добавьте аккаунт MAX проекта <code>"
-        f"{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> в исходный чат. "
-        "Если поиск по номеру не срабатывает, попросите владельца или администратора MAX "
-        "прислать аккаунту ссылку-приглашение. В канале аккаунт должен иметь доступ к публикациям "
-        "(обычно его добавляют подписчиком/участником). Если добавить нельзя, владелец может "
-        "временно разрешить доступ по публичной ссылке; если MAX всё равно не показывает сообщения, "
-        "вариант с аккаунтом проекта для этого источника не заработает. "
-        "Проверка подтверждает, что аккаунт может открыть и читать источник, но для публичной группы "
-        "сама по себе не доказывает членство в ней."
+        "Чтобы читать закрытый чат, аккаунт проекта <code>"
+        f"{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> должен вступить в него. "
+        "Можно добавить его по номеру или прислать боту ссылку-приглашение: бот попробует открыть её и вступить. "
+        "Если MAX отправит заявку, владелец или администратор должен её одобрить. "
+        "Для канала достаточно права читать публикации — права администратора не нужны. "
+        "Открытые чаты можно подключить по ссылке, если MAX показывает сообщения аккаунту проекта. "
+        "После отправки ссылки бот проверит доступ; если MAX не даст открыть чат, парсинг останется выключен."
     )
 
 
@@ -3015,7 +3096,7 @@ def _verify_project_chat_access(chat_id, notify_chat_id=None):
         toggle_chat(chat_id, True)
         bot.send_message(
             destination,
-            "✅ <b>Доступ к парсингу проверен.</b> Аккаунт проекта смог открыть исходную группу, и парсинг запущен.\n\n"
+            "✅ <b>Доступ проверен.</b> Аккаунт проекта видит источник MAX, пересылка запущена.\n\n"
             "Если в группе пока нет сообщений, парсер продолжит проверять её автоматически.",
             parse_mode="HTML",
             **NO_PREVIEW,
@@ -3040,11 +3121,26 @@ def _verify_project_chat_access(chat_id, notify_chat_id=None):
                 "🔁 Проверить подключение",
                 callback_data=f"project_retry_{chat_id}",
             ))
+            if "MAX_INVITE_APPROVAL_PENDING" in str(error):
+                access_message = (
+                    "Заявка аккаунта проекта на вступление отправлена. "
+                    "Когда владелец или администратор её одобрит, нажмите «Проверить подключение»."
+                )
+            elif "MAX_INVITE_JOIN_REQUIRED" in str(error):
+                access_message = (
+                    "Не удалось вступить в источник по этой ссылке. "
+                    "Попросите владельца или администратора добавить аккаунт либо прислать новую ссылку. "
+                    "После добавления нажмите «Проверить подключение»."
+                )
+            else:
+                access_message = (
+                    "Не удалось подтвердить доступ аккаунта проекта к источнику MAX. "
+                    "Проверьте ссылку и убедитесь, что аккаунт добавлен и видит сообщения. "
+                    "Затем нажмите «Проверить подключение»."
+                )
             bot.send_message(
                 destination,
-                "⚠️ Не удалось подтвердить доступ аккаунта проекта к исходной группе. "
-                "Подключение оставил выключенным.\n\n"
-                f"{_project_access_help()}",
+                "⚠️ " + access_message + "\n\n" + _project_access_help(),
                 parse_mode="HTML",
                 reply_markup=keyboard,
                 **NO_PREVIEW,
@@ -3076,7 +3172,13 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         title = bot.get_chat(chat_id).title or f"Группа {chat_id}"
     except Exception:
         title = f"Группа {chat_id}"
-    if not claim_chat(chat_id, title, owner_id, account_mode):
+    try:
+        claimed = claim_chat(chat_id, title, owner_id, account_mode)
+    except ChatLimitReached:
+        pending_setup_modes.pop(owner_id, None)
+        bot.send_message(owner_id, _chat_limit_notice(), **NO_PREVIEW)
+        return False
+    if not claimed:
         pending_setup_modes.pop(owner_id, None)
         bot.send_message(
             owner_id,
@@ -3089,13 +3191,13 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
     bot.send_message(
         owner_id,
         f"✅ Группа <b>{escape_html(title)}</b> закреплена за вами.\n\n"
-        f"<b>Шаг 2 из {2 if account_mode == 'project' else 3}.</b> Пришлите сюда ссылку на группу MAX, из которой нужно получать сообщения.\n"
+        f"<b>Шаг 2 из {2 if account_mode == 'project' else 3}.</b> Пришлите ссылку на чат, группу или канал MAX, откуда получать сообщения.\n"
         "Как скопировать ссылку: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
-        "зайдите в нужную группу и скопируйте её ссылку из меню группы.\n\n"
-        + (f"Для этого способа аккаунт MAX проекта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> "
-           "должен иметь доступ к исходной группе. Если его нельзя добавить напрямую, попросите владельца "
-           "или администратора выдать ссылку-приглашение либо разрешить чтение по публичной ссылке. "
-           "После настройки бот отдельно проверит, может ли аккаунт открыть источник.\n\n"
+        "откройте нужный чат, группу или канал и скопируйте ссылку из меню.\n\n"
+        + (f"Для открытого источника отправьте обычную ссылку. Для закрытого пришлите ссылку-приглашение — "
+           f"бот попробует подключить аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
+           "Если MAX отправит заявку, владелец/администратор должен её одобрить. "
+           "Затем бот проверит, видит ли аккаунт сообщения.\n\n"
            if account_mode == "project" else "")
         + "Для отмены отправьте /cancel.",
         parse_mode="HTML",
@@ -3141,10 +3243,10 @@ def customer_source_url(message):
         )
         return
     url = (message.text or "").strip()
-    if not re.match(r"^https?://(?:web\.)?max\.ru/", url, re.I):
+    if not _is_max_source_url(url):
         bot.send_message(
             message.chat.id,
-            "Не похоже на ссылку группы MAX. Пришлите полную ссылку вида <code>https://web.max.ru/…</code>.",
+            "Не удалось распознать ссылку MAX. Пришлите ссылку на чат, группу или канал с домена max.ru.",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -3169,7 +3271,7 @@ def customer_source_url(message):
     if os.path.exists(project_session):
         bot.send_message(
             message.chat.id,
-            "✅ Ссылка сохранена. Сейчас проверю, может ли аккаунт проекта открыть эту группу MAX. "
+            "✅ Ссылка сохранена. Сейчас проверю, может ли аккаунт проекта открыть этот чат MAX. "
             "Парсинг включится только после успешной проверки.\n\n"
             f"{_project_access_help()}",
             parse_mode="HTML",
@@ -3184,7 +3286,7 @@ def customer_source_url(message):
         bot.send_message(
             message.chat.id,
             "✅ Ссылка сохранена. Подключение включится после настройки сессии аккаунта проекта "
-            "и проверки доступа к исходной группе.\n\n"
+            "и проверки доступа к источнику.\n\n"
             f"{_project_access_help()}\n\n"
             "Когда сессия будет готова, бот проверит доступ автоматически. Если MAX всё ещё не видит группу, "
             "в сообщении появится кнопка повторной проверки.",
@@ -3980,6 +4082,65 @@ def admin_callbacks(call):
             call.message.chat.id, call.message.message_id,
             int(action.rsplit("_", 1)[1]),
         )
+    elif action == "admin_free_subscriptions":
+        show_free_subscription_users(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_free_sub_page_"):
+        show_free_subscription_users(
+            call.message.chat.id, call.message.message_id,
+            int(action.rsplit("_", 1)[1]),
+        )
+    elif action.startswith("admin_free_sub_user_"):
+        try:
+            target_user_id = int(action.rsplit("_", 1)[1])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Не удалось определить пользователя", show_alert=True)
+            return
+        show_free_subscription_options(
+            call.message.chat.id, call.message.message_id, target_user_id
+        )
+    elif action.startswith("admin_free_sub_grant_"):
+        try:
+            parts = action.split("_")
+            plan_code, days_value, user_id_value = parts[4], parts[5], parts[6]
+            target_user_id = int(user_id_value)
+            days = int(days_value)
+            if plan_code not in {"self", "project"} or days not in {30, 90, 365}:
+                raise ValueError("invalid subscription choice")
+            granted = grant_subscription(target_user_id, plan_code, days)
+        except (ValueError, TypeError, IndexError) as error:
+            bot.answer_callback_query(call.id, "Не удалось выдать подписку", show_alert=True)
+            debug_logger.warning("ADMIN_FREE_SUBSCRIPTION_INVALID admin_id=%s error=%s", call.from_user.id, log_preview(error, 120))
+            return
+        except Exception as error:
+            bot.answer_callback_query(call.id, "Ошибка базы данных", show_alert=True)
+            debug_logger.exception("ADMIN_FREE_SUBSCRIPTION_FAILED admin_id=%s user_id=%s", call.from_user.id, target_user_id)
+            return
+
+        active_until = granted["active_until"].astimezone(timezone.utc)
+        plan_label = "ваш аккаунт MAX" if plan_code == "self" else "аккаунт проекта MAX"
+        delivery_note = ""
+        try:
+            bot.send_message(
+                target_user_id,
+                "🎁 <b>Вам выдан бесплатный доступ к MAX_Parser</b>\n\n"
+                f"Срок: <b>{days} дней</b> · способ: <b>{plan_label}</b>.\n"
+                f"Подписка действует до <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n\n"
+                "Подключить или посмотреть чаты можно через /connect и /mychats.",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        except Exception:
+            delivery_note = "\nУведомление пользователю не доставлено — возможно, он ещё не запускал бота."
+        text = (
+            "✅ <b>Бесплатная подписка выдана</b>\n\n"
+            f"Пользователь: <code>{target_user_id}</code>\n"
+            f"Срок: {days} дней · {plan_label}\n"
+            f"Действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>."
+            f"{delivery_note}"
+        )
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+        safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, **NO_PREVIEW)
     elif action == "admin_parse_diagnostics":
         show_parse_diagnostics(call.message.chat.id, call.message.message_id)
     elif action.startswith("admin_parse_diag_"):
@@ -4265,9 +4426,9 @@ def callback_handler(call):
                 message_id=call.message.message_id,
                 text='''
 <b>MAX_Parser — удобный мост между MAX и Telegram</b>\n
-<i>Он помогает автоматически пересылать новые сообщения из выбранной группы MAX в Telegram. Ты не пропустишь важные объявления, обсуждения и файлы, даже если чаще пользуешься Telegram.</i>\n
+<i>Он помогает автоматически пересылать новые сообщения из выбранного чата MAX в Telegram. Ты не пропустишь важные объявления, обсуждения и файлы, даже если чаще пользуешься Telegram.</i>\n
 <blockquote><b>Что умеет бот:</b>\n
-• Пересылать новые сообщения из подключённой группы MAX.
+• Пересылать новые сообщения из подключённого чата MAX.
 • Отправлять текст, фото, видео, документы и другие поддерживаемые вложения.
 • Работать автоматически: не нужно постоянно открывать MAX и проверять группу вручную.
 • Помогать не терять важную информацию из школьных, рабочих или дружеских чатов.
@@ -4276,12 +4437,10 @@ def callback_handler(call):
 • Не нужно каждый раз переключаться между приложениями.
 • Не нужно постоянно включать и выключать VPN.
 • Ты сам выбираешь группу и настраиваешь, откуда получать сообщения.</blockquote>\n
-<blockquote><b>⚠️ Важно знать:</b>\n
-Бот использует <b>автоматизированный доступ к MAX</b>, поэтому в редких случаях аккаунт может быть <b>временно ограничен на несколько дней</b>. Это редкая ситуация, но такие ограничения возможны со стороны MAX.\n
-Если вы боитесь, что можете временно потерять доступ к аккаунту в MAX, то у MAX_Parser <b>есть отличное решение</b>:\n
-MAX_Parser будет работать через <b>другой аккаунт</b>, который сделан специально для парсинга. Тебе не нужно авторизоваться в MAX и предоставлять доступ к своему аккаунту.\n
-Достаточно будет просто пригласить этот аккаунт в группу MAX, из которой нужно пересылать сообщения. Бот будет автоматически получать новые сообщения и пересылать их в Telegram.\n
-🔒 Тем самым, ваш аккаунт в MAX останется в <b>абсолютной безопасности</b>.</blockquote>
+<blockquote><b>Выберите способ подключения:</b>\n
+• <b>Ваш аккаунт MAX:</b> вы входите в MAX, а бот читает выбранный вами чат.\n
+• <b>Аккаунт проекта:</b> добавьте его в исходную группу или канал. В закрытом источнике владелец может подтвердить вступление.\n
+В обоих случаях бот пересылает сообщения только из источников, к которым у выбранного аккаунта есть доступ.</blockquote>
 
 ''', reply_markup=return_start(), parse_mode='HTML', **NO_PREVIEW)
         elif call.data == "start_comeback":
@@ -4313,10 +4472,11 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "<b>Подключение MAX → Telegram</b>\n\n"
                     "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
                     "<blockquote><b>1️⃣ Ваш аккаунт MAX</b>\n"
-                    "В данном способе вы даете доступ к своему аккаунту, после бот будет просмотривать ТОЛЬКО ту группу, которую вы указали.</blockquote>\n"
+                    "Бот будет читать только выбранный вами чат. Авторизация сохраняется для этого подключения.</blockquote>\n"
                     "<blockquote><b>2️⃣ Аккаунт проекта</b>\n"
-                    f"В группу добавляется аккаунт MAX проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>. "
-                    "После отправки ссылки бот проверит, может ли аккаунт открыть источник.</blockquote>\n\n"
+                    f"Добавьте аккаунт проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code> в нужный MAX-чат. "
+                    "После отправки ссылки бот проверит, видит ли он сообщения.</blockquote>\n\n"
+                    f"Можно подключить до {MAX_CUSTOMER_CHATS} чатов. Чтобы подключить больше, напишите в поддержку через /help.\n\n"
                     "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
                 ),
                 reply_markup=parser_keyboard(),
@@ -4345,6 +4505,10 @@ MAX_Parser будет работать через <b>другой аккаунт
                 return
             mode = "self" if call.data == "my_acc_250" else "project"
             track_user(call)
+            if len(get_user_chats(call.from_user.id)) >= MAX_CUSTOMER_CHATS:
+                bot.answer_callback_query(call.id, "Достигнут лимит подключений", show_alert=True)
+                bot.send_message(call.from_user.id, _chat_limit_notice(), **NO_PREVIEW)
+                return
             if _user_needs_subscription(call.from_user.id):
                 bot.answer_callback_query(call.id, "Сначала оформите подписку")
                 _send_subscription_invoice(call.from_user.id, mode)
@@ -4408,15 +4572,14 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "<b>Что понадобится</b>\n"
                     "• Эта переписка с ботом.\n"
                     "• Ваша Telegram-группа для получения сообщений.\n"
-                    "• Ссылка на группу MAX.\n\n"
-                    "<b>Шаг 1 · Выберите Telegram-группу, в которую будут приходить сообщения из группы MAX</b>\n"
+                    "• Ссылка на чат, группу или канал MAX.\n\n"
+                    "<b>Шаг 1 · Выберите Telegram-группу, в которую будут приходить сообщения из MAX</b>\n"
                     "После нажатия на кнопку «Подключить MAX_Parser» выберите способ работы с MAX. Затем добавьте этого бота "
                     "в Telegram-группу, куда должны приходить сообщения. После появления бота отправьте в группе /bind. "
                     "Если бот уже добавлен, то просто напишите /bind. Боту нужно разрешить отправлять сообщения.\n\n"
-                    "<b>Шаг 2 · Укажите группу MAX</b>\n"
-                    "Откройте <a href=\"https://web.max.ru\">web.max.ru</a>, войдите в MAX, перейдите в нужную группу "
-                    "и скопируйте ссылку группы из её меню. Бот попросит прислать эту ссылку в личный чат. "
-                    "Проверьте, что ссылка ведёт именно в нужную группу.\n\n"
+                    "<b>Шаг 2 · Укажите источник MAX</b>\n"
+                    "Откройте <a href=\"https://web.max.ru\">web.max.ru</a>, перейдите в нужный чат, группу или канал "
+                    "и скопируйте ссылку из меню. Отправьте её боту в личном чате.\n\n"
                     "<b>Вариант 1 · Ваш аккаунт MAX</b>\n"
                     "После отправки ссылки бот пришлёт QR-код. Отсканируйте его в приложении MAX и нажмите "
                     "«Готово, я отсканировал». Если MAX запросит пароль двухэтапной проверки, отправьте его боту в этой "
@@ -4425,13 +4588,14 @@ MAX_Parser будет работать через <b>другой аккаунт
                     "Номер, код и пароль вводятся в удалённой странице MAX, не в Telegram. Сервер MAX_Parser технически "
                     "обрабатывает ввод, но приложение не сохраняет его и не пересылает в Telegram.\n\n"
                     "<b>Вариант 2 · Через готовый аккаунт MAX</b>\n"
-                    f"Добавьте аккаунт MAX проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code> в исходную группу или канал. "
-                    "Если поиск по номеру не срабатывает, попросите владельца/администратора прислать аккаунту ссылку-приглашение. "
-                    "В канале аккаунту нужно выдать доступ к публикациям. Если добавить его нельзя, владелец может разрешить "
-                    "чтение по публичной ссылке; иначе этот способ для источника не подойдёт.\n"
+                    f"Попросите владельца или администратора добавить в источник аккаунт <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>. "
+                    "Для закрытого источника можно отправить боту ссылку-приглашение: он попробует вступить. "
+                    "Если MAX попросит одобрение, его должен дать владелец или администратор. "
+                    "Для канала достаточно обычного доступа к публикациям — права администратора не нужны.\n"
                     "В личном чате с ботом выберите вариант 2, добавьте бота в Telegram-группу назначения и отправьте там /bind. "
-                    "Затем пришлите ссылку исходной группы MAX. Бот проверит чтение и включит парсинг только при успехе. "
-                    "Для публичного источника эта проверка доказывает доступ к чтению, но не членство аккаунта в группе.\n\n"
+                    "Затем пришлите ссылку на источник MAX. Бот проверит, может ли аккаунт проекта открыть сообщения, "
+                    "и включит пересылку только после успешной проверки. Для закрытых источников владелец должен разрешить доступ.\n\n"
+                    f"К одному аккаунту можно подключить до {MAX_CUSTOMER_CHATS} чатов. Чтобы подключить больше, напишите в поддержку через /help.\n\n"
                     "<b>Управление и помощь</b>\n"
                     "• /mychats — посмотреть свои подключения.\n"
                     "• /cancel — отменить текущий шаг настройки.\n"

@@ -1233,6 +1233,97 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
         return False
     return True
 
+
+def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
+    """Join a user-selected MAX source when MAX shows a clear join/subscribe button."""
+    source_parts = urlparse(source_url)
+    source_host = (source_parts.hostname or "").lower().rstrip(".")
+    if source_host != "max.ru" and not source_host.endswith(".max.ru"):
+        return
+    is_invite_link = bool(re.match(r"^/join(?:/|$)", source_parts.path, re.I))
+
+    invite_actions = re.compile(
+        r"^(?:вступить(?: в (?:чат|группу|канал))?|присоединиться|подписаться|"
+        r"принять(?: приглашение)?|отправить заявку|запросить вступление|"
+        r"join(?: chat| group| channel)?|subscribe|request to join)$",
+        re.I,
+    )
+    buttons = page.locator("button, [role='button']")
+    clicked = False
+    requested_approval = False
+    for _ in range(2):
+        matched = None
+        matched_requests_approval = False
+        try:
+            for index in range(min(buttons.count(), 40)):
+                button = buttons.nth(index)
+                try:
+                    if not button.is_visible(timeout=100):
+                        continue
+                    label = " ".join((button.inner_text(timeout=250) or "").split())
+                    if not label:
+                        label = " ".join((button.get_attribute("aria-label") or "").split())
+                    if invite_actions.fullmatch(label):
+                        matched = button
+                        if re.fullmatch(r"отправить заявку|запросить вступление|request to join", label, re.I):
+                            matched_requests_approval = True
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            matched = None
+        if matched is None:
+            break
+        try:
+            matched.click(timeout=2000)
+            page.wait_for_timeout(1200)
+            clicked = True
+            requested_approval = requested_approval or matched_requests_approval
+        except Exception as error:
+            debug_logger.warning(
+                "MAX_INVITE_ACTION_FAILED chat_id=%s error=%s",
+                chat_id, log_preview(error, 180),
+            )
+            break
+
+    if requested_approval:
+        raise Exception("MAX_INVITE_APPROVAL_PENDING")
+    current_path = urlparse(page.url).path
+    if is_invite_link and re.match(r"^/join(?:/|$)", current_path, re.I):
+        if clicked:
+            try:
+                body_text = page.locator("body").inner_text(timeout=500).casefold()
+            except Exception:
+                body_text = ""
+            if re.search(
+                r"(?:заявка.{0,30}(?:отправлена|ожидает|рассматривается)|"
+                r"ожидайте.{0,20}(?:одобрения|подтверждения)|"
+                r"request.{0,30}(?:sent|pending)|waiting for (?:approval|review))",
+                body_text,
+                re.I,
+            ):
+                raise Exception("MAX_INVITE_APPROVAL_PENDING")
+        remaining_action = False
+        try:
+            for index in range(min(buttons.count(), 40)):
+                button = buttons.nth(index)
+                if not button.is_visible(timeout=100):
+                    continue
+                label = " ".join((button.inner_text(timeout=250) or "").split())
+                if not label:
+                    label = " ".join((button.get_attribute("aria-label") or "").split())
+                if invite_actions.fullmatch(label):
+                    remaining_action = True
+                    break
+        except Exception:
+            remaining_action = True
+        if remaining_action:
+            raise Exception("MAX_INVITE_JOIN_REQUIRED")
+        if not clicked:
+            raise Exception("MAX_INVITE_JOIN_REQUIRED")
+    if clicked:
+        debug_logger.info("MAX_INVITE_ACCEPTED chat_id=%s route=%s", chat_id, current_path)
+
 def mark_message_seen(post: dict, chat_id: int = 0) -> None:
     if chat_id not in message_cache_by_chat:
         message_cache_by_chat[chat_id] = set()
@@ -3613,8 +3704,18 @@ def parse_max_group_media(
             raise Exception(f"SESSION_EXPIRED|{debug_path}")
         _goto_max_with_retry(page, group_url, chat_id, "переход в чат MAX")
         page.wait_for_timeout(4000)
+        _accept_max_invite_if_available(page, group_url, chat_id)
         current_url = page.url
-        if group_url not in current_url:
+        requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
+        current_parts = urlparse(current_url)
+        current_host = (current_parts.hostname or "").lower().rstrip(".")
+        current_path = current_parts.path.rstrip("/").lower()
+        redirected_to_max_chat = (
+            (requested_host == "max.ru" or requested_host.endswith(".max.ru"))
+            and (current_host == "max.ru" or current_host.endswith(".max.ru"))
+            and current_path not in {"", "/", "/auth", "/login", "/signin", "/sign-in"}
+        )
+        if group_url not in current_url and not redirected_to_max_chat:
             debug_path = f"{SESSIONS_DIR}/wrong_chat_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"WRONG_CHAT_REDIRECT|{debug_path}")

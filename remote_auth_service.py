@@ -34,7 +34,13 @@ main{max-width:1080px;margin:auto;padding:clamp(9px,2vw,18px)}h1{font-size:21px;
 </style></head>
 <body><main>
 <h1>🔐 Вход в MAX</h1>
-<p class="notice">Нажмите «Ввести текст», наберите номер или код и отправьте его: сервис автоматически выберет видимое поле авторизации MAX. Если поле не определится, нажмите его на экране MAX вручную. Черновик можно исправлять до отправки. Enter отправляет текст и нажимает Enter в MAX. Не отправляйте код в Telegram.</p>
+<h2>Краткая инструкция</h2>
+<p class="notice"><strong>1.</strong> Нажмите НА ЭКРАНЕ <b>sign in with phone number</b></p>
+<p class="notice"><strong>2.</strong> Введите свой номер телефона <b>сразу с девятки</b> (<b>БЕЗ 7 или 8 в начале,</b> например: 9123456789). После ввода нажмите <b>Continue.</b></p>
+<p class="notice"><strong>3.</strong> Нажмите на пустой квадратик на экране для подтверждения, что вы человек</p>
+<p class="notice"><strong>4.</strong> Введите код</p>
+<p class="notice"><strong>5.</strong> Если у вас двухфакторная защита, то введите пароль</p>
+<p class="notice"><b>ПРИМЕЧАНИЕ:</b> если вы хотите стереть символы, которые уже на экране, то нажмите на поле для ввода и МНОГО РАЗ нажмите на кнопку стереть (со стрелочкой «назад» ⌫).</p>
 <div class="toolbar"><button id="keyboardButton" type="button">⌨️ Ввести текст</button><button id="refreshButton" type="button">🔄 Обновить экран</button><button id="zoomButton" type="button">🔍 Увеличить экран</button></div>
 <div id="screenFrame"><img id="screen" alt="Экран входа MAX"></div>
 <div class="inputRow"><textarea id="keyboard" rows="1" maxlength="256" placeholder="Введите номер, код или пароль" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Черновик текста для MAX"></textarea><button id="sendButton" type="button">📨 Отправить в MAX</button></div>
@@ -123,7 +129,6 @@ class RemoteAuthService:
             protocol_version = "HTTP/1.1"
 
             def log_message(self, _format, *_args):
-                # Never log auth inputs, cookies, or one-time tokens.
                 return
 
             def _send(self, status, body=b"", content_type="application/json; charset=utf-8", extra=()):

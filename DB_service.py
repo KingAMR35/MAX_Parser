@@ -9,6 +9,11 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_NAME = os.getenv("PGDATABASE", "MAX_Parser")
+MAX_CUSTOMER_CHATS = 5
+
+
+class ChatLimitReached(Exception):
+    """Raised when a customer tries to connect more than the allowed chats."""
 
 
 def get_connection():
@@ -165,6 +170,28 @@ def delete_admin(user_id: int):
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
         return cursor.rowcount == 1
+
+
+def grant_subscription(user_id: int, plan_code: str, days: int):
+    """Grant a free subscription, extending any time that is still active."""
+    if plan_code not in {"self", "project"}:
+        raise ValueError("Некорректный тариф подписки")
+    days = int(days)
+    if days < 1 or days > 3650:
+        raise ValueError("Срок подписки должен быть от 1 до 3650 дней")
+    with get_connection() as conn:
+        return conn.execute("""
+            INSERT INTO telegram_subscriptions (user_id, plan_code, active_until)
+            VALUES (%s, %s, CURRENT_TIMESTAMP + (%s * INTERVAL '1 day'))
+            ON CONFLICT (user_id) DO UPDATE SET
+                plan_code = EXCLUDED.plan_code,
+                active_until = GREATEST(
+                    telegram_subscriptions.active_until, CURRENT_TIMESTAMP
+                ) + (%s * INTERVAL '1 day'),
+                updated_at = CURRENT_TIMESTAMP,
+                reminder_sent_at = NULL
+            RETURNING user_id, plan_code, active_until
+        """, (int(user_id), plan_code, days, days)).fetchone()
 
 
 #! ============ ПОЛЬЗОВАТЕЛИ ============
@@ -363,16 +390,26 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
     """Bind a Telegram destination to one customer; never transfer an existing owner."""
     with get_connection() as conn:
         with conn.transaction():
+            # Serialize new claims per customer so simultaneous /bind commands
+            # cannot bypass the per-owner chat limit.
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (int(owner_id),))
             conn.execute("""
                 INSERT INTO chats (chat_id, title, owner_id, account_mode, is_active, message_count)
-                VALUES (%s, %s, %s, %s, FALSE, 0)
+                VALUES (%s, %s, NULL, %s, FALSE, 0)
                 ON CONFLICT (chat_id) DO NOTHING
-            """, (chat_id, title, owner_id, account_mode))
+            """, (chat_id, title, account_mode))
             row = conn.execute(
                 "SELECT owner_id FROM chats WHERE chat_id = %s FOR UPDATE", (chat_id,)
             ).fetchone()
             if row and row["owner_id"] is not None and int(row["owner_id"]) != int(owner_id):
                 return False
+            if not row or row["owner_id"] is None:
+                count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM chats WHERE owner_id = %s",
+                    (int(owner_id),),
+                ).fetchone()["count"]
+                if int(count) >= MAX_CUSTOMER_CHATS:
+                    raise ChatLimitReached
             conn.execute("""
                 UPDATE chats
                 SET title = %s, owner_id = %s, account_mode = %s, max_url = NULL,
