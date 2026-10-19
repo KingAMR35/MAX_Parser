@@ -10,6 +10,7 @@ import traceback
 import unicodedata
 import shutil
 import subprocess
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from telebot import types
@@ -24,6 +25,10 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 remote_auth_service = RemoteAuthService()
 print("🚀 MAX Parser Bot запущен")
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='HTML')
+try:
+    BOT_USER_ID = int(str(os.getenv("BOT_TOKEN") or "").split(":", 1)[0])
+except (TypeError, ValueError):
+    BOT_USER_ID = 0
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 add_admin(ADMIN_ID, "main_admin")
 TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "").strip()
@@ -157,6 +162,7 @@ bot.set_my_commands([
     types.BotCommand("connect", "Подключить чат MAX"),
     types.BotCommand("mychats", "Мои группы парсинга"),
     types.BotCommand("subscription", "Подписка и продление"),
+    types.BotCommand("delete_reply", "Удалить сообщение бота по ответу (админ)"),
     types.BotCommand("admin", "Админ-панель")
 ])
 
@@ -248,8 +254,143 @@ _telegram_group_send_times = {}
 _telegram_send_lock = threading.Lock()
 _send_context = threading.local()
 _POLL_MESSAGE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_poll_messages.json")
+_SENT_PARSER_MESSAGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_parser_messages.json")
 _poll_message_cache = {}
 _poll_message_cache_lock = threading.Lock()
+_sent_parser_messages = []
+_sent_parser_messages_lock = threading.RLock()
+_SENT_MESSAGE_DELETE_WINDOW = timedelta(hours=47)
+
+def _load_sent_parser_messages():
+    global _sent_parser_messages
+    try:
+        with open(_SENT_PARSER_MESSAGES_FILE, "r", encoding="utf-8") as records_file:
+            value = json.load(records_file)
+        _sent_parser_messages = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    except (OSError, ValueError, TypeError):
+        _sent_parser_messages = []
+
+def _save_sent_parser_messages_locked():
+    temporary_path = _SENT_PARSER_MESSAGES_FILE + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as records_file:
+            json.dump(_sent_parser_messages, records_file, ensure_ascii=False)
+        os.replace(temporary_path, _SENT_PARSER_MESSAGES_FILE)
+    except OSError as exc:
+        debug_logger.warning(
+            "SENT_PARSER_MESSAGES_SAVE_FAILED path=%s error=%s",
+            _SENT_PARSER_MESSAGES_FILE, log_preview(exc),
+        )
+
+def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=False):
+    ids = []
+    for value in message_ids or []:
+        try:
+            message_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if message_id not in ids:
+            ids.append(message_id)
+    if not ids:
+        return
+
+    preview = re.sub(r"<[^>]*>", " ", str(post.get("text") or ""))
+    preview = " ".join(preview.split())[:100]
+    if not preview:
+        if post.get("poll"):
+            preview = "Опрос"
+        elif (post.get("contact") or {}).get("is_contact"):
+            preview = "Контакт"
+        elif post.get("location"):
+            preview = "Геопозиция"
+        else:
+            preview = "Медиа или вложение"
+    record = {
+        "record_id": uuid.uuid4().hex[:12],
+        "chat_id": int(chat_id),
+        "message_ids": ids,
+        "source_id": str(post.get("source_id") or post.get("idx") or "")[:80],
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "preview": preview,
+        "partial": bool(partial),
+    }
+    with _sent_parser_messages_lock:
+        _sent_parser_messages.append(record)
+        per_chat = []
+        for item in _sent_parser_messages:
+            try:
+                if int(item.get("chat_id") or 0) == int(chat_id):
+                    per_chat.append(item)
+            except (TypeError, ValueError):
+                continue
+        keep_ids = {item.get("record_id") for item in per_chat[-50:]}
+        retained = []
+        for item in _sent_parser_messages:
+            try:
+                same_chat = int(item.get("chat_id") or 0) == int(chat_id)
+            except (TypeError, ValueError):
+                same_chat = False
+            if not same_chat or item.get("record_id") in keep_ids:
+                retained.append(item)
+        _sent_parser_messages[:] = retained[-1000:]
+        _save_sent_parser_messages_locked()
+
+def _sent_record_is_deletable(record, now=None):
+    try:
+        sent_at = datetime.fromisoformat(str(record.get("sent_at") or "").replace("Z", "+00:00"))
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        return timedelta(0) <= current - sent_at <= _SENT_MESSAGE_DELETE_WINDOW
+    except (TypeError, ValueError):
+        return False
+
+def _find_sent_parser_record(record_id):
+    with _sent_parser_messages_lock:
+        return next(
+            (dict(item) for item in _sent_parser_messages if item.get("record_id") == record_id),
+            None,
+        )
+
+def _finish_sent_parser_record(record_id, remaining_ids):
+    with _sent_parser_messages_lock:
+        for index, item in enumerate(_sent_parser_messages):
+            if item.get("record_id") != record_id:
+                continue
+            if remaining_ids:
+                updated = dict(item)
+                updated["message_ids"] = [int(value) for value in remaining_ids]
+                _sent_parser_messages[index] = updated
+            else:
+                _sent_parser_messages.pop(index)
+            _save_sent_parser_messages_locked()
+            return
+
+def _forget_sent_parser_message(chat_id, message_id):
+    changed = False
+    with _sent_parser_messages_lock:
+        for index in range(len(_sent_parser_messages) - 1, -1, -1):
+            item = _sent_parser_messages[index]
+            try:
+                if int(item.get("chat_id") or 0) != int(chat_id):
+                    continue
+                current_ids = [int(value) for value in item.get("message_ids") or []]
+            except (TypeError, ValueError):
+                continue
+            if int(message_id) not in current_ids:
+                continue
+            remaining = [value for value in current_ids if value != int(message_id)]
+            if remaining:
+                updated = dict(item)
+                updated["message_ids"] = remaining
+                _sent_parser_messages[index] = updated
+            else:
+                _sent_parser_messages.pop(index)
+            changed = True
+        if changed:
+            _save_sent_parser_messages_locked()
+
+_load_sent_parser_messages()
 
 def _load_poll_message_cache():
     global _poll_message_cache
@@ -850,8 +991,12 @@ def _send_post(chat_id: int, post: dict) -> bool:
         chat_id, post_id, post_kind, post.get("date") or "<missing>",
         post.get("time") or "<missing>", media_types, log_preview(post.get("text")) or "<empty>"
     )
+    sent_record_saved = False
     try:
         _send_post_impl(chat_id, post)
+        if context["message_ids"]:
+            _record_parser_sent_post(chat_id, post, context["message_ids"])
+            sent_record_saved = True
         if post.get("poll") and context["message_ids"]:
             _remember_sent_poll(chat_id, post, context["message_ids"][0])
         if context["api_ok"]:
@@ -868,6 +1013,10 @@ def _send_post(chat_id: int, post: dict) -> bool:
         )
         return result != "no_telegram_payload"
     except Exception as exc:
+        if context["message_ids"] and not sent_record_saved:
+            _record_parser_sent_post(
+                chat_id, post, context["message_ids"], partial=True
+            )
         debug_logger.exception(
             "POST_SEND_COMPLETE chat_id=%s source_id=%s result=failed api_ok=%s api_errors=%s error=%s",
             chat_id, post_id, context["api_ok"], context["api_errors"], log_preview(exc, 300)
@@ -1778,6 +1927,7 @@ def show_admin_menu(chat_id):
     kb.add(types.InlineKeyboardButton("📋 Список чатов", callback_data="admin_chats"))
     kb.add(types.InlineKeyboardButton("📊 Статус парсинга", callback_data="admin_parse_status"))
     kb.add(types.InlineKeyboardButton("🧪 Последний разбор сообщений", callback_data="admin_parse_diagnostics"))
+    kb.add(types.InlineKeyboardButton("🗑 Удалить сообщения парсера", callback_data="admin_sent_messages"))
     kb.row(
         types.InlineKeyboardButton("👑 Админы", callback_data="admin_admins"),
         types.InlineKeyboardButton("👤 Пользователи", callback_data="admin_users")
@@ -1789,6 +1939,144 @@ def show_admin_menu(chat_id):
     kb.add(types.InlineKeyboardButton("🔑 MAX-аккаунт проекта", callback_data="admin_project_login"))
     kb.add(types.InlineKeyboardButton("🗑 Очистить весь кэш", callback_data="admin_clear_cache", style="danger"))
     bot.send_message(chat_id, text, reply_markup=kb, **NO_PREVIEW)
+
+def _sent_parser_records_snapshot():
+    with _sent_parser_messages_lock:
+        return [dict(item) for item in _sent_parser_messages if isinstance(item, dict)]
+
+def _sent_record_time_label(record):
+    try:
+        sent_at = datetime.fromisoformat(str(record.get("sent_at") or "").replace("Z", "+00:00"))
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        return sent_at.astimezone().strftime("%d.%m %H:%M")
+    except (TypeError, ValueError):
+        return "время неизвестно"
+
+def _sent_parser_chat_title(target_chat_id):
+    try:
+        chat = get_chat_by_id(int(target_chat_id))
+        if chat and chat.get("title"):
+            return str(chat["title"])
+    except Exception:
+        pass
+    return str(target_chat_id)
+
+def _show_sent_parser_chats(chat_id, message_id=None):
+    records = [r for r in _sent_parser_records_snapshot() if _sent_record_is_deletable(r)]
+    grouped = {}
+    for record in records:
+        try:
+            target_chat_id = int(record.get("chat_id"))
+        except (TypeError, ValueError):
+            continue
+        grouped[target_chat_id] = grouped.get(target_chat_id, 0) + 1
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if grouped:
+        for target_chat_id, count in sorted(
+            grouped.items(), key=lambda item: _sent_record_latest_time(item[0]), reverse=True
+        ):
+            title = _sent_parser_chat_title(target_chat_id)
+            label = f"🗑 {title[:38]} · {count}"
+            keyboard.add(types.InlineKeyboardButton(
+                label, callback_data=f"admin_sent_chat_{target_chat_id}"
+            ))
+        text = (
+            "🗑 <b>Удаление сообщений парсера</b>\n\n"
+            "Выберите Telegram-группу. Здесь доступны отправки за последние 47 часов.\n\n"
+            "Чтобы удалить старое сообщение, ответьте на него в группе командой /delete_reply."
+        )
+    else:
+        text = (
+            "🗑 <b>Удаление сообщений парсера</b>\n\n"
+            "Новые отправки появятся здесь. Чтобы удалить уже отправленное сообщение, ответьте на него командой /delete_reply в группе.\n\n"
+            "Удаление доступно в течение 48 часов после отправки."
+        )
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    if message_id:
+        safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+    else:
+        bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+def _sent_record_latest_time(target_chat_id):
+    newest = 0.0
+    for record in _sent_parser_records_snapshot():
+        try:
+            if int(record.get("chat_id") or 0) != int(target_chat_id) or not _sent_record_is_deletable(record):
+                continue
+            sent_at = datetime.fromisoformat(str(record.get("sent_at") or "").replace("Z", "+00:00"))
+            newest = max(newest, sent_at.timestamp())
+        except (TypeError, ValueError, OSError):
+            continue
+    return newest
+
+def _show_sent_parser_posts(chat_id, message_id, target_chat_id):
+    records = [
+        record for record in _sent_parser_records_snapshot()
+        if str(record.get("chat_id")) == str(target_chat_id) and _sent_record_is_deletable(record)
+    ]
+    records.sort(key=lambda record: str(record.get("sent_at") or ""), reverse=True)
+    records = records[:20]
+    title = _sent_parser_chat_title(target_chat_id)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for record in records:
+        preview = " ".join(str(record.get("preview") or "Сообщение").split())[:34]
+        label = f"🗑 {_sent_record_time_label(record)} · {preview}"
+        keyboard.add(types.InlineKeyboardButton(
+            label, callback_data=f"admin_sent_post_{record.get('record_id')}"
+        ))
+    keyboard.add(types.InlineKeyboardButton("🔙 К группам", callback_data="admin_sent_messages"))
+    text = (
+        f"🗑 <b>{escape_html(title)}</b>\n\n"
+        "Выберите отправку, которую нужно удалить. Если у неё было несколько фото или файлов, удалится весь набор."
+        if records else
+        f"🗑 <b>{escape_html(title)}</b>\n\nНет сохранённых отправок для удаления."
+    )
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+def _show_sent_parser_confirmation(chat_id, message_id, record):
+    title = _sent_parser_chat_title(record.get("chat_id"))
+    preview = escape_html(str(record.get("preview") or "Сообщение"))
+    count = len(record.get("message_ids") or [])
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton("✅ Удалить", callback_data=f"admin_sent_delete_{record['record_id']}"),
+        types.InlineKeyboardButton("↩️ Назад", callback_data=f"admin_sent_chat_{record['chat_id']}"),
+    )
+    text = (
+        "⚠️ <b>Удалить отправку?</b>\n\n"
+        f"Группа: <b>{escape_html(title)}</b>\n"
+        f"Время: <b>{_sent_record_time_label(record)}</b>\n"
+        f"Сообщений Telegram: <b>{count}</b>\n"
+        f"Текст: <blockquote>{preview}</blockquote>\n\n"
+        "Удалятся только сообщения, отправленные этим ботом."
+    )
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+def _delete_sent_parser_record(record_id):
+    record = _find_sent_parser_record(record_id)
+    if not record:
+        return 0, [], "Запись уже удалена или не найдена."
+    if not _sent_record_is_deletable(record):
+        return 0, list(record.get("message_ids") or []), "Telegram разрешает удалить отправленные сообщения только в течение 48 часов."
+    target_chat_id = int(record.get("chat_id"))
+    remaining = []
+    deleted = 0
+    errors = []
+    for message_id in record.get("message_ids") or []:
+        try:
+            bot.delete_message(target_chat_id, int(message_id))
+            deleted += 1
+        except Exception as error:
+            error_text = str(error).casefold()
+            if "message to delete not found" in error_text or "message_id_invalid" in error_text:
+                deleted += 1
+                continue
+            remaining.append(int(message_id))
+            errors.append(str(error))
+    _finish_sent_parser_record(record_id, remaining)
+    return deleted, remaining, (errors[0] if errors else "")
 
 def show_chats_list(chat_id, message_id=None):
     chats = get_all_chats()
@@ -2957,6 +3245,45 @@ def start_bot(message):
 @bot.message_handler(commands=['help', 'help1'])
 def help_command(message):
     start_support(message.chat.id, message.from_user)
+
+
+@bot.message_handler(commands=['delete_reply'])
+def delete_parser_message_by_reply(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Эта команда доступна только администратору.")
+        return
+    target = getattr(message, "reply_to_message", None)
+    if target is None:
+        bot.reply_to(
+            message,
+            "Ответьте командой /delete_reply на сообщение MAX_Parser, которое нужно удалить.",
+        )
+        return
+    sender = getattr(target, "from_user", None)
+    if not sender or int(getattr(sender, "id", 0) or 0) != BOT_USER_ID:
+        bot.reply_to(message, "Можно удалить только сообщение, которое отправил MAX_Parser.")
+        return
+    try:
+        bot.delete_message(message.chat.id, target.message_id)
+        _forget_sent_parser_message(message.chat.id, target.message_id)
+    except Exception as error:
+        debug_logger.warning(
+            "ADMIN_DELETE_REPLIED_MESSAGE_FAILED admin_id=%s chat_id=%s message_id=%s error=%s",
+            message.from_user.id, message.chat.id, target.message_id, log_preview(error, 180),
+        )
+        bot.reply_to(
+            message,
+            "Не получилось удалить. Сообщение могло быть отправлено больше 48 часов назад или у бота нет доступа.",
+        )
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    try:
+        bot.send_message(message.from_user.id, "✅ Сообщение MAX_Parser удалено из группы.", **NO_PREVIEW)
+    except Exception:
+        pass
 
 
 @bot.message_handler(commands=['subscription'])
@@ -4356,6 +4683,43 @@ def admin_callbacks(call):
         _clear_auth_waiters(target_id)
         bot.answer_callback_query(call.id, "❌ Авторизация отменена", show_alert=True)
         bot.send_message(call.message.chat.id, "❌ Процесс авторизации отменён.", **NO_PREVIEW)
+    elif action == "admin_sent_messages":
+        _show_sent_parser_chats(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_sent_chat_"):
+        try:
+            target_chat_id = int(action[len("admin_sent_chat_"):])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Не удалось определить группу", show_alert=True)
+            return
+        _show_sent_parser_posts(call.message.chat.id, call.message.message_id, target_chat_id)
+    elif action.startswith("admin_sent_post_"):
+        record_id = action[len("admin_sent_post_"):]
+        record = _find_sent_parser_record(record_id)
+        if not record or not _sent_record_is_deletable(record):
+            bot.answer_callback_query(call.id, "Эту отправку уже нельзя удалить", show_alert=True)
+            _show_sent_parser_chats(call.message.chat.id, call.message.message_id)
+            return
+        _show_sent_parser_confirmation(call.message.chat.id, call.message.message_id, record)
+    elif action.startswith("admin_sent_delete_"):
+        record_id = action[len("admin_sent_delete_"):]
+        deleted, remaining, error_text = _delete_sent_parser_record(record_id)
+        if remaining:
+            reason = re.sub(r"\s+", " ", error_text or "")[:75]
+            detail = f" Причина: {reason}" if reason else ""
+            bot.answer_callback_query(
+                call.id,
+                f"Удалено: {deleted}. Не удалено: {len(remaining)}.{detail}",
+                show_alert=True,
+            )
+        elif deleted:
+            bot.answer_callback_query(call.id, f"Удалено сообщений: {deleted}")
+        else:
+            bot.answer_callback_query(call.id, error_text or "Не удалось удалить", show_alert=True)
+        record = _find_sent_parser_record(record_id)
+        if record:
+            _show_sent_parser_posts(call.message.chat.id, call.message.message_id, record.get("chat_id"))
+        else:
+            _show_sent_parser_chats(call.message.chat.id, call.message.message_id)
     elif action == "admin_chats":
         show_chats_list(call.message.chat.id, call.message.message_id)
     elif action == "admin_add_chat":

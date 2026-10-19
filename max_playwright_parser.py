@@ -13,6 +13,7 @@ import queue
 import threading
 import traceback
 import tempfile
+from datetime import datetime, timedelta
 from typing import List, Dict
 from playwright.sync_api import sync_playwright
 from debug_log import logger as debug_logger, preview as log_preview
@@ -20,11 +21,11 @@ from debug_log import logger as debug_logger, preview as log_preview
 SESSIONS_DIR = "sessions"
 SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
-# Keep a rolling window so a busy chat can catch up after a slow cycle. On the
-# first connection only the newest few posts are delivered; older rows become
-# the initial baseline instead of causing a large first-time media download.
-MAX_MESSAGES_TO_PARSE = 100
+# Keep the scan close to the previous safe window. A larger window can pull
+# messages that were never cached by older versions and replay old history.
+MAX_MESSAGES_TO_PARSE = 10
 MAX_FIRST_CONNECTION_MESSAGES = 3
+MAX_UNCACHED_MESSAGE_AGE = timedelta(hours=36)
 MAX_MEDIA_DOWNLOAD_BYTES = 47 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_BYTES = 9 * 1024 * 1024
 MEDIA_SPOOL_DIR = os.path.join(tempfile.gettempdir(), "max_parser_media")
@@ -100,6 +101,32 @@ def _normalize_message_lines(text: str) -> str:
         for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     ]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _message_datetime(message: dict):
+    """Parse MAX's displayed date/time when available; return None if uncertain."""
+    date_text = str((message or {}).get("date") or "").strip()
+    time_text = str((message or {}).get("time") or "").strip()
+    parsed_date = None
+    for date_format in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            parsed_date = datetime.strptime(date_text, date_format).date()
+            break
+        except (TypeError, ValueError):
+            continue
+    if parsed_date is None:
+        return None
+
+    parsed_time = None
+    for time_format in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+        try:
+            parsed_time = datetime.strptime(time_text.upper(), time_format).time()
+            break
+        except (TypeError, ValueError):
+            continue
+    if parsed_time is None:
+        parsed_time = datetime.min.time()
+    return datetime.combine(parsed_date, parsed_time)
 
 #! ==========================================
 #! 1. QR-АВТОРИЗАЦИЯ
@@ -4058,7 +4085,19 @@ def parse_max_group_media(
             page.evaluate("""async maxMessagesToParse => {
                 const allRows=Array.from(document.querySelectorAll('.item'));
                 const rowLimit=Math.max(0,Math.floor(Number(maxMessagesToParse)||0));
-                const rows=rowLimit ? allRows.slice(-rowLimit) : [];
+                let indexed=[];
+                for (const attr of ['data-message-id','data-mid','data-id','data-index']) {
+                    const candidates=allRows.map(row=>{
+                        const raw=String(row.getAttribute(attr)||'').trim();
+                        if (!/^-?\d+$/.test(raw)) return null;
+                        try { return {row,key:BigInt(raw)}; } catch(e) { return null; }
+                    }).filter(Boolean);
+                    if (candidates.length>=2) { indexed=candidates; break; }
+                }
+                const descending=indexed.length>=2 && indexed[0].key>indexed[indexed.length-1].key;
+                const rows=rowLimit
+                    ? (descending ? allRows.slice(0,rowLimit) : allRows.slice(-rowLimit))
+                    : [];
                 for(const row of rows){try{row.scrollIntoView({block:'center',inline:'nearest'});}catch(e){} await new Promise(r=>setTimeout(r,45));}
                 window.scrollTo(0,document.body.scrollHeight);
             }""", MAX_MESSAGES_TO_PARSE)
@@ -4071,8 +4110,20 @@ def parse_max_group_media(
                 const results = [];
                 const allRows = Array.from(document.querySelectorAll('.item'));
                 const rowLimit = Math.max(0, Math.floor(Number(maxMessagesToParse) || 0));
-                const firstSelectedIndex = Math.max(0, allRows.length - rowLimit);
-                const rows = rowLimit ? allRows.slice(firstSelectedIndex) : [];
+                let indexed=[];
+                for (const attr of ['data-message-id','data-mid','data-id','data-index']) {
+                    const candidates=allRows.map(row=>{
+                        const raw=String(row.getAttribute(attr)||'').trim();
+                        if (!/^-?\d+$/.test(raw)) return null;
+                        try { return {row,key:BigInt(raw)}; } catch(e) { return null; }
+                    }).filter(Boolean);
+                    if (candidates.length>=2) { indexed=candidates; break; }
+                }
+                const descending=indexed.length>=2 && indexed[0].key>indexed[indexed.length-1].key;
+                const firstSelectedIndex=descending ? 0 : Math.max(0,allRows.length-rowLimit);
+                const rows = rowLimit
+                    ? (descending ? allRows.slice(0,rowLimit) : allRows.slice(firstSelectedIndex))
+                    : [];
 
                 function clean(value) {
                     return String(value || "")
@@ -5709,6 +5760,7 @@ def parse_max_group_media(
 
                         results.push({
                             idx: domIndex,
+                            dom_order_descending: descending,
                             source_id: String(sourceId),
                             data_message_id: safeAttr(row, "data-message-id"),
                             mid: safeAttr(row, "data-mid"),
@@ -5770,8 +5822,9 @@ def parse_max_group_media(
                 f"MAX вернул неожиданный тип списка сообщений: {type(raw_messages).__name__}"
             )
         debug_logger.info(
-            "MAX_DOM_EXTRACTED chat_id=%s raw_cards=%s max_messages=%s",
+            "MAX_DOM_EXTRACTED chat_id=%s raw_cards=%s max_messages=%s order_descending=%s",
             chat_id, len(raw_messages), MAX_MESSAGES_TO_PARSE,
+            bool(raw_messages and raw_messages[0].get("dom_order_descending")),
         )
         if len(raw_messages) > MAX_MESSAGES_TO_PARSE:
             raise RuntimeError(
@@ -5820,8 +5873,8 @@ def parse_max_group_media(
                 seen_ids.add(source_id)
             cleaned.append(msg)
 
-        # DOM-порядок MAX — от старых к новым; сохраняем его для доставки
-        # по порядку и сначала отделяем системные карточки и служебные строки.
+        # Отделяем системные карточки и служебные строки перед финальной
+        # фильтрацией и отправкой ограниченного окна сообщений.
         all_messages = cleaned
 
         # MAX иногда выводит количество голосов отдельной соседней .item, например
@@ -5857,22 +5910,57 @@ def parse_max_group_media(
                 consumed_poll_service.add(j)
             poll["total_votes"] = sum(max(0, int(o.get("votes") or 0)) for o in poll.get("options", []) if isinstance(o, dict))
         all_messages = [m for idx, m in enumerate(all_messages) if idx not in consumed_poll_service]
+        dom_order_descending = bool(
+            all_messages and all_messages[0].get("dom_order_descending")
+        )
+        if all_messages and all(_message_datetime(message) is not None for message in all_messages):
+            all_messages.sort(
+                key=lambda message: (
+                    _message_datetime(message),
+                    -int(message.get("idx") or 0) if dom_order_descending else int(message.get("idx") or 0),
+                )
+            )
+        elif dom_order_descending:
+            all_messages.reverse()
         first_connection = not message_cache_by_chat.get(chat_id) and not message_signatures_by_chat.get(chat_id)
         if first_connection:
-            baseline = all_messages[:-MAX_FIRST_CONNECTION_MESSAGES]
+            # A new/empty cache has no trustworthy high-water mark. Treat every
+            # older row as history. Only deliver the newest few when MAX gives
+            # them a usable, recent date; this prevents a reversed DOM from
+            # replaying the oldest cards as the initial batch.
+            now = datetime.now()
+            initial_candidates = all_messages[-MAX_FIRST_CONNECTION_MESSAGES:]
+            recent_initial = []
+            for candidate in initial_candidates:
+                candidate_datetime = _message_datetime(candidate)
+                age = now - candidate_datetime if candidate_datetime is not None else None
+                if age is not None and timedelta(0) <= age <= MAX_UNCACHED_MESSAGE_AGE:
+                    recent_initial.append(candidate)
+            recent_initial_ids = {id(candidate) for candidate in recent_initial}
+            baseline = [candidate for candidate in all_messages if id(candidate) not in recent_initial_ids]
             for baseline_msg in baseline:
                 mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
             if baseline:
                 save_message_cache()
-            all_messages = all_messages[-MAX_FIRST_CONNECTION_MESSAGES:]
+            all_messages = recent_initial
             debug_logger.info(
-                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s baseline=%s initial_delivery=%s",
+                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s history_marked=%s initial_delivery=%s",
                 chat_id, len(baseline), len(all_messages),
             )
         else:
             unprocessed = []
             prefiltered = 0
+            stale_marked = 0
+            now = datetime.now()
             for candidate in all_messages:
+                candidate_datetime = _message_datetime(candidate)
+                if (
+                    candidate_datetime is not None
+                    and now - candidate_datetime > MAX_UNCACHED_MESSAGE_AGE
+                ):
+                    mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
+                    stale_marked += 1
+                    continue
                 if (
                     _message_can_be_prefiltered(candidate)
                     and not is_new_message(_message_cache_stub(candidate), chat_id=chat_id)
@@ -5882,8 +5970,8 @@ def parse_max_group_media(
                 unprocessed.append(candidate)
             all_messages = unprocessed
             debug_logger.info(
-                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s new=%s",
-                chat_id, len(cleaned), prefiltered, len(all_messages),
+                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s stale=%s new=%s",
+                chat_id, len(cleaned), prefiltered, stale_marked, len(all_messages),
             )
         print(f"[{chat_id}] После фильтрации: {len(all_messages)} сообщений (от старых к новым)")
 
