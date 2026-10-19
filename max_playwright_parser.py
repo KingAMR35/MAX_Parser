@@ -2608,28 +2608,45 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
         ).strip()
     try:
         click_id = (msg.get("download_click_id") or "").strip()
+        specific_control_attempted = False
         if click_id:
             candidate = page.locator(f'[data-max-parser-download-id="{click_id}"]').first
             if candidate.count() > 0:
-                try:
-                    with page.expect_download(timeout=7000) as download_info:
-                        candidate.click(timeout=4000)
-                    download = download_info.value
-                    download_url = download.url
-                    suggested = download.suggested_filename or filename_hint or "document.pdf"
-                    if download_url:
-                        media = _download_document_to_memory(
-                            page=page,
-                            context=context,
-                            url=download_url,
-                            filename=filename_hint or suggested,
-                            chat_id=chat_id,
-                            media_type=media_type,
-                        )
-                        if media and media.get("bytes"):
-                            return media
-                except Exception as e:
-                    print(f"[{chat_id}] ℹ️ Не удалось получить download event от кнопки: {e}")
+                specific_control_attempted = True
+                control_meta = candidate.evaluate(
+                    """el => ({
+                        label: el.getAttribute('aria-label') || '',
+                        title: el.getAttribute('title') || '',
+                        text: el.innerText || el.textContent || '',
+                        className: typeof el.className === 'string' ? el.className : ''
+                    })"""
+                )
+                control_label = " ".join(str(value or "") for value in control_meta.values())
+                if re.search(r"cancel|отменить|отмена|stop", control_label, re.I):
+                    print(f"[{chat_id}] ℹ️ Пропускаю кнопку отмены загрузки вместо скачивания")
+                else:
+                    try:
+                        # MAX may place a video/player overlay above the download
+                        # control. This is the exact control found for this message,
+                        # so force the click and keep the wait bounded.
+                        with page.expect_download(timeout=3500) as download_info:
+                            candidate.click(timeout=1200, force=True)
+                        download = download_info.value
+                        download_url = download.url
+                        suggested = download.suggested_filename or filename_hint or "document.pdf"
+                        if download_url:
+                            media = _download_document_to_memory(
+                                page=page,
+                                context=context,
+                                url=download_url,
+                                filename=filename_hint or suggested,
+                                chat_id=chat_id,
+                                media_type=media_type,
+                            )
+                            if media and media.get("bytes"):
+                                return media
+                    except Exception as e:
+                        print(f"[{chat_id}] ℹ️ Не удалось получить download event от кнопки: {e}")
                 try:
                     attrs = candidate.evaluate(
                         """el => ({
@@ -2647,6 +2664,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                                 url=url,
                                 filename=filename_hint or msg.get('download_click_filename', ''),
                                 chat_id=chat_id,
+                                media_type=media_type,
                             )
                             if media and media.get("bytes"):
                                 return media
@@ -2655,37 +2673,55 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
         card = _message_card_locator(page, msg)
         if card.count() == 0:
             return None
-        download_candidates = card.locator(
-            'a, button, [role="button"], [data-testid*="download" i], '
-            '[aria-label*="скачать" i], [aria-label*="download" i], '
-            '[class*="download" i]'
-        )
-        candidate_count = min(download_candidates.count(), 20)
-        for i in range(candidate_count - 1, -1, -1):
-            candidate = download_candidates.nth(i)
-            try:
-                if not candidate.is_visible(timeout=300):
-                    continue
-            except Exception:
-                continue
-            try:
-                with page.expect_download(timeout=5000) as download_info:
-                    candidate.click(timeout=3000)
-                download = download_info.value
-                download_url = download.url
-                suggested = download.suggested_filename or filename_hint or "document.pdf"
-                if download_url:
-                    media = _download_document_to_memory(
-                        page=page,
-                        context=context,
-                        url=download_url,
-                        filename=filename_hint or suggested,
-                        chat_id=chat_id,
+        is_rich_media = media_type in {"voice", "audio", "video", "video_note", "animation"}
+        # If the message already exposed its own download control, don't scan
+        # unrelated buttons in the card. A video surface can intercept those
+        # clicks and turn one failed attachment into many long retries.
+        if not specific_control_attempted and not is_rich_media:
+            download_candidates = card.locator(
+                'a[download], [data-testid*="download" i], '
+                '[aria-label*="скачать" i], [aria-label*="download" i], '
+                '[title*="скачать" i], [title*="download" i], '
+                '[class*="download" i]'
+            )
+            candidate_count = min(download_candidates.count(), 3)
+            for i in range(candidate_count - 1, -1, -1):
+                candidate = download_candidates.nth(i)
+                try:
+                    if not candidate.is_visible(timeout=250):
+                        continue
+                    candidate_meta = candidate.evaluate(
+                        """el => ({
+                            label: el.getAttribute('aria-label') || '',
+                            title: el.getAttribute('title') || '',
+                            text: el.innerText || el.textContent || '',
+                            className: typeof el.className === 'string' ? el.className : ''
+                        })"""
                     )
-                    if media and media.get("bytes"):
-                        return media
-            except Exception as e:
-                print(f"[{chat_id}] ℹ️ Клик по элементу вложения без download event: {e}")
+                    candidate_label = " ".join(str(value or "") for value in candidate_meta.values())
+                    if re.search(r"cancel|отменить|отмена|stop", candidate_label, re.I):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    with page.expect_download(timeout=3000) as download_info:
+                        candidate.click(timeout=1000, force=True)
+                    download = download_info.value
+                    download_url = download.url
+                    suggested = download.suggested_filename or filename_hint or "document.pdf"
+                    if download_url:
+                        media = _download_document_to_memory(
+                            page=page,
+                            context=context,
+                            url=download_url,
+                            filename=filename_hint or suggested,
+                            chat_id=chat_id,
+                            media_type=media_type,
+                        )
+                        if media and media.get("bytes"):
+                            return media
+                except Exception as e:
+                    print(f"[{chat_id}] ℹ️ Клик по кнопке скачивания не дал download event: {e}")
         candidates = card.locator(
             '[href], [src], [data-url], [data-href], [data-download-url], '
             '[data-file-url], [data-src], [data-link]'
@@ -2719,23 +2755,24 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
             )
             if media and media.get("bytes"):
                 return media
-        try:
-            with page.expect_download(timeout=5000) as download_info:
-                card.click(timeout=3000)
-            download = download_info.value
-            download_url = download.url
-            suggested = download.suggested_filename or filename_hint or "document.pdf"
-            if download_url:
-                return _download_document_to_memory(
-                    page=page,
-                    context=context,
-                    url=download_url,
-                    filename=filename_hint or suggested,
-                    chat_id=chat_id,
-                    media_type=media_type,
-                )
-        except Exception as e:
-            print(f"[{chat_id}] ℹ️ Карточка файла не дала download event: {e}")
+        if not specific_control_attempted and not is_rich_media:
+            try:
+                with page.expect_download(timeout=3000) as download_info:
+                    card.click(timeout=1000, force=True)
+                download = download_info.value
+                download_url = download.url
+                suggested = download.suggested_filename or filename_hint or "document.pdf"
+                if download_url:
+                    return _download_document_to_memory(
+                        page=page,
+                        context=context,
+                        url=download_url,
+                        filename=filename_hint or suggested,
+                        chat_id=chat_id,
+                        media_type=media_type,
+                    )
+            except Exception as e:
+                print(f"[{chat_id}] ℹ️ Карточка файла не дала download event: {e}")
     except Exception as e:
         print(f"[{chat_id}] ❌ Ошибка поиска карточки документа: {e}")
     return None
@@ -5322,6 +5359,10 @@ def parse_max_group_media(
                         }
                         const documents = [];
                         const filenameHint = extractFilename(fullRowText);
+                        const hasRichMediaSurface = Boolean(
+                            bubble.querySelector("video,audio") ||
+                            richAttachments.some(a => ["video", "video_note", "voice", "audio", "animation"].includes(a.type))
+                        );
 
                         getFileNodes(bubble).forEach((el, nodeIndex) => {
                             try {
@@ -5332,10 +5373,12 @@ def parse_max_group_media(
                                 const title = safeAttr(el, "title");
                                 const className = typeof el.className === "string" ? el.className : "";
                                 const hint = [ownText, aria, title, className, fullRowText].join(" ");
-                                const looksLikeFile =
+                                const isCancelAction = /cancel|отменить|отмена|stop/i.test([ownText, aria, title, className].join(" "));
+                                const looksLikeFile = !isCancelAction && (
                                     Boolean(downloadAttr) ||
                                     /\.(pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)(?:[?#\s]|$)/i.test(hint) ||
-                                    /скачать|download|файл|file|document|attachment/i.test(hint);
+                                    /скачать|download|файл|file|document|attachment/i.test(hint)
+                                );
                                 if (!looksLikeFile) return;
                                 let filename = filenameHint || downloadAttr || "document.file";
                                 if (href) {
@@ -5346,7 +5389,7 @@ def parse_max_group_media(
                                         filename = pathName;
                                     }
                                 }
-                                if (!href && /скачать|download/i.test(hint)) {
+                                if (!href && !hasRichMediaSurface && !isCancelAction && /скачать|download/i.test(hint)) {
                                     const clickId = `max-parser-download-${domIndex}-${nodeIndex}`;
                                     try {
                                         el.setAttribute("data-max-parser-download-id", clickId);
@@ -5371,9 +5414,12 @@ def parse_max_group_media(
                             const aria = safeAttr(el, "aria-label");
                             const title = safeAttr(el, "title");
                             const cls = typeof el.className === "string" ? el.className : "";
+                            const isCancelAction = /cancel|отменить|отмена|stop/i.test([ownText, aria, title, cls].join(" "));
                             if (
-                                /^(скачать|download)$/i.test(ownText) ||
-                                /скачать|download/i.test(aria + " " + title + " " + cls)
+                                !hasRichMediaSurface && !isCancelAction && (
+                                    /^(скачать|download)$/i.test(ownText) ||
+                                    /скачать|download/i.test(aria + " " + title + " " + cls)
+                                )
                             ) {
                                 downloadClickId = `max-parser-download-${domIndex}-final-${nodeIndex}`;
                                 try {
@@ -5817,7 +5863,11 @@ def parse_max_group_media(
                     or msg.get("download_click_id")
                     or msg.get("download_click_filename")
                 )
-                if has_file_hint:
+                # A message with an exact download control was already tried
+                # above when it had no media. Don't click that same control a
+                # second time after a failed attempt; when other media exists,
+                # this remains the one attempt to fetch an additional file.
+                if has_file_hint and (not msg.get("download_click_id") or media_files):
                     media = _download_document_from_message_card(
                         page=page,
                         context=context,
