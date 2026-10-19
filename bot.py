@@ -25,10 +25,6 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 remote_auth_service = RemoteAuthService()
 print("🚀 MAX Parser Bot запущен")
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='HTML')
-try:
-    BOT_USER_ID = int(str(os.getenv("BOT_TOKEN") or "").split(":", 1)[0])
-except (TypeError, ValueError):
-    BOT_USER_ID = 0
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 add_admin(ADMIN_ID, "main_admin")
 TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "").strip()
@@ -162,7 +158,6 @@ bot.set_my_commands([
     types.BotCommand("connect", "Подключить чат MAX"),
     types.BotCommand("mychats", "Мои группы парсинга"),
     types.BotCommand("subscription", "Подписка и продление"),
-    types.BotCommand("delete_reply", "Удалить сообщение бота по ответу (админ)"),
     types.BotCommand("admin", "Админ-панель")
 ])
 
@@ -365,30 +360,6 @@ def _finish_sent_parser_record(record_id, remaining_ids):
                 _sent_parser_messages.pop(index)
             _save_sent_parser_messages_locked()
             return
-
-def _forget_sent_parser_message(chat_id, message_id):
-    changed = False
-    with _sent_parser_messages_lock:
-        for index in range(len(_sent_parser_messages) - 1, -1, -1):
-            item = _sent_parser_messages[index]
-            try:
-                if int(item.get("chat_id") or 0) != int(chat_id):
-                    continue
-                current_ids = [int(value) for value in item.get("message_ids") or []]
-            except (TypeError, ValueError):
-                continue
-            if int(message_id) not in current_ids:
-                continue
-            remaining = [value for value in current_ids if value != int(message_id)]
-            if remaining:
-                updated = dict(item)
-                updated["message_ids"] = remaining
-                _sent_parser_messages[index] = updated
-            else:
-                _sent_parser_messages.pop(index)
-            changed = True
-        if changed:
-            _save_sent_parser_messages_locked()
 
 _load_sent_parser_messages()
 
@@ -1985,12 +1956,12 @@ def _show_sent_parser_chats(chat_id, message_id=None):
         text = (
             "🗑 <b>Удаление сообщений парсера</b>\n\n"
             "Выберите Telegram-группу. Здесь доступны отправки за последние 47 часов.\n\n"
-            "Чтобы удалить старое сообщение, ответьте на него в группе командой /delete_reply."
+            "Отметьте сообщения кнопками и подтвердите удаление."
         )
     else:
         text = (
             "🗑 <b>Удаление сообщений парсера</b>\n\n"
-            "Новые отправки появятся здесь. Чтобы удалить уже отправленное сообщение, ответьте на него командой /delete_reply в группе.\n\n"
+            "Новые отправки появятся здесь. Удалять их можно кнопками в этом разделе.\n\n"
             "Удаление доступно в течение 48 часов после отправки."
         )
     keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
@@ -2415,8 +2386,9 @@ def show_user_send_selector(chat_id, message_id, page=0):
     page = max(0, min(int(page), page_count - 1))
     first = page * ADMIN_LIST_PAGE_SIZE
     shown = users[first:first + ADMIN_LIST_PAGE_SIZE]
-    text = f"👤 <b>Выберите пользователя</b> · {len(users)} всего"
+    text = f"👤 <b>Пользователи</b> · {len(users)} всего"
     if users:
+        text += "\nНажмите на ID, чтобы скопировать. Затем нажмите «Отправить по ID»."
         for user in shown:
             name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
             name = escape_html(name or "Имя не указано")
@@ -2425,13 +2397,8 @@ def show_user_send_selector(chat_id, message_id, page=0):
     else:
         text += "\n\nСписок пользователей пока пуст."
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for user in shown:
-        kb.add(types.InlineKeyboardButton(
-            "👤 Выбрать",
-            callback_data=f"admin_send_user_pick_{user['user_id']}"
-        ))
     _page_buttons(kb, page, page_count, "admin_send_users_page")
-    kb.add(types.InlineKeyboardButton("✍️ Ввести ID вручную", callback_data="admin_send_user_manual"))
+    kb.add(types.InlineKeyboardButton("✉️ Отправить по ID", callback_data="admin_send_user_manual"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
@@ -2442,21 +2409,17 @@ def show_chat_send_selector(chat_id, message_id, page=0):
     page = max(0, min(int(page), page_count - 1))
     first = page * ADMIN_LIST_PAGE_SIZE
     shown = chats[first:first + ADMIN_LIST_PAGE_SIZE]
-    text = f"💬 <b>Выберите чат</b> · {len(chats)} всего"
+    text = f"💬 <b>Чаты</b> · {len(chats)} всего"
     if chats:
+        text += "\nНажмите на ID, чтобы скопировать. Затем нажмите «Отправить по ID»."
         for chat in shown:
             title = escape_html(chat.get("title") or "Без названия")
             text += f"\n\n<b>{title}</b>\n🆔 ID: <code>{chat['chat_id']}</code>"
     else:
         text += "\n\nЧатов пока нет."
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for chat in shown:
-        kb.add(types.InlineKeyboardButton(
-            "💬 Выбрать",
-            callback_data=f"admin_send_chat_pick_{chat['chat_id']}"
-        ))
     _page_buttons(kb, page, page_count, "admin_send_chats_page")
-    kb.add(types.InlineKeyboardButton("✍️ Ввести ID вручную", callback_data="admin_send_chat_manual"))
+    kb.add(types.InlineKeyboardButton("✉️ Отправить по ID", callback_data="admin_send_chat_manual"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
@@ -2470,17 +2433,6 @@ def _prompt_send_to_user(chat_id, user_id):
         **NO_PREVIEW,
     )
     bot.register_next_step_handler(prompt, process_send_to_user_content, int(user_id))
-
-
-def _prompt_send_to_chat(chat_id, target_chat_id):
-    prompt = bot.send_message(
-        chat_id,
-        f"Теперь отправьте сообщение в чат <code>{target_chat_id}</code>.",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard(),
-        **NO_PREVIEW,
-    )
-    bot.register_next_step_handler(prompt, process_send_to_chat_content, int(target_chat_id))
 
 
 def process_add_chat_step1(message, admin_chat_id):
@@ -3085,7 +3037,8 @@ def _notify_support_admin(user, body_message=None):
         ADMIN_ID,
         "🆘 <b>Обращение в тех поддержку</b>\n"
         f"👤 {full_name}\n"
-        f"🔎 Никнейм: {username}",
+        f"🔎 Никнейм: {username}\n"
+        f"🆔 ID: <code>{user.id}</code>",
         parse_mode="HTML",
         reply_markup=_support_admin_keyboard(user.id),
         **NO_PREVIEW,
@@ -3245,45 +3198,6 @@ def start_bot(message):
 @bot.message_handler(commands=['help', 'help1'])
 def help_command(message):
     start_support(message.chat.id, message.from_user)
-
-
-@bot.message_handler(commands=['delete_reply'])
-def delete_parser_message_by_reply(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Эта команда доступна только администратору.")
-        return
-    target = getattr(message, "reply_to_message", None)
-    if target is None:
-        bot.reply_to(
-            message,
-            "Ответьте командой /delete_reply на сообщение MAX_Parser, которое нужно удалить.",
-        )
-        return
-    sender = getattr(target, "from_user", None)
-    if not sender or int(getattr(sender, "id", 0) or 0) != BOT_USER_ID:
-        bot.reply_to(message, "Можно удалить только сообщение, которое отправил MAX_Parser.")
-        return
-    try:
-        bot.delete_message(message.chat.id, target.message_id)
-        _forget_sent_parser_message(message.chat.id, target.message_id)
-    except Exception as error:
-        debug_logger.warning(
-            "ADMIN_DELETE_REPLIED_MESSAGE_FAILED admin_id=%s chat_id=%s message_id=%s error=%s",
-            message.from_user.id, message.chat.id, target.message_id, log_preview(error, 180),
-        )
-        bot.reply_to(
-            message,
-            "Не получилось удалить. Сообщение могло быть отправлено больше 48 часов назад или у бота нет доступа.",
-        )
-        return
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    try:
-        bot.send_message(message.from_user.id, "✅ Сообщение MAX_Parser удалено из группы.", **NO_PREVIEW)
-    except Exception:
-        pass
 
 
 @bot.message_handler(commands=['subscription'])
@@ -4931,14 +4845,6 @@ def admin_callbacks(call):
             **NO_PREVIEW,
         )
         bot.register_next_step_handler(prompt, process_send_to_chat_id)
-    elif action.startswith("admin_send_user_pick_"):
-        _prompt_send_to_user(
-            call.message.chat.id, int(action.rsplit("_", 1)[1])
-        )
-    elif action.startswith("admin_send_chat_pick_"):
-        _prompt_send_to_chat(
-            call.message.chat.id, int(action.rsplit("_", 1)[1])
-        )
     elif action.startswith("admin_user_send_"):
         _prompt_send_to_user(
             call.message.chat.id, int(action.rsplit("_", 1)[1])
