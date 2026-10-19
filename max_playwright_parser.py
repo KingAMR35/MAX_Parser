@@ -170,7 +170,7 @@ def _is_logged_in(page) -> bool:
         print(f"️ Ошибка проверки авторизации: {e}")
         return False
 
-def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int = 60000):
+def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int = 60000, max_attempts: int = 4):
     """Retry transient MAX network failures with a short exponential backoff."""
     retryable_errors = (
         "err_connection_closed",
@@ -184,7 +184,7 @@ def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int 
         "err_internet_disconnected",
         "err_ssl_protocol_error",
     )
-    max_attempts = 4
+    max_attempts = max(1, int(max_attempts))
     for attempt in range(1, max_attempts + 1):
         try:
             return page.goto(url, timeout=timeout, wait_until="domcontentloaded")
@@ -3673,6 +3673,9 @@ def parse_max_group_media(
     group_url: str,
     chat_id: int,
     session_path: str = None,
+    verify_only: bool = False,
+    navigation_timeout_ms: int = 60000,
+    navigation_attempts: int = 4,
 ) -> List[Dict]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
     debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
@@ -3694,16 +3697,23 @@ def parse_max_group_media(
             timezone_id=MAX_TIMEZONE_ID,
         )
         page = context.new_page()
-        _install_max_media_response_cache(page, chat_id)
+        if not verify_only:
+            _install_max_media_response_cache(page, chat_id)
         print(f"[{chat_id}] Переход на главную MAX...")
-        _goto_max_with_retry(page, "https://web.max.ru", chat_id, "главная страница MAX")
-        page.wait_for_timeout(3000)
+        _goto_max_with_retry(
+            page, "https://web.max.ru", chat_id, "главная страница MAX",
+            timeout=navigation_timeout_ms, max_attempts=navigation_attempts,
+        )
+        page.wait_for_timeout(1200 if verify_only else 3000)
         if not _is_logged_in(page):
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"SESSION_EXPIRED|{debug_path}")
-        _goto_max_with_retry(page, group_url, chat_id, "переход в чат MAX")
-        page.wait_for_timeout(4000)
+        _goto_max_with_retry(
+            page, group_url, chat_id, "переход в чат MAX",
+            timeout=navigation_timeout_ms, max_attempts=navigation_attempts,
+        )
+        page.wait_for_timeout(1200 if verify_only else 4000)
         _accept_max_invite_if_available(page, group_url, chat_id)
         current_url = page.url
         requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
@@ -3723,7 +3733,9 @@ def parse_max_group_media(
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"EMPTY_PAGE|{debug_path}")
-        debug_logger.info("MAX_CHAT_OPENED chat_id=%s route=%s", chat_id, urlparse(current_url).path)
+        debug_logger.info("MAX_CHAT_OPENED chat_id=%s route=%s verify_only=%s", chat_id, urlparse(current_url).path, verify_only)
+        if verify_only:
+            return []
         print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
         try:
             page.keyboard.press("End")
@@ -4641,29 +4653,52 @@ def parse_max_group_media(
                             safeAttr(el,"data-media-url") || safeAttr(el,"data-sticker-url") || safeAttr(el,"data-url") || safeAttr(el,"data-href");
                         return u;
                     }
+                    // One video element may expose the same clip through <video>,
+                    // several <source> nodes and MAX's data-* attributes. Use the
+                    // browser-selected source once, so quality variants are not
+                    // mistaken for separate messages.
+                    const mediaOwners = Array.from(row.querySelectorAll("video, audio"));
+                    mediaOwners.forEach(el => {
+                        const tagName = String(el.tagName || "").toLowerCase();
+                        const mediaTag = tagName;
+                        let url = "";
+                        try {
+                            if (typeof el.currentSrc === "string" && /^(https?:|blob:)/i.test(el.currentSrc)) url = el.currentSrc;
+                        } catch(e) {}
+                        if (!url) url = safeAttr(el, "src") || candidate(el);
+                        if (!url) {
+                            const source = el.querySelector("source[src],source[data-src]");
+                            if (source) url = safeAttr(source, "src") || safeAttr(source, "data-src") || candidate(source);
+                        }
+                        let meta = "";
+                        for (let node = el, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
+                            meta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
+                        }
+                        const duration = Number.isFinite(Number(el.duration)) && Number(el.duration) > 0
+                            ? Number(el.duration) : 0;
+                        const poster = mediaTag === "video"
+                            ? (safeAttr(el, "poster") || (typeof el.poster === "string" ? el.poster : "")) : "";
+                        if (url) push(classify(meta, mediaTag), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || "", {duration, poster});
+                    });
                     const elements = row.querySelectorAll(
-                        "video, audio, source, [data-video-url], [data-audio-url], [data-voice-url], [data-media-url], [data-sticker-url], " +
+                        "[data-video-url], [data-audio-url], [data-voice-url], [data-media-url], [data-sticker-url], " +
                         "[data-video], [data-audio], [data-voice], [data-media], [data-voice-message], [data-video-note]"
                     );
                     elements.forEach(el => {
-                        const tagName = String(el.tagName || "").toLowerCase();
-                        let mediaTag = tagName;
-                        let ancestorMeta = "";
-                        let ancestorUrl = "";
-                        for (let node = el, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
-                            const nodeTag = String(node.tagName || "").toLowerCase();
-                            if (nodeTag === "video" || nodeTag === "audio") mediaTag = nodeTag;
-                            ancestorMeta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
-                            if (!ancestorUrl) ancestorUrl = candidate(node);
-                        }
-                        const meta = ancestorMeta;
-                        const url = candidate(el) || ancestorUrl;
-                        if (url) push(classify(meta, mediaTag), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || safeAttr(el.parentElement || el,"data-filename") || "");
+                        // Attributes nested in an actual media element are alternate
+                        // URLs for that same clip, already handled above.
+                        if (el.closest && el.closest("video, audio")) return;
+                        const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
+                        const url = candidate(el);
+                        if (url) push(classify(meta, String(el.tagName || "").toLowerCase()), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || "");
                     });
                     // Некоторые версии MAX держат медиа в div/span как background-image.
                     row.querySelectorAll("div,span,a,canvas").forEach(el => {
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|sticker|media)/i.test(meta)) return;
+                        if (el.closest && el.closest("video, audio")) return;
+                        const wantedType = classify(meta, String(el.tagName || "").toLowerCase());
+                        if ((wantedType === "video" || wantedType === "video_note") && out.some(item => item.type === "video" || item.type === "video_note")) return;
                         let url = candidate(el);
                         if (!url) {
                             try {
@@ -4681,12 +4716,16 @@ def parse_max_group_media(
                     row.querySelectorAll("*").forEach(el => {
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|media|videonote|video-note)/i.test(meta)) return;
+                        if (el.closest && el.closest("video, audio")) return;
+                        const wantedType = classify(meta, String(el.tagName || "").toLowerCase());
+                        if ((wantedType === "video" || wantedType === "video_note") && out.some(item => item.type === "video" || item.type === "video_note")) return;
                         const url = candidate(el);
                         if (url) push(classify(meta, String(el.tagName || "").toLowerCase()), url, safeAttr(el,"data-filename") || "");
                     });
                     // MAX может показывать только длительность 00:01, а URL видео/voice
                     // лежит у одного из ближайших родителей. Ищем такой URL до 6 уровней вверх.
                     try {
+                        let hasVideoAttachment = out.some(item => item.type === "video" || item.type === "video_note");
                         row.querySelectorAll("*").forEach(el => {
                             const t = clean(el.textContent);
                             if (!/^\d{1,2}:\d{2}$/.test(t)) return;
@@ -4695,7 +4734,11 @@ def parse_max_group_media(
                                 const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
                                 const url = candidate(node);
                                 if (url && /(video|voice|audio|круж|голос|message)/i.test(meta)) {
-                                    push(classify(meta, String(node.tagName || "").toLowerCase()), url, safeAttr(node,"data-filename") || "");
+                                    const type = classify(meta, String(node.tagName || "").toLowerCase());
+                                    if (!((type === "video" || type === "video_note") && hasVideoAttachment)) {
+                                        push(type, url, safeAttr(node,"data-filename") || "");
+                                        if (type === "video" || type === "video_note") hasVideoAttachment = true;
+                                    }
                                     break;
                                 }
                             }
@@ -5079,33 +5122,13 @@ def parse_max_group_media(
                             const digitCount = String(value || "").replace(/\D/g, "").length;
                             return digitCount >= 10 && digitCount <= 15;
                         };
-                        const contactPhoneText = (rowText.match(/(?<!\w)\+?\d[\d\s().-]{8,}\d(?!\w)/g) || []).find(validPhoneText) || "";
-                        const contactAction = Array.from(outerRow.querySelectorAll("button,[role='button'],a")).some(el =>
-                            /go to conversation|open chat|перейти к диалогу|перейти в чат|открыть чат/i.test(
-                                `${clean(el.innerText)} ${safeAttr(el,"aria-label")} ${safeAttr(el,"title")} ${safeAttr(el,"class")}`
-                            )
-                        );
-                        const messageBlock=outerRow.querySelector(".block") || row;
-                        const contactVisual = Array.from(messageBlock.querySelectorAll(
-                            "[data-contact-avatar],[class*='contact' i] img,img,canvas,[style*='background-image' i],[data-image-url],[data-photo-url]"
-                        )).some(el => {
-                            const meta=`${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el.parentElement || el,"class")} ${safeAttr(el.parentElement || el,"data-testid")}`;
-                            if (/data-contact-avatar|contact-avatar|contact-photo/i.test(meta)) return true;
-                            if (/avatar|userpic|profile|author|sender/i.test(meta)) return false;
-                            try {
-                                const rect=el.getBoundingClientRect();
-                                const largest=Math.max(rect.width,rect.height);
-                                return rect.width>=24 && rect.height>=24 && largest<=220 &&
-                                    Math.abs(rect.width-rect.height)<=Math.max(24,largest*0.2);
-                            } catch(e) { return false; }
-                        });
-                        const contactSelector="[data-testid*='contact' i],[class*='contact-card' i],[class*='contact-message' i],[data-contact],[data-vcard],[data-phone],[data-contact-phone],[data-contact-phone-number]";
-                        const contact = row.querySelector(contactSelector) || outerRow.querySelector(contactSelector) ||
-                            (contactAction || (contactPhoneText && contactVisual) ? row : null);
-                        const explicitContactText = /already in your contacts|уже в ваших контактах/i.test(rowText) ||
-                            contactAction || Boolean(contactPhoneText && contactVisual);
-                        // Обычное сообщение не считается контактом. Нужен явный DOM-маркер,
-                        // реальный телефон/vCard или точный служебный текст MAX о контакте.
+                        const contactSelector="[data-testid*='contact-card' i],[data-testid*='contact-message' i],[data-testid*='vcard' i],[class*='contact-card' i],[class*='contact-message' i],[class*='vcard' i],[data-contact],[data-vcard],[data-phone],[data-contact-phone],[data-contact-phone-number]";
+                        const telLink = row.querySelector("a[href^='tel:' i],[href^='tel:' i]");
+                        const contact = row.querySelector(contactSelector) || outerRow.querySelector(contactSelector) || telLink;
+                        const explicitContactText = Boolean(contact);
+                        // Номер в тексте, аватар или кнопка перехода не доказывают,
+                        // что сообщение является контактом: у обычных карточек MAX
+                        // встречаются длинные числовые ID.
                         if (!contact && !explicitContactText) {
                             // Обычное сообщение/имя — не контакт. Ничего не добавляем.
                         } else {
@@ -5127,7 +5150,8 @@ def parse_max_group_media(
                             if (phone) break;
                         }
                         if (!phone) {
-                            const tel=scope.querySelector("a[href^='tel:' i],[href^='tel:' i]");
+                        const tel=scope.querySelector("a[href^='tel:' i],[href^='tel:' i]") ||
+                            (scope.matches && scope.matches("a[href^='tel:' i],[href^='tel:' i]") ? scope : null);
                             if(tel) phone=normalizePhone((safeAttr(tel,"href")||"").replace(/^tel:/i,""),true);
                         }
                         if (!phone) {
@@ -5564,6 +5588,11 @@ def parse_max_group_media(
                 isinstance(a, dict) and a.get("type") in rich_media_types
                 for a in (msg.get("attachments") or [])
             )
+            rich_video_hint = any(
+                isinstance(a, dict) and a.get("type") in {"video", "video_note"}
+                for a in (msg.get("attachments") or [])
+            )
+            image_video_fallbacks = []
             emoji_image_urls = {str(u).strip() for u in (msg.get("emoji_image_urls") or []) if str(u).strip()}
             # MAX emoji assets are inline glyphs, not standalone photo attachments.
             # Keep Unicode in the message text and omit assets whose glyph MAX hides.
@@ -5617,6 +5646,12 @@ def parse_max_group_media(
                     detected_type = media.get("type")
                     if detected_type in {"video", "audio"}:
                         non_image_urls.add(img_url)
+                        if detected_type == "video" and rich_video_hint:
+                            # MAX can expose a low-resolution preview URL beside the
+                            # real attachment. Keep it only as a fallback if the
+                            # attachment itself cannot be downloaded.
+                            image_video_fallbacks.append(media)
+                            continue
                         if detected_type == "video" and msg.get("video_note_hint"):
                             media["type"] = "video_note"
                         elif detected_type == "audio" and msg.get("voice_hint"):
@@ -5698,7 +5733,45 @@ def parse_max_group_media(
                             media.get("content_type", ""), media["bytes"], "video",
                         )
                     media["type"] = "video_note" if expected_type == "video" else "voice" if expected_type == "audio" else att_type
+                    if att_type in {"video", "video_note"} and attachment.get("duration"):
+                        try:
+                            media["duration"] = float(attachment["duration"])
+                        except (TypeError, ValueError):
+                            pass
+                    poster_url = str(attachment.get("poster") or "").strip()
+                    if att_type == "video" and poster_url:
+                        try:
+                            poster_media = get_media_bytes(
+                                poster_url,
+                                media_type="image",
+                                chat_id=chat_id,
+                                context=context,
+                                page=page,
+                            )
+                            if poster_media and poster_media.get("bytes") and poster_media.get("type") == "image":
+                                media["thumbnail_bytes"] = poster_media["bytes"]
+                        except Exception as exc:
+                            debug_logger.info(
+                                "MAX_VIDEO_POSTER_FETCH_FAILED chat_id=%s source_id=%s error=%s",
+                                chat_id, msg.get("source_id") or msg.get("idx"), log_preview(exc, 160),
+                            )
                     media_files.append(media)
+            if image_video_fallbacks and not any(
+                _media_payload_kind(media) == "video" for media in media_files
+            ):
+                fallback_video = max(
+                    image_video_fallbacks,
+                    key=lambda media: len(media.get("bytes") or b""),
+                )
+                fallback_video["type"] = "video"
+                fallback_video["filename"] = _media_filename(
+                    fallback_video.get("filename", ""),
+                    fallback_video.get("url", ""),
+                    fallback_video.get("content_type", ""),
+                    fallback_video["bytes"],
+                    "video",
+                )
+                media_files.append(fallback_video)
             # Exact media element fallback: read bytes from the <audio>/<video>
             # belonging to this message card only. No page-wide resource scan.
             if not has_expected_rich_media():

@@ -61,6 +61,24 @@ def _video_upload_details(media: dict, post: dict) -> dict:
     except (TypeError, ValueError):
         pass
 
+    poster_data = media.get("thumbnail_bytes")
+    if isinstance(poster_data, (bytes, bytearray)) and poster_data:
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(io.BytesIO(bytes(poster_data))) as source:
+                poster = ImageOps.exif_transpose(source).convert("RGB")
+                poster.thumbnail((320, 320))
+                thumbnail = io.BytesIO()
+                poster.save(thumbnail, format="JPEG", quality=85, optimize=True)
+            thumbnail_bytes = thumbnail.getvalue()
+            if thumbnail_bytes.startswith(b"\xff\xd8\xff") and len(thumbnail_bytes) <= 200_000:
+                result["thumbnail"] = thumbnail_bytes
+        except Exception as exc:
+            debug_logger.info(
+                "VIDEO_POSTER_CONVERSION_FAILED source_id=%s error=%s",
+                post.get("source_id") or post.get("idx") or "?", log_preview(exc, 160),
+            )
+
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         try:
@@ -96,7 +114,7 @@ def _video_upload_details(media: dict, post: dict) -> dict:
             result["width"] = int(dimensions.group(1))
             result["height"] = int(dimensions.group(2))
         thumbnail = probe.stdout
-        if thumbnail.startswith(b"\xff\xd8\xff") and len(thumbnail) < 200_000:
+        if "thumbnail" not in result and thumbnail.startswith(b"\xff\xd8\xff") and len(thumbnail) < 200_000:
             result["thumbnail"] = thumbnail
     except Exception as exc:
         debug_logger.warning(
@@ -784,6 +802,10 @@ def _diagnostic_post(post, status, detail=""):
 
 
 def _store_parse_diagnostic(chat_id, title, sent, skipped, failed, posts, error=None):
+    visible_posts = [
+        item for item in (posts or [])
+        if isinstance(item, dict) and item.get("status") in {"sent", "failed"}
+    ][-10:]
     entry = {
         "chat_id": int(chat_id),
         "title": str(title or "")[:100],
@@ -791,7 +813,7 @@ def _store_parse_diagnostic(chat_id, title, sent, skipped, failed, posts, error=
         "sent": int(sent),
         "skipped": int(skipped),
         "failed": int(failed),
-        "posts": list(posts or [])[-10:],
+        "posts": visible_posts,
         "error": str(error or "")[:240],
     }
     with PARSE_DIAGNOSTICS_LOCK:
@@ -1716,7 +1738,7 @@ def show_parse_diagnostics(chat_id, message_id, target_chat_id=None):
         if not chats:
             text += "Сначала добавьте чат для парсинга."
         else:
-            text += "Выберите чат, чтобы увидеть последние сообщения и их статус."
+            text += "Выберите чат, чтобы увидеть последние отправленные сообщения и ошибки."
             for chat in chats[:12]:
                 chat_id_value = int(chat["chat_id"])
                 entry = diagnostics.get(chat_id_value)
@@ -1725,7 +1747,6 @@ def show_parse_diagnostics(chat_id, message_id, target_chat_id=None):
                     text += (
                         f"\n\n<b>{title}</b> · {escape_html(entry.get('updated_at') or '')}"
                         f"\n✅ {entry.get('sent', 0)} отправлено · "
-                        f"⏭ {entry.get('skipped', 0)} пропущено · "
                         f"⚠️ {entry.get('failed', 0)} ошибок"
                     )
                     button_label = _short_button_label(
@@ -1757,15 +1778,15 @@ def show_parse_diagnostics(chat_id, message_id, target_chat_id=None):
         text += (
             f"\n🕒 {escape_html(entry.get('updated_at') or '')}"
             f"\n✅ Отправлено: {entry.get('sent', 0)}"
-            f" · ⏭ Пропущено: {entry.get('skipped', 0)}"
             f" · ⚠️ Ошибок: {entry.get('failed', 0)}"
         )
         if entry.get("error"):
             text += f"\n\n⚠️ <b>Ошибка разбора:</b> {escape_html(entry['error'])}"
+        if not entry.get("posts") and not entry.get("error"):
+            text += "\n\nВ этом цикле ошибок нет. Новых сообщений для отправки не найдено."
         for item in entry.get("posts", []):
             status_label = {
                 "sent": "✅ отправлено",
-                "skipped": "⏭ пропущено",
                 "failed": "⚠️ ошибка",
             }.get(item.get("status"), "ℹ️ обработано")
             preview = escape_html(item.get("text") or "[без текста]")
@@ -2372,10 +2393,9 @@ def _yookassa_receipt_provider_data(plan_code, amount):
             "задайте YOOKASSA_RECEIPT_PAYMENT_MODE и YOOKASSA_RECEIPT_PAYMENT_SUBJECT"
         )
 
-    _, plan_description = _subscription_plan(plan_code)
     receipt = {
         "items": [{
-            "description": f"MAX_Parser — подписка на 30 дней ({plan_description})",
+            "description": "Подписка на MAX_Parser — доступ к сервису на 30 дней",
             "quantity": "1.00",
             "amount": {
                 "value": f"{amount // 100}.{amount % 100:02d}",
@@ -2494,7 +2514,7 @@ def _maybe_offer_review(user_id):
 def show_approved_reviews(chat_id, message_id, page=0):
     reviews = get_approved_reviews()
     if not reviews:
-        text = "⭐ <b>Отзывы</b>\n\nПока нет опубликованных отзывов."
+        text = "⭐ <b>Отзывы</b>\n\nПока отзывов нет."
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
         safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
@@ -2938,7 +2958,7 @@ def connect_command(message):
         return
     bot.send_message(
         message.chat.id,
-        f"Выберите способ подключения. Подключено чатов: {len(get_user_chats(message.from_user.id))}/{MAX_CUSTOMER_CHATS}.",
+        "Выберите способ подключения.",
         reply_markup=parser_keyboard(),
         **NO_PREVIEW,
     )
@@ -2946,8 +2966,8 @@ def connect_command(message):
 
 def _chat_limit_notice():
     return (
-        f"К вашему аккаунту можно подключить до {MAX_CUSTOMER_CHATS} чатов. "
-        "Если нужно больше, напишите в поддержку командой /help."
+        f"У вас уже подключено {MAX_CUSTOMER_CHATS} чатов. "
+        "Чтобы подключить ещё один, напишите в поддержку через /help."
     )
 
 
@@ -2994,6 +3014,11 @@ def _show_my_chats(chat_id, owner_id, message_id=None):
             f"\n<b>{index}. {escape_html(chat.get('title') or 'Группа')}</b>\n"
             f"{state} · {mode}"
         )
+        if chat.get("account_mode") == "project" and chat.get("max_url") and not chat.get("is_active"):
+            keyboard.add(types.InlineKeyboardButton(
+                f"🔎 Проверить доступ №{index}",
+                callback_data=f"project_retry_{chat['chat_id']}",
+            ))
         keyboard.add(types.InlineKeyboardButton(
             f"🗑 Удалить №{index}",
             callback_data=f"mychat_delete_{chat['chat_id']}"
@@ -3062,27 +3087,55 @@ def _project_access_help():
     )
 
 
-def _verify_project_chat_access(chat_id, notify_chat_id=None):
+def _verify_project_chat_access(chat_id, notify_chat_id=None, progress_message_id=None):
     chat = get_chat_by_id(chat_id)
-    if not chat or chat.get("account_mode") != "project" or not chat.get("max_url"):
-        return False
-    owner_id = int(chat.get("owner_id") or 0)
+    owner_id = int(chat.get("owner_id") or 0) if chat else 0
     destination = int(notify_chat_id or owner_id or ADMIN_ID)
+
+    def report(text, reply_markup=None):
+        if not destination:
+            return
+        if progress_message_id:
+            try:
+                bot.edit_message_text(
+                    text=text,
+                    chat_id=destination,
+                    message_id=progress_message_id,
+                    reply_markup=reply_markup,
+                    **NO_PREVIEW,
+                )
+                return
+            except Exception as error:
+                debug_logger.info(
+                    "PROJECT_ACCESS_STATUS_EDIT_FAILED chat_id=%s error_type=%s",
+                    chat_id, type(error).__name__,
+                )
+        bot.send_message(
+            destination,
+            text,
+            reply_markup=reply_markup,
+            **NO_PREVIEW,
+        )
+
+    if not chat or chat.get("account_mode") != "project" or not chat.get("max_url"):
+        if progress_message_id:
+            report("Проверка остановлена: это подключение удалено или ссылка на источник отсутствует.")
+        return False
     session_path = _session_path_for_chat(chat)
     if not os.path.exists(session_path):
-        if destination:
-            bot.send_message(
-                destination,
-                "Ссылка на группу сохранена, но аккаунт проекта ещё не авторизован. "
-                "Подключение включится после настройки сессии администратором.",
-                **NO_PREVIEW,
-            )
+        report(
+            "Ссылка сохранена. Аккаунт проекта ещё не подключён. "
+            "После его авторизации бот автоматически проверит доступ к этому чату."
+        )
         return False
     try:
-        posts = parse_max_group_media(
+        parse_max_group_media(
             group_url=chat["max_url"],
             chat_id=chat_id,
             session_path=session_path,
+            verify_only=True,
+            navigation_timeout_ms=12000,
+            navigation_attempts=2,
         )
         current = get_chat_by_id(chat_id)
         if (
@@ -3091,15 +3144,12 @@ def _verify_project_chat_access(chat_id, notify_chat_id=None):
             or current.get("max_url") != chat.get("max_url")
             or int(current.get("owner_id") or 0) != owner_id
         ):
+            report("Проверка остановлена: подключение было удалено или изменено.")
             return False
-        _process_chat_posts_if_present(chat_id, current.get("title") or "MAX", posts)
         toggle_chat(chat_id, True)
-        bot.send_message(
-            destination,
-            "✅ <b>Доступ проверен.</b> Аккаунт проекта видит источник MAX, пересылка запущена.\n\n"
-            "Если в группе пока нет сообщений, парсер продолжит проверять её автоматически.",
-            parse_mode="HTML",
-            **NO_PREVIEW,
+        report(
+            "✅ Доступ проверен. Пересылка включена.\n\n"
+            "Бот начнёт проверять новые сообщения в ближайшем цикле."
         )
         if owner_id > 0 and not is_admin(owner_id):
             try:
@@ -3115,36 +3165,37 @@ def _verify_project_chat_access(chat_id, notify_chat_id=None):
             "PROJECT_GROUP_ACCESS_CHECK_FAILED chat_id=%s owner_id=%s error_type=%s",
             chat_id, owner_id, type(error).__name__,
         )
-        if destination:
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(types.InlineKeyboardButton(
-                "🔁 Проверить подключение",
-                callback_data=f"project_retry_{chat_id}",
-            ))
-            if "MAX_INVITE_APPROVAL_PENDING" in str(error):
-                access_message = (
-                    "Заявка аккаунта проекта на вступление отправлена. "
-                    "Когда владелец или администратор её одобрит, нажмите «Проверить подключение»."
-                )
-            elif "MAX_INVITE_JOIN_REQUIRED" in str(error):
-                access_message = (
-                    "Не удалось вступить в источник по этой ссылке. "
-                    "Попросите владельца или администратора добавить аккаунт либо прислать новую ссылку. "
-                    "После добавления нажмите «Проверить подключение»."
-                )
-            else:
-                access_message = (
-                    "Не удалось подтвердить доступ аккаунта проекта к источнику MAX. "
-                    "Проверьте ссылку и убедитесь, что аккаунт добавлен и видит сообщения. "
-                    "Затем нажмите «Проверить подключение»."
-                )
-            bot.send_message(
-                destination,
-                "⚠️ " + access_message + "\n\n" + _project_access_help(),
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                **NO_PREVIEW,
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton(
+            "🔁 Проверить ещё раз",
+            callback_data=f"project_retry_{chat_id}",
+        ))
+        keyboard.add(types.InlineKeyboardButton(
+            "💬 Написать в поддержку",
+            callback_data="support_start",
+        ))
+        if "MAX_INVITE_APPROVAL_PENDING" in str(error):
+            access_message = (
+                "Заявка аккаунта проекта отправлена. Когда владелец или администратор её одобрит, "
+                "нажмите «Проверить ещё раз»."
             )
+        elif "MAX_INVITE_JOIN_REQUIRED" in str(error):
+            access_message = (
+                "Аккаунту проекта пока не удалось вступить в этот чат. Попросите владельца или администратора "
+                "добавить его либо пришлите новую ссылку-приглашение, затем повторите проверку."
+            )
+        elif "SESSION_EXPIRED" in str(error):
+            access_message = (
+                "Сессия аккаунта проекта завершилась. Администратору нужно повторно войти в MAX, "
+                "после этого проверку можно запустить ещё раз."
+            )
+        else:
+            access_message = (
+                "Не удалось подтвердить, что аккаунт проекта видит сообщения в этом источнике. "
+                "Проверьте ссылку и доступ аккаунта, затем нажмите «Проверить ещё раз». "
+                "Если аккаунт нельзя добавить в группу или чат, напишите в поддержку через /help."
+            )
+        report("⚠️ " + access_message, reply_markup=keyboard)
         return False
 
 
@@ -3188,6 +3239,13 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         return False
     pending_setup_modes.pop(owner_id, None)
     customer_setup_state[owner_id] = {"chat_id": chat_id, "mode": account_mode}
+    setup_keyboard = None
+    if account_mode == "project":
+        setup_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        setup_keyboard.add(types.InlineKeyboardButton(
+            "Не получается добавить аккаунт?",
+            callback_data=f"project_add_help_{chat_id}",
+        ))
     bot.send_message(
         owner_id,
         f"✅ Группа <b>{escape_html(title)}</b> закреплена за вами.\n\n"
@@ -3201,6 +3259,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
            if account_mode == "project" else "")
         + "Для отмены отправьте /cancel.",
         parse_mode="HTML",
+        reply_markup=setup_keyboard,
         **NO_PREVIEW,
     )
     return True
@@ -3269,17 +3328,15 @@ def customer_source_url(message):
 
     project_session = os.path.join("sessions", "project_account.json")
     if os.path.exists(project_session):
-        bot.send_message(
+        progress = bot.send_message(
             message.chat.id,
-            "✅ Ссылка сохранена. Сейчас проверю, может ли аккаунт проекта открыть этот чат MAX. "
-            "Парсинг включится только после успешной проверки.\n\n"
-            f"{_project_access_help()}",
-            parse_mode="HTML",
+            "⏳ Ссылка получена. Проверяю, может ли аккаунт проекта открыть этот чат MAX. "
+            "Результат появится здесь.",
             **NO_PREVIEW,
         )
         threading.Thread(
             target=_verify_project_chat_access,
-            args=(chat_id, message.chat.id),
+            args=(chat_id, message.chat.id, progress.message_id),
             daemon=True,
         ).start()
     else:
@@ -3691,13 +3748,14 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
     is_allowed_customer_qr = False
     is_allowed_customer_review = action == "reviews_show" or action.startswith("reviews_page_")
     is_allowed_project_retry = False
+    is_allowed_project_setup = False
     if not is_admin(call.from_user.id) and action.startswith("qr_"):
         try:
             qr_target = _qr_target_from_action(action)
@@ -3724,7 +3782,21 @@ def admin_callbacks(call):
             )
         except (ValueError, IndexError, TypeError):
             is_allowed_project_retry = False
-    if not is_admin(call.from_user.id) and not is_allowed_customer_qr and not is_allowed_customer_review and not is_allowed_project_retry:
+    if not is_admin(call.from_user.id) and action.startswith(("project_add_help_", "project_help_channel_", "project_help_support_")):
+        try:
+            setup_chat_id = int(action.rsplit("_", 1)[1])
+            setup_chat = get_chat_by_id(setup_chat_id)
+            setup_state = customer_setup_state.get(int(call.from_user.id)) or {}
+            is_allowed_project_setup = bool(
+                setup_chat
+                and setup_chat.get("account_mode") == "project"
+                and int(setup_chat.get("owner_id") or 0) == int(call.from_user.id)
+                and setup_state.get("mode") == "project"
+                and int(setup_state.get("chat_id") or 0) == setup_chat_id
+            )
+        except (ValueError, IndexError, TypeError):
+            is_allowed_project_setup = False
+    if not is_admin(call.from_user.id) and not is_allowed_customer_qr and not is_allowed_customer_review and not is_allowed_project_retry and not is_allowed_project_setup:
         bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
         return
     if action.startswith("support_close_"):
@@ -3763,16 +3835,89 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "⚠️ Не удалось удалить")
             print(f"Ошибка удаления: {e}")
         return
+    if action.startswith(("project_add_help_", "project_help_channel_", "project_help_support_")):
+        try:
+            setup_chat_id = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Некорректное подключение", show_alert=True)
+            return
+        setup_state = customer_setup_state.get(int(call.from_user.id)) or {}
+        setup_chat = get_chat_by_id(setup_chat_id)
+        if (
+            not setup_chat
+            or setup_chat.get("account_mode") != "project"
+            or int(setup_chat.get("owner_id") or 0) != int(call.from_user.id)
+            or setup_state.get("mode") != "project"
+            or int(setup_state.get("chat_id") or 0) != setup_chat_id
+        ):
+            bot.answer_callback_query(call.id, "Этот шаг настройки уже завершён", show_alert=True)
+            return
+        if action.startswith("project_add_help_"):
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
+            keyboard.add(types.InlineKeyboardButton(
+                "📢 Это канал — отправлю приглашение",
+                callback_data=f"project_help_channel_{setup_chat_id}",
+            ))
+            keyboard.add(types.InlineKeyboardButton(
+                "💬 Это группа или чат — поддержка",
+                callback_data=f"project_help_support_{setup_chat_id}",
+            ))
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "Не получается добавить аккаунт проекта?\n\n"
+                "Если источник — канал, нажмите первую кнопку и отправьте ссылку-приглашение. "
+                "Если это группа или чат и добавить аккаунт нельзя, нажмите «Поддержка».",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboard,
+                **NO_PREVIEW,
+            )
+            return
+        if action.startswith("project_help_channel_"):
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
+            keyboard.add(types.InlineKeyboardButton(
+                "💬 Написать в поддержку",
+                callback_data=f"project_help_support_{setup_chat_id}",
+            ))
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "📢 Отправьте сюда ссылку-приглашение на канал MAX. Бот попробует открыть её и подписать аккаунт проекта. "
+                "Если MAX отправит заявку на вступление, её должен одобрить владелец или администратор канала.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboard,
+                **NO_PREVIEW,
+            )
+            return
+        customer_setup_state.pop(int(call.from_user.id), None)
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text(
+                "Настройку приостановил. Поддержка поможет разобраться, как подключить этот источник.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+                **NO_PREVIEW,
+            )
+        except Exception:
+            pass
+        start_support(call.message.chat.id, call.from_user)
+        return
     if action.startswith("project_retry_"):
         try:
             retry_chat_id = int(action.rsplit("_", 1)[1])
         except (ValueError, IndexError):
             bot.answer_callback_query(call.id, "Некорректный ID группы", show_alert=True)
             return
-        bot.answer_callback_query(call.id, "Проверяю доступ к MAX-группе")
+        bot.answer_callback_query(call.id, "Проверяю доступ к MAX")
+        progress = bot.send_message(
+            call.from_user.id,
+            "⏳ Проверяю доступ к источнику MAX. Результат появится здесь.",
+            **NO_PREVIEW,
+        )
         threading.Thread(
             target=_verify_project_chat_access,
-            args=(retry_chat_id, call.from_user.id),
+            args=(retry_chat_id, call.from_user.id, progress.message_id),
             daemon=True,
         ).start()
         return
@@ -4476,7 +4621,6 @@ def callback_handler(call):
                     "<blockquote><b>2️⃣ Аккаунт проекта</b>\n"
                     f"Добавьте аккаунт проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code> в нужный MAX-чат. "
                     "После отправки ссылки бот проверит, видит ли он сообщения.</blockquote>\n\n"
-                    f"Можно подключить до {MAX_CUSTOMER_CHATS} чатов. Чтобы подключить больше, напишите в поддержку через /help.\n\n"
                     "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
                 ),
                 reply_markup=parser_keyboard(),
@@ -4595,7 +4739,6 @@ def callback_handler(call):
                     "В личном чате с ботом выберите вариант 2, добавьте бота в Telegram-группу назначения и отправьте там /bind. "
                     "Затем пришлите ссылку на источник MAX. Бот проверит, может ли аккаунт проекта открыть сообщения, "
                     "и включит пересылку только после успешной проверки. Для закрытых источников владелец должен разрешить доступ.\n\n"
-                    f"К одному аккаунту можно подключить до {MAX_CUSTOMER_CHATS} чатов. Чтобы подключить больше, напишите в поддержку через /help.\n\n"
                     "<b>Управление и помощь</b>\n"
                     "• /mychats — посмотреть свои подключения.\n"
                     "• /cancel — отменить текущий шаг настройки.\n"
