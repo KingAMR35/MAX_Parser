@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 import queue
 import threading
 import traceback
+import tempfile
 from typing import List, Dict
 from playwright.sync_api import sync_playwright
 from debug_log import logger as debug_logger, preview as log_preview
@@ -19,8 +20,15 @@ from debug_log import logger as debug_logger, preview as log_preview
 SESSIONS_DIR = "sessions"
 SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
-MAX_MESSAGES_TO_PARSE = 10  #! Тут менять кол-во сообщений
-MAX_MESSAGES_TO_PARSE = max(0, int(MAX_MESSAGES_TO_PARSE))
+# Keep a rolling window so a busy chat can catch up after a slow cycle. On the
+# first connection only the newest few posts are delivered; older rows become
+# the initial baseline instead of causing a large first-time media download.
+MAX_MESSAGES_TO_PARSE = 100
+MAX_FIRST_CONNECTION_MESSAGES = 3
+MAX_MEDIA_DOWNLOAD_BYTES = 47 * 1024 * 1024
+MAX_TELEGRAM_PHOTO_BYTES = 9 * 1024 * 1024
+MEDIA_SPOOL_DIR = os.path.join(tempfile.gettempdir(), "max_parser_media")
+os.makedirs(MEDIA_SPOOL_DIR, exist_ok=True)
 MAX_TIMEZONE_ID = "Europe/Samara"
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -1133,6 +1141,67 @@ def get_legacy_message_hash(post: dict) -> str:
         return ""
     return hashlib.md5(f"max-message:{source_id}".encode("utf-8")).hexdigest()
 
+
+def _message_cache_stub(msg: dict) -> dict:
+    """Build the stable, attachment-free part of a MAX row for cache checks."""
+    special = {
+        key: msg.get(key)
+        for key in ("location", "poll", "contact")
+        if msg.get(key)
+    }
+    return {
+        "source_id": msg.get("source_id", ""),
+        "source_id_is_index": bool(msg.get("source_id_is_index")),
+        "idx": msg.get("idx"),
+        "name": msg.get("name", "Аноним"),
+        "text": msg.get("text", ""),
+        "time": msg.get("time", ""),
+        "date": msg.get("date", ""),
+        "location": msg.get("location"),
+        "poll": msg.get("poll"),
+        "contact": msg.get("contact"),
+        "special": special,
+        "media_files": [],
+    }
+
+
+def _message_can_be_prefiltered(msg: dict) -> bool:
+    """Do not fetch attachments for rows whose identity is already reliable."""
+    if _has_media_independent_content(_message_cache_stub(msg)):
+        return True
+    source_id = str(msg.get("source_id") or "").strip()
+    return bool(source_id and not msg.get("source_id_is_index"))
+
+
+def _spool_media_payload(media: dict, chat_id: int, source_id: str) -> str:
+    """Move one completed attachment from RAM to a temporary file."""
+    data = media.get("bytes")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return ""
+    suffix = os.path.splitext(str(media.get("filename") or ""))[1][:12]
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(prefix=f"max-{int(chat_id)}-", suffix=suffix, dir=MEDIA_SPOOL_DIR)
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+        media["size_bytes"] = len(data)
+        media["temp_path"] = path
+        media.pop("bytes", None)
+        return path
+    except OSError as exc:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        media["spool_failed"] = True
+        media.pop("bytes", None)
+        debug_logger.warning(
+            "MEDIA_SPOOL_FAILED chat_id=%s source_id=%s bytes=%s error=%s",
+            chat_id, source_id or "?", len(data), log_preview(exc, 180),
+        )
+        return ""
+
 def get_media_hash(data=None, url=None) -> str:
     if isinstance(data, (bytes, bytearray)):
         return hashlib.md5(bytes(data)).hexdigest()
@@ -1433,6 +1502,30 @@ def _sniff_rich_media_type(data: bytes, content_type: str = "") -> str:
         return "audio"
     return ""
 
+
+def _media_size_limit_marker(
+    chat_id: int, url: str, media_type: str, size_bytes: int, limit_bytes: int = None
+) -> dict:
+    size_bytes = max(0, int(size_bytes or 0))
+    limit_bytes = int(limit_bytes or MAX_MEDIA_DOWNLOAD_BYTES)
+    debug_logger.warning(
+        "MAX_MEDIA_SKIPPED chat_id=%s type=%s bytes=%s limit=%s url=%s",
+        chat_id, media_type, size_bytes, limit_bytes, log_preview(url, 180),
+    )
+    return {
+        "url": url,
+        "type": media_type,
+        "oversized": True,
+        "size_bytes": size_bytes,
+    }
+
+
+def _declared_media_size(headers) -> int:
+    try:
+        return max(0, int(headers.get("content-length") or headers.get("Content-Length") or 0))
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
 def get_media_bytes(
     url: str,
     media_type: str = "image",
@@ -1449,6 +1542,8 @@ def get_media_bytes(
         try:
             if url.startswith("data:"):
                 header, encoded = url.split(",", 1)
+                if len(encoded) > (MAX_MEDIA_DOWNLOAD_BYTES * 4 // 3 + 8):
+                    return _media_size_limit_marker(chat_id, url, media_type, len(encoded) * 3 // 4)
                 data = base64.b64decode(encoded)
                 content_type = header[5:].split(";", 1)[0] if header.startswith("data:") else ""
             elif url.startswith("blob:"):
@@ -1457,20 +1552,31 @@ def get_media_bytes(
                     return None
                 result = page.evaluate(
                     """
-                    async url => {
+                    async ({url, maxBytes}) => {
                         const response = await fetch(url, {credentials: "include"});
                         if (!response.ok) throw new Error(`HTTP ${response.status}`);
                         const blob = await response.blob();
-                        const buffer = await blob.arrayBuffer();
+                        if (blob.size > maxBytes) return {oversizedSize: blob.size, contentType: blob.type || ""};
+                        const dataUrl = await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(reader.result);
+                            reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
+                            reader.readAsDataURL(blob);
+                        });
                         return {
-                            bytes: Array.from(new Uint8Array(buffer)),
+                            dataUrl,
                             contentType: blob.type || ""
                         };
                     }
                     """,
-                    url,
+                    {"url": url, "maxBytes": MAX_MEDIA_DOWNLOAD_BYTES},
                 )
-                data = bytes(result.get("bytes", []))
+                if result.get("oversizedSize"):
+                    return _media_size_limit_marker(chat_id, url, media_type, result["oversizedSize"])
+                encoded_data = str(result.get("dataUrl") or "")
+                if "," not in encoded_data:
+                    raise RuntimeError("blob вернул пустые данные")
+                data = base64.b64decode(encoded_data.split(",", 1)[1])
                 content_type = result.get("contentType", "")
             elif url.startswith(("http://", "https://")):
                 headers = {
@@ -1488,8 +1594,21 @@ def get_media_bytes(
                     except Exception:
                         response = None
                 if response is not None and response.ok:
-                    data = response.body()
+                    declared_size = _declared_media_size(response.headers)
+                    if declared_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                        try:
+                            response.dispose()
+                        except Exception:
+                            pass
+                        return _media_size_limit_marker(chat_id, url, media_type, declared_size)
                     content_type = response.headers.get("content-type", "")
+                    data = response.body()
+                    try:
+                        response.dispose()
+                    except Exception:
+                        pass
+                    if len(data) > MAX_MEDIA_DOWNLOAD_BYTES:
+                        return _media_size_limit_marker(chat_id, url, media_type, len(data))
                 else:
                     cookies = _browser_cookies_as_dict(context) if context is not None else {}
                     fallback_headers = {
@@ -1501,24 +1620,49 @@ def get_media_bytes(
                         "Referer": "https://web.max.ru/",
                         "Accept": headers["Accept"],
                     }
-                    response2 = requests.get(url, headers=fallback_headers, cookies=cookies, timeout=(15, 60))
-                    response2.raise_for_status()
-                    data = response2.content
-                    content_type = response2.headers.get("content-type", "")
+                    with requests.get(
+                        url, headers=fallback_headers, cookies=cookies,
+                        timeout=(15, 60), stream=True,
+                    ) as response2:
+                        response2.raise_for_status()
+                        declared_size = _declared_media_size(response2.headers)
+                        if declared_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                            return _media_size_limit_marker(chat_id, url, media_type, declared_size)
+                        chunks = bytearray()
+                        for chunk in response2.iter_content(chunk_size=256 * 1024):
+                            if not chunk:
+                                continue
+                            chunks.extend(chunk)
+                            if len(chunks) > MAX_MEDIA_DOWNLOAD_BYTES:
+                                return _media_size_limit_marker(chat_id, url, media_type, len(chunks))
+                        data = bytes(chunks)
+                        content_type = response2.headers.get("content-type", "")
                 # Последний browser-only fallback полезен для CORS/proxy URLs.
                 if media_type == "image" and (not data or not _looks_like_image(data, content_type)) and page is not None:
                     try:
                         fetched = page.evaluate(
-                            """async (url) => {
+                            """async ({url, maxBytes}) => {
                                 const r = await fetch(url, {credentials:'include', headers:{'Accept':'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'}});
                                 if (!r.ok) throw new Error(`HTTP ${r.status}`);
                                 const b = await r.blob();
-                                const ab = await b.arrayBuffer();
-                                return {bytes:Array.from(new Uint8Array(ab)), contentType:b.type||''};
+                                if (b.size > maxBytes) return {oversizedSize:b.size, contentType:b.type||''};
+                                const dataUrl = await new Promise((resolve,reject)=>{
+                                    const reader=new FileReader();
+                                    reader.onload=()=>resolve(reader.result);
+                                    reader.onerror=()=>reject(reader.error||new Error('FileReader failed'));
+                                    reader.readAsDataURL(b);
+                                });
+                                return {dataUrl, contentType:b.type||''};
                             }""",
-                            url,
+                            {"url": url, "maxBytes": MAX_MEDIA_DOWNLOAD_BYTES},
                         )
-                        browser_bytes = bytes(fetched.get("bytes") or [])
+                        if fetched.get("oversizedSize"):
+                            return _media_size_limit_marker(chat_id, url, media_type, fetched["oversizedSize"])
+                        browser_data_url = str(fetched.get("dataUrl") or "")
+                        browser_bytes = (
+                            base64.b64decode(browser_data_url.split(",", 1)[1])
+                            if "," in browser_data_url else b""
+                        )
                         browser_type = fetched.get("contentType") or ""
                         if browser_bytes:
                             data = browser_bytes
@@ -1530,8 +1674,14 @@ def get_media_bytes(
                 return None
             if not data:
                 raise RuntimeError("MAX вернул пустой файл")
+            if len(data) > MAX_MEDIA_DOWNLOAD_BYTES:
+                return _media_size_limit_marker(chat_id, url, media_type, len(data))
             detected_type = _sniff_rich_media_type(data, content_type) if media_type == "image" else ""
             if detected_type:
+                if detected_type == "image" and len(data) > MAX_TELEGRAM_PHOTO_BYTES:
+                    return _media_size_limit_marker(
+                        chat_id, url, detected_type, len(data), MAX_TELEGRAM_PHOTO_BYTES
+                    )
                 result = {
                     "url": url,
                     "bytes": data,
@@ -1553,6 +1703,10 @@ def get_media_bytes(
                         return None
                     raise RuntimeError(
                         f"ответ не похож на изображение: content-type={content_type!r}, size={len(data)}"
+                    )
+                if len(data) > MAX_TELEGRAM_PHOTO_BYTES:
+                    return _media_size_limit_marker(
+                        chat_id, url, "image", len(data), MAX_TELEGRAM_PHOTO_BYTES
                     )
             media_hash = get_media_hash(data=data)
             return {
@@ -1905,11 +2059,16 @@ def _install_max_media_response_cache(page, chat_id: int) -> None:
     """Capture audio/video responses during history warmup, before lazy cards are clicked."""
     page._max_media_response_cache = []
     page._max_media_claimed_responses = set()
+    page._max_media_response_cache_bytes = 0
 
     def on_response(resp):
         try:
             content_type = str(resp.headers.get("content-type") or "").lower()
             if not any(kind in content_type for kind in ("audio/", "video/", "octet-stream", "binary")):
+                return
+            if _declared_media_size(resp.headers) > 25 * 1024 * 1024:
+                return
+            if page._max_media_response_cache_bytes >= 24 * 1024 * 1024:
                 return
             url = str(resp.url or "")
             parsed_url = urlparse(url)
@@ -1918,7 +2077,10 @@ def _install_max_media_response_cache(page, chat_id: int) -> None:
             if "/_app/immutable/assets/" in parsed_url.path:
                 return
             body = resp.body()
-            if not body or len(body) <= 300 or len(body) > 25 * 1024 * 1024:
+            if (
+                not body or len(body) <= 300
+                or len(body) > min(25 * 1024 * 1024, 24 * 1024 * 1024 - page._max_media_response_cache_bytes)
+            ):
                 return
             media_kind = _media_payload_kind({"bytes": body, "content_type": content_type})
             if media_kind not in ("audio", "video"):
@@ -1934,6 +2096,7 @@ def _install_max_media_response_cache(page, chat_id: int) -> None:
                 "hash": get_media_hash(data=body),
             }
             page._max_media_response_cache.append(entry)
+            page._max_media_response_cache_bytes += len(body)
             debug_logger.info(
                 "MAX_MEDIA_PRELOAD_CAPTURED chat_id=%s order=%s type=%s endpoint=%s content_type=%s bytes=%s content_range=%s",
                 chat_id, entry["response_order"], media_kind, path, content_type,
@@ -1953,6 +2116,7 @@ def _take_preloaded_media(page, msg: dict, expected_type: str, chat_id: int) -> 
     responses = getattr(page, "_max_media_response_cache", [])
     wanted_duration = float(msg.get("media_duration_seconds") or 0)
     candidates = []
+    oversized_candidate = None
     for entry in responses:
         order = entry.get("response_order")
         if order in claimed or entry.get("type") != wanted:
@@ -1969,12 +2133,36 @@ def _take_preloaded_media(page, msg: dict, expected_type: str, chat_id: int) -> 
         range_match = re.search(r"bytes\s+\d+-\d+/(\d+)", content_range, re.I)
         if expected_type == "video_note" and range_match and int(range_match.group(1)) > len(data):
             expected_size = int(range_match.group(1))
+            if expected_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                oversized_candidate = _media_size_limit_marker(
+                    chat_id, entry.get("url", ""), expected_type, expected_size
+                )
+                continue
             try:
                 full = page.context.request.get(
                     entry["url"], headers={"Referer": "https://web.max.ru/"},
                     timeout=60_000, fail_on_status_code=False,
                 )
+                declared_size = _declared_media_size(full.headers) if full.ok else 0
+                if declared_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                    try:
+                        full.dispose()
+                    except Exception:
+                        pass
+                    oversized_candidate = _media_size_limit_marker(
+                        chat_id, entry.get("url", ""), expected_type, declared_size
+                    )
+                    continue
                 full_data = full.body() if full.ok else b""
+                try:
+                    full.dispose()
+                except Exception:
+                    pass
+                if len(full_data) > MAX_MEDIA_DOWNLOAD_BYTES:
+                    oversized_candidate = _media_size_limit_marker(
+                        chat_id, entry.get("url", ""), expected_type, len(full_data)
+                    )
+                    continue
             except Exception as exc:
                 debug_logger.warning(
                     "MAX_MEDIA_PRELOAD_RANGE_FAILED chat_id=%s source_id=%s response_order=%s error=%s",
@@ -1999,7 +2187,7 @@ def _take_preloaded_media(page, msg: dict, expected_type: str, chat_id: int) -> 
         candidates.append((difference, order, entry, data, actual_duration, content_range))
 
     if not candidates:
-        return []
+        return [oversized_candidate] if oversized_candidate else []
     # Nearby MAX cards may prefetch more than one audio stream at once. Match the
     # duration displayed on this exact card before falling back to response order.
     candidates.sort(key=lambda item: (item[0], item[1]))
@@ -2531,18 +2719,21 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
     try:
         if url.startswith("data:"):
             header, encoded = url.split(",", 1)
+            if len(encoded) > (MAX_MEDIA_DOWNLOAD_BYTES * 4 // 3 + 8):
+                return _media_size_limit_marker(chat_id, url, media_type, len(encoded) * 3 // 4)
             file_bytes = base64.b64decode(encoded)
             content_type = header[5:].split(";", 1)[0] if header.startswith("data:") else ""
             final_name = _normalize_document_filename(filename, url, content_type)
         elif url.startswith("blob:"):
             data_url = page.evaluate(
                 r"""
-                async (url) => {
+                async ({url, maxBytes}) => {
                     const response = await fetch(url, { credentials: 'include' });
                     if (!response.ok) {
                         throw new Error(`HTTP ${response.status}`);
                     }
                     const blob = await response.blob();
+                    if (blob.size > maxBytes) return {oversizedSize: blob.size};
                     return await new Promise((resolve, reject) => {
                         const reader = new FileReader();
                         reader.onload = () => resolve(reader.result);
@@ -2551,8 +2742,10 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
                     });
                 }
                 """,
-                url,
+                {"url": url, "maxBytes": MAX_MEDIA_DOWNLOAD_BYTES},
             )
+            if isinstance(data_url, dict) and data_url.get("oversizedSize"):
+                return _media_size_limit_marker(chat_id, url, media_type, data_url["oversizedSize"])
             if not data_url or "," not in data_url:
                 raise RuntimeError("blob вернул пустые данные")
             meta, encoded = data_url.split(",", 1)
@@ -2563,9 +2756,22 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
             response = context.request.get(url, timeout=60_000, fail_on_status_code=False)
             if not response.ok:
                 raise RuntimeError(f"HTTP {response.status}: {response.status_text}")
-            file_bytes = response.body()
             headers = response.headers
+            declared_size = _declared_media_size(headers)
+            if declared_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                try:
+                    response.dispose()
+                except Exception:
+                    pass
+                return _media_size_limit_marker(chat_id, url, media_type, declared_size)
             content_type = headers.get("content-type", "")
+            file_bytes = response.body()
+            try:
+                response.dispose()
+            except Exception:
+                pass
+            if len(file_bytes) > MAX_MEDIA_DOWNLOAD_BYTES:
+                return _media_size_limit_marker(chat_id, url, media_type, len(file_bytes))
             header_name = _filename_from_headers(headers, filename)
             final_name = _normalize_document_filename(header_name, url, content_type)
         else:
@@ -2573,6 +2779,15 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
             return None
         if not file_bytes:
             raise RuntimeError("получен пустой файл")
+        if len(file_bytes) > MAX_MEDIA_DOWNLOAD_BYTES:
+            return _media_size_limit_marker(chat_id, url, media_type, len(file_bytes))
+        if (
+            media_type == "image" and _looks_like_image(file_bytes, content_type)
+            and len(file_bytes) > MAX_TELEGRAM_PHOTO_BYTES
+        ):
+            return _media_size_limit_marker(
+                chat_id, url, "image", len(file_bytes), MAX_TELEGRAM_PHOTO_BYTES
+            )
         if media_type in {"voice", "audio", "video", "video_note", "animation"}:
             final_name = _media_filename(final_name, url, content_type, file_bytes, media_type)
         return {
@@ -2643,6 +2858,8 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                                 chat_id=chat_id,
                                 media_type=media_type,
                             )
+                            if media and media.get("oversized"):
+                                return media
                             if media and media.get("bytes"):
                                 return media
                     except Exception as e:
@@ -2666,6 +2883,8 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                                 chat_id=chat_id,
                                 media_type=media_type,
                             )
+                            if media and media.get("oversized"):
+                                return media
                             if media and media.get("bytes"):
                                 return media
                 except Exception:
@@ -2718,6 +2937,8 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                             chat_id=chat_id,
                             media_type=media_type,
                         )
+                        if media and media.get("oversized"):
+                            return media
                         if media and media.get("bytes"):
                             return media
                 except Exception as e:
@@ -2753,6 +2974,8 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                 chat_id=chat_id,
                 media_type=media_type,
             )
+            if media and media.get("oversized"):
+                return media
             if media and media.get("bytes"):
                 return media
         if not specific_control_attempted and not is_rich_media:
@@ -3051,15 +3274,31 @@ def _read_media_element_bytes(page, msg: dict, expected_type: str, chat_id: int 
                     try {
                         const r = await fetch(url, {credentials:'include'});
                         if (!r.ok) return {url,bytes:[],contentType:''};
-                        const b = await r.arrayBuffer();
-                        return {url,bytes:Array.from(new Uint8Array(b)),contentType:r.headers.get('content-type')||''};
+                        const declared = Number(r.headers.get('content-length')||0);
+                        const maxBytes = 49283072;
+                        if (declared > maxBytes) return {url,bytes:[],contentType:r.headers.get('content-type')||'',oversizedSize:declared};
+                        const blob = await r.blob();
+                        if (blob.size > maxBytes) return {url,bytes:[],contentType:blob.type||'',oversizedSize:blob.size};
+                        const dataUrl = await new Promise((resolve,reject)=>{
+                            const reader=new FileReader();
+                            reader.onload=()=>resolve(reader.result);
+                            reader.onerror=()=>reject(reader.error||new Error('FileReader failed'));
+                            reader.readAsDataURL(blob);
+                        });
+                        return {url,dataUrl,contentType:blob.type||''};
                     } catch(e) {
                         return {url,bytes:[],contentType:''};
                     }
                 }""")
             except Exception:
                 continue
-            data = bytes(result.get("bytes") or [])
+            if result.get("oversizedSize"):
+                return [_media_size_limit_marker(chat_id, result.get("url") or "", expected_type, result["oversizedSize"])]
+            data_url = str(result.get("dataUrl") or "")
+            data = (
+                base64.b64decode(data_url.split(",", 1)[1])
+                if "," in data_url else b""
+            )
             if len(data) <= 300:
                 continue
             ct = str(result.get("contentType") or "").lower()
@@ -3145,12 +3384,27 @@ def _capture_media_after_click(page, msg: dict, expected_type: str, chat_id: int
     dom_id=str(msg.get('dom_id') or '').strip()
     if not dom_id: return []
     captured=[]
+    oversized_captured=[]
     def on_response(resp):
         try:
             ct=str(resp.headers.get('content-type','')).lower()
             url=str(resp.url or '')
+            declared_size = _declared_media_size(resp.headers)
+            if declared_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                if (
+                    ct.startswith(("audio/", "video/"))
+                    or re.search(r"voice|audio|video|media|attachment|file", url, re.I)
+                ):
+                    oversized_captured.append((url, declared_size))
+                return
             body=resp.body()
-            if not body or len(body) <= 300:
+            if (
+                not body or len(body) <= 300 or len(body) > MAX_MEDIA_DOWNLOAD_BYTES
+                or len(captured) >= 4
+                or sum(len(item[2]) for item in captured) + len(body) > MAX_MEDIA_DOWNLOAD_BYTES
+            ):
+                if body and len(body) > MAX_MEDIA_DOWNLOAD_BYTES:
+                    oversized_captured.append((url, len(body)))
                 return
             parsed_url=urlparse(url)
             path=(parsed_url.netloc + parsed_url.path)[:180]
@@ -3247,6 +3501,9 @@ def _capture_media_after_click(page, msg: dict, expected_type: str, chat_id: int
             "MAX_MEDIA_CAPTURE_EMPTY chat_id=%s source_id=%s expected=%s",
             chat_id, msg.get("source_id") or msg.get("idx"), expected_type
         )
+        if oversized_captured:
+            url, size_bytes = oversized_captured[0]
+            return [_media_size_limit_marker(chat_id, url, expected_type, size_bytes)]
     return out
 
 
@@ -3295,7 +3552,9 @@ def _extract_live_rich_media(page, msg: dict, chat_id: int = 0) -> list[dict]:
             elif item.get('tag')=='video' or re.search(r'(^|[\s_-])video(?:[\s_-]|message|$)|movie|mp4',low,re.I): typ='video'
             else: typ='audio'
             media=_download_document_to_memory(page=page,context=page.context,url=url,filename='',chat_id=chat_id,media_type=typ)
-            if media and media.get('bytes'):
+            if media and media.get("oversized"):
+                out.append(media)
+            elif media and media.get('bytes'):
                 media['type']=typ; out.append(media)
     except Exception as exc:
         print(f"[{chat_id}] ℹ️ Live rich-media fallback: {exc}")
@@ -3713,6 +3972,7 @@ def parse_max_group_media(
     verify_only: bool = False,
     navigation_timeout_ms: int = 60000,
     navigation_attempts: int = 4,
+    post_callback=None,
 ) -> List[Dict]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
     debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
@@ -3722,6 +3982,8 @@ def parse_max_group_media(
     if not os.path.exists(session_file):
         raise Exception("NO_SESSION")
     pw = browser = context = page = None
+    media_spool_paths = []
+    parse_completed = False
     try:
         pw = sync_playwright().start()
         browser = pw.chromium.launch(
@@ -5558,9 +5820,8 @@ def parse_max_group_media(
                 seen_ids.add(source_id)
             cleaned.append(msg)
 
-        # В режиме тестирования отправляем ВСЕ найденные сообщения, которые
-        # реально присутствуют в загруженной ленте MAX. DOM-порядок MAX —
-        # от старых к новым, поэтому ничего не переворачиваем.
+        # DOM-порядок MAX — от старых к новым; сохраняем его для доставки
+        # по порядку и сначала отделяем системные карточки и служебные строки.
         all_messages = cleaned
 
         # MAX иногда выводит количество голосов отдельной соседней .item, например
@@ -5596,7 +5857,34 @@ def parse_max_group_media(
                 consumed_poll_service.add(j)
             poll["total_votes"] = sum(max(0, int(o.get("votes") or 0)) for o in poll.get("options", []) if isinstance(o, dict))
         all_messages = [m for idx, m in enumerate(all_messages) if idx not in consumed_poll_service]
-        all_messages = all_messages[-MAX_MESSAGES_TO_PARSE:] if MAX_MESSAGES_TO_PARSE else []
+        first_connection = not message_cache_by_chat.get(chat_id) and not message_signatures_by_chat.get(chat_id)
+        if first_connection:
+            baseline = all_messages[:-MAX_FIRST_CONNECTION_MESSAGES]
+            for baseline_msg in baseline:
+                mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
+            if baseline:
+                save_message_cache()
+            all_messages = all_messages[-MAX_FIRST_CONNECTION_MESSAGES:]
+            debug_logger.info(
+                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s baseline=%s initial_delivery=%s",
+                chat_id, len(baseline), len(all_messages),
+            )
+        else:
+            unprocessed = []
+            prefiltered = 0
+            for candidate in all_messages:
+                if (
+                    _message_can_be_prefiltered(candidate)
+                    and not is_new_message(_message_cache_stub(candidate), chat_id=chat_id)
+                ):
+                    prefiltered += 1
+                    continue
+                unprocessed.append(candidate)
+            all_messages = unprocessed
+            debug_logger.info(
+                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s new=%s",
+                chat_id, len(cleaned), prefiltered, len(all_messages),
+            )
         print(f"[{chat_id}] После фильтрации: {len(all_messages)} сообщений (от старых к новым)")
 
         human_posts = []
@@ -5619,6 +5907,8 @@ def parse_max_group_media(
                         contact_obj["url"] = resolved_link
             media_files = []
             def has_expected_rich_media():
+                if any(isinstance(media, dict) and media.get("oversized") for media in media_files):
+                    return True
                 if msg.get("video_note_hint") or msg.get("voice_hint"):
                     return any(_media_satisfies_hint(m, msg) for m in media_files)
                 return any(m.get("type") in ("voice", "video_note", "video", "audio") for m in media_files)
@@ -5688,7 +5978,9 @@ def parse_max_group_media(
                     context=context,
                     page=page,
                 )
-                if media and media.get("bytes"):
+                if media and media.get("oversized"):
+                    msg["_oversized_media"] = True
+                elif media and media.get("bytes"):
                     detected_type = media.get("type")
                     if detected_type in {"video", "audio"}:
                         non_image_urls.add(img_url)
@@ -5721,7 +6013,9 @@ def parse_max_group_media(
                     filename=doc.get("filename", ""),
                     chat_id=chat_id,
                 )
-                if media and media.get("bytes"):
+                if media and media.get("oversized"):
+                    msg["_oversized_media"] = True
+                elif media and media.get("bytes"):
                     media_files.append(media)
             candidate_count = max(0, candidate_count - len(non_image_urls))
             if non_image_urls and candidate_count == 0:
@@ -5759,7 +6053,9 @@ def parse_max_group_media(
                     chat_id=chat_id,
                     media_type=att_type,
                 )
-                if media and media.get("bytes"):
+                if media and media.get("oversized"):
+                    msg["_oversized_media"] = True
+                elif media and media.get("bytes"):
                     media_kind = _media_payload_kind(media)
                     expected_type = "video" if msg.get("video_note_hint") else "audio" if msg.get("voice_hint") else ""
                     if expected_type and media_kind != expected_type:
@@ -5851,7 +6147,9 @@ def parse_max_group_media(
                     chat_id=chat_id,
                     media_type=click_type,
                 )
-                if media and media.get("bytes"):
+                if media and media.get("oversized"):
+                    msg["_oversized_media"] = True
+                elif media and media.get("bytes"):
                     media_files.append(media)
             if not any(m.get("type") == "document" for m in media_files):
                 has_file_hint = bool(
@@ -5874,7 +6172,9 @@ def parse_max_group_media(
                         msg=msg,
                         chat_id=chat_id,
                     )
-                    if media and media.get("bytes"):
+                    if media and media.get("oversized"):
+                        msg["_oversized_media"] = True
+                    elif media and media.get("bytes"):
                         media_files.append(media)
             if msg.get("sticker_hint"):
                 has_animation_payload = any(
@@ -5898,6 +6198,8 @@ def parse_max_group_media(
                 for media in media_files:
                     if media.get("type") in {"image", "sticker"}:
                         media["_sticker_fallback"] = True
+            if any(isinstance(media, dict) and media.get("oversized") for media in media_files):
+                msg["_oversized_media"] = True
             for media in media_files:
                 if (msg.get("video_note_hint") or msg.get("voice_hint")) and not _media_satisfies_hint(media, msg):
                     debug_logger.warning(
@@ -5921,6 +6223,17 @@ def parse_max_group_media(
                 media = _prepare_video_note_for_telegram(media, chat_id=chat_id)
                 data = media.get("bytes")
                 if not isinstance(data, (bytes, bytearray)) or not data:
+                    continue
+                media_limit = (
+                    MAX_TELEGRAM_PHOTO_BYTES
+                    if media.get("type") == "image" else MAX_MEDIA_DOWNLOAD_BYTES
+                )
+                if len(data) > media_limit:
+                    msg["_oversized_media"] = True
+                    _media_size_limit_marker(
+                        chat_id, str(media.get("url") or ""), media.get("type", "media"),
+                        len(data), media_limit,
+                    )
                     continue
                 media_hash = get_media_hash(data=data)
                 visual_hash = _image_visual_hash(bytes(data)) if media.get("type") == "image" else None
@@ -5969,6 +6282,7 @@ def parse_max_group_media(
                     "contact": msg.get("contact"),
                 },
                 "media_files": unique_media,
+                "media_omitted": bool(msg.get("_oversized_media")),
                 "photo_visual_hint": bool(msg.get("photo_visual_hint")),
                 "voice_hint": bool(msg.get("voice_hint")),
                 "video_note_hint": bool(msg.get("video_note_hint")),
@@ -6042,6 +6356,20 @@ def parse_max_group_media(
                     chat_id, parsed_post.get("source_id") or parsed_post.get("idx"),
                     duplicate_media_count, visual_duplicate_count
                 )
+            for media in unique_media:
+                spool_path = _spool_media_payload(
+                    media, chat_id, parsed_post.get("source_id") or parsed_post.get("idx") or "?"
+                )
+                if spool_path:
+                    media_spool_paths.append(spool_path)
+                elif media.pop("spool_failed", False):
+                    parsed_post["media_omitted"] = True
+                    try:
+                        parsed_post["media_files"].remove(media)
+                    except ValueError:
+                        pass
+            if post_callback is not None:
+                post_callback(parsed_post)
 
         if len(human_posts) > MAX_MESSAGES_TO_PARSE:
             debug_logger.error(
@@ -6070,6 +6398,7 @@ def parse_max_group_media(
             sum(bool((post.get("contact") or {}).get("is_contact")) for post in human_posts),
         )
 
+        parse_completed = True
         return human_posts
 
     except Exception as exc:
@@ -6078,6 +6407,12 @@ def parse_max_group_media(
         traceback.print_exc()
         raise
     finally:
+        if not parse_completed:
+            for path in media_spool_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         try:
             if page and getattr(page, "_max_media_response_listener", None):
                 page.remove_listener("response", page._max_media_response_listener)

@@ -51,7 +51,8 @@ support_sessions = set(get_open_support_sessions())
 def _video_upload_details(media: dict, post: dict) -> dict:
     """Build Telegram video duration and thumbnail metadata from the actual file."""
     data = media.get("bytes")
-    if not isinstance(data, (bytes, bytearray)) or not data:
+    temp_path = str(media.get("temp_path") or "")
+    if (not isinstance(data, (bytes, bytearray)) or not data) and not (temp_path and os.path.isfile(temp_path)):
         return {}
     result = {}
     try:
@@ -90,13 +91,15 @@ def _video_upload_details(media: dict, post: dict) -> dict:
         return result
 
     try:
+        input_source = temp_path if temp_path and os.path.isfile(temp_path) else "pipe:0"
         probe = subprocess.run(
             [
-                ffmpeg, "-hide_banner", "-i", "pipe:0", "-frames:v", "1",
+                ffmpeg, "-hide_banner", "-i", input_source, "-frames:v", "1",
                 "-vf", "scale=320:320:force_original_aspect_ratio=decrease,setsar=1",
                 "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
             ],
-            input=bytes(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            input=bytes(data) if input_source == "pipe:0" else None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=18, check=False,
         )
         details = probe.stderr.decode("utf-8", "replace")
@@ -134,6 +137,19 @@ remote_auth_monitors = set()
 remote_auth_monitor_lock = threading.Lock()
 SUPPORT_END_TEXT = "✅ Завершить чат с поддержкой"
 MAX_PROJECT_ACCOUNT_PHONE = "+7 939 752 85 95"
+try:
+    MAX_CONCURRENT_CHAT_PARSERS = max(
+        1, min(2, int(os.getenv("MAX_CONCURRENT_CHAT_PARSERS", "2")))
+    )
+except (TypeError, ValueError):
+    MAX_CONCURRENT_CHAT_PARSERS = 2
+PARSER_CYCLE_INTERVAL_SECONDS = 30
+try:
+    TELEGRAM_MIN_SEND_INTERVAL_SECONDS = max(
+        0.05, float(os.getenv("TELEGRAM_MIN_SEND_INTERVAL_SECONDS", "0.1"))
+    )
+except (TypeError, ValueError):
+    TELEGRAM_MIN_SEND_INTERVAL_SECONDS = 0.1
 
 bot.set_my_commands([
     types.BotCommand("start", "Запустить бота"),
@@ -159,12 +175,51 @@ def _is_emoji_only_text(text: str, emoji_values) -> bool:
     remainder = remainder.replace("\ufe0f", "").replace("\u200d", "").strip()
     return not remainder
 
-def _media_to_bytesio(media: dict) -> io.BytesIO:
+class _NamedUploadFile(io.IOBase):
+    """File-backed Telegram upload stream with the source filename preserved."""
+    def __init__(self, path: str, filename: str):
+        super().__init__()
+        self._stream = open(path, "rb")
+        self.name = filename or os.path.basename(path)
+
+    def read(self, size=-1):
+        return self._stream.read(size)
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        return self._stream.seek(offset, whence)
+
+    def tell(self):
+        return self._stream.tell()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def close(self):
+        try:
+            self._stream.close()
+        finally:
+            super().close()
+
+
+def _media_to_bytesio(media: dict) -> io.IOBase:
+    temp_path = str(media.get("temp_path") or "")
+    filename = str(media.get("filename") or "")
+    if temp_path and os.path.isfile(temp_path):
+        file_obj = _NamedUploadFile(temp_path, filename)
+        ctx = getattr(_send_context, "current", None)
+        if ctx is not None:
+            ctx.setdefault("upload_files", []).append(file_obj)
+        return file_obj
     data = media.get("bytes")
     if not isinstance(data, (bytes, bytearray)) or not data:
         raise ValueError(f"Медиа {media.get('type', 'unknown')} не содержит bytes")
     file_obj = io.BytesIO(bytes(data))
-    filename = media.get("filename")
     if filename:
         file_obj.name = filename
     file_obj.seek(0)
@@ -175,7 +230,21 @@ def _media_already_sent(media: dict, chat_id: int) -> bool:
     media_hash = media.get("hash") or get_media_hash(data=data)
     return not is_new_media(data=data, chat_id=chat_id, media_hash=media_hash)
 
+
+def _cleanup_post_media(post: dict) -> None:
+    for media in post.get("media_files", []) or []:
+        path = str(media.get("temp_path") or "") if isinstance(media, dict) else ""
+        if path:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                debug_logger.warning("MEDIA_SPOOL_CLEANUP_FAILED path=%s error=%s", path, log_preview(exc, 160))
+
 _telegram_last_send = 0.0
+_telegram_last_send_by_chat = {}
+_telegram_group_send_times = {}
 _telegram_send_lock = threading.Lock()
 _send_context = threading.local()
 _POLL_MESSAGE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_poll_messages.json")
@@ -427,47 +496,93 @@ def _rewind_telegram_uploads(value):
 
 def _telegram_call(fn, *args, **kwargs):
     global _telegram_last_send
-    with _telegram_send_lock:
-        for attempt in range(4):
-            wait = 0.8 - (time.monotonic() - _telegram_last_send)
-            if wait > 0:
-                time.sleep(wait)
-            try:
-                for value in args:
-                    _rewind_telegram_uploads(value)
-                for value in kwargs.values():
-                    _rewind_telegram_uploads(value)
-                result = fn(*args, **kwargs)
-                _telegram_last_send = time.monotonic()
-                ctx = getattr(_send_context, "current", None)
-                if ctx is not None:
-                    ids = _telegram_result_ids(result)
-                    ctx["api_ok"] += 1
-                    ctx["message_ids"].extend(ids)
-                    debug_logger.info(
-                        "TELEGRAM_SEND_OK chat_id=%s source_id=%s method=%s telegram_message_ids=%s payload=%s",
-                        ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
-                        ids or "<no-id>", _telegram_payload_preview(fn, args, kwargs) or "<media payload>"
-                    )
-                return result
-            except Exception as e:
-                text = str(e)
-                ctx = getattr(_send_context, "current", None)
-                if ctx is not None:
-                    ctx["api_errors"] += 1
-                    debug_logger.error(
-                        "TELEGRAM_SEND_FAIL chat_id=%s source_id=%s method=%s payload=%s error=%s",
-                        ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
-                        _telegram_payload_preview(fn, args, kwargs) or "<media payload>",
-                        log_preview(text, 300)
-                    )
-                m = re.search(r"retry after (\d+)", text, re.I)
-                if "429" in text and m and attempt < 3:
-                    delay = int(m.group(1)) + 1
-                    print(f"⏳ Telegram 429: ждём {delay} сек.")
-                    time.sleep(delay)
-                    continue
-                raise
+    method_name = getattr(fn, "__name__", "")
+    destination = kwargs.get("chat_id")
+    if destination is None and method_name.startswith("send_") and args:
+        destination = args[0]
+    try:
+        destination_key = int(destination) if destination is not None else None
+    except (TypeError, ValueError):
+        destination_key = None
+    send_cost = 1
+    if method_name == "send_media_group":
+        media_group = kwargs.get("media")
+        if media_group is None and len(args) > 1:
+            media_group = args[1]
+        send_cost = max(1, len(media_group or []))
+    attempt = 0
+    while attempt < 4:
+        wait = 0.0
+        reserved = False
+        with _telegram_send_lock:
+            now = time.monotonic()
+            wait = TELEGRAM_MIN_SEND_INTERVAL_SECONDS - (now - _telegram_last_send)
+            if method_name.startswith("send_") and destination_key is not None:
+                # Telegram allows at most 20 messages/minute in a group and
+                # recommends at most one message/second in a private chat.
+                last_chat_send = _telegram_last_send_by_chat.get(destination_key, 0.0)
+                if destination_key < 0:
+                    wait = max(wait, 3.0 - (now - last_chat_send))
+                    recent_times = [
+                        sent_at for sent_at in _telegram_group_send_times.get(destination_key, [])
+                        if now - sent_at < 60
+                    ]
+                    _telegram_group_send_times[destination_key] = recent_times
+                    excess = len(recent_times) + send_cost - 20
+                    if excess > 0 and len(recent_times) >= excess:
+                        wait = max(wait, recent_times[excess - 1] + 60 - now)
+                else:
+                    wait = max(wait, send_cost * 1.0 - (now - last_chat_send))
+            if wait <= 0:
+                reserved = True
+                _telegram_last_send = now
+                if method_name.startswith("send_") and destination_key is not None:
+                    _telegram_last_send_by_chat[destination_key] = now
+                    if destination_key < 0:
+                        recent_times = _telegram_group_send_times.setdefault(destination_key, [])
+                        recent_times.extend([now] * send_cost)
+        if not reserved:
+            time.sleep(max(0.05, wait))
+            continue
+
+        try:
+            for value in args:
+                _rewind_telegram_uploads(value)
+            for value in kwargs.values():
+                _rewind_telegram_uploads(value)
+            result = fn(*args, **kwargs)
+        except Exception as e:
+            text = str(e)
+            attempt += 1
+            ctx = getattr(_send_context, "current", None)
+            if ctx is not None:
+                ctx["api_errors"] += 1
+                debug_logger.error(
+                    "TELEGRAM_SEND_FAIL chat_id=%s source_id=%s method=%s payload=%s error=%s",
+                    ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
+                    _telegram_payload_preview(fn, args, kwargs) or "<media payload>",
+                    log_preview(text, 300)
+                )
+            m = re.search(r"retry after (\d+)", text, re.I)
+            if "429" in text and m and attempt < 4:
+                delay = int(m.group(1)) + 1
+                print(f"⏳ Telegram 429: ждём {delay} сек.")
+                time.sleep(delay)
+                continue
+            raise
+
+        ctx = getattr(_send_context, "current", None)
+        if ctx is not None:
+            ids = _telegram_result_ids(result)
+            ctx["api_ok"] += 1
+            ctx["message_ids"].extend(ids)
+            debug_logger.info(
+                "TELEGRAM_SEND_OK chat_id=%s source_id=%s method=%s telegram_message_ids=%s payload=%s",
+                ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
+                ids or "<no-id>", _telegram_payload_preview(fn, args, kwargs) or "<media payload>"
+            )
+        return result
+    raise RuntimeError("Не удалось отправить сообщение в Telegram после нескольких попыток")
 
 def _send_post_impl(chat_id: int, post: dict) -> None:
     msg_text = format_message(post)
@@ -563,6 +678,8 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         msg_text=""
 
     actual_text=_clean_browser_video_fallback(post.get("text") or "")
+    if post.get("media_omitted"):
+        actual_text = f"{actual_text}\n\n📎 Вложение пропущено из-за ограничения размера Telegram.".strip()
     emoji_texts=post.get("emoji_texts") or []
     if not special_sent and emoji_texts:
         emoji_text = actual_text if _is_emoji_only_text(actual_text, emoji_texts) else ""
@@ -716,6 +833,7 @@ def _send_post(chat_id: int, post: dict) -> bool:
         "api_errors": 0,
         "message_ids": [],
         "suppressed_media": 0,
+        "upload_files": [],
     }
     previous = getattr(_send_context, "current", None)
     _send_context.current = context
@@ -756,17 +874,23 @@ def _send_post(chat_id: int, post: dict) -> bool:
         )
         raise
     finally:
+        for upload_file in context.get("upload_files", []):
+            try:
+                upload_file.close()
+            except Exception:
+                pass
         _send_context.current = previous
 
 def _commit_successful_post(chat_id: int, post: dict) -> None:
     mark_message_seen(post, chat_id=chat_id)
     for media in post.get("media_files", []) or []:
         data = media.get("bytes")
-        if isinstance(data, (bytes, bytearray)) and data:
+        media_hash = media.get("hash")
+        if media_hash or (isinstance(data, (bytes, bytearray)) and data):
             mark_media_seen(
                 data=data,
                 chat_id=chat_id,
-                media_hash=media.get("hash"),
+                media_hash=media_hash,
             )
             visual_hash = media.get("visual_hash")
             if visual_hash and visual_hash != media.get("hash"):
@@ -787,6 +911,8 @@ def _diagnostic_post(post, status, detail=""):
     media_summary = ", ".join(
         f"{media_type} ×{count}" for media_type, count in sorted(media_counts.items())
     ) or "нет"
+    if post.get("media_omitted"):
+        media_summary += "; одно крупное вложение пропущено"
     preview = " ".join(str(post.get("text") or "").split()).strip()
     if not preview:
         preview = "[без текста]"
@@ -824,7 +950,7 @@ def _record_parse_diagnostic_failure(chat_id, title, error):
     _store_parse_diagnostic(chat_id, title, 0, 0, 1, [], error=error)
 
 
-def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
+def _process_posts(chat_id: int, title: str, posts: list, record_diagnostics=True, diagnostics_out=None) -> tuple:
     if posts is None:
         raise TypeError(f"Парсер MAX для чата {title} вернул None вместо списка сообщений")
     if not isinstance(posts, list):
@@ -845,6 +971,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
             cycle_key = source_id or get_message_hash(post)
 
         if cycle_key in cycle_ids:
+            _cleanup_post_media(post)
             skipped_count += 1
             diagnostic_posts.append(_diagnostic_post(post, "skipped", "дубль в текущей выборке"))
             debug_logger.info("MESSAGE_SKIPPED chat_id=%s source_id=%s reason=duplicate_in_cycle", chat_id, source_id or "?")
@@ -856,6 +983,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
             poll_state = _get_poll_delivery_state(chat_id, post)
             if _poll_is_closed(post):
                 if poll_state.get("final_sent"):
+                    _cleanup_post_media(post)
                     _refresh_poll_snapshot(chat_id, post, poll_state, closed=True)
                     skipped_count += 1
                     diagnostic_posts.append(_diagnostic_post(post, "skipped", "итог опроса уже отправлен"))
@@ -871,6 +999,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
                     log_preview((post.get("poll") or {}).get("question"), 120),
                 )
             elif _poll_has_delivery(poll_state):
+                _cleanup_post_media(post)
                 _refresh_poll_snapshot(chat_id, post, poll_state, closed=False)
                 skipped_count += 1
                 diagnostic_posts.append(_diagnostic_post(post, "skipped", "опрос уже отправлен"))
@@ -881,6 +1010,7 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
                 continue
 
         if not force_poll_send and not is_new_message(post, chat_id=chat_id):
+            _cleanup_post_media(post)
             skipped_count += 1
             diagnostic_posts.append(_diagnostic_post(post, "skipped", "уже есть в кэше отправленных"))
             debug_logger.info("MESSAGE_SKIPPED chat_id=%s source_id=%s reason=seen_cache", chat_id, source_id or "?")
@@ -900,7 +1030,6 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
             increment_message_count(chat_id)
             new_count += 1
             diagnostic_posts.append(_diagnostic_post(post, "sent"))
-            time.sleep(1.5)
         except Exception as error:
             failed_count += 1
             diagnostic_posts.append(_diagnostic_post(post, "failed", str(error)))
@@ -909,6 +1038,8 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
                 chat_id, source_id or "?", log_preview(title, 100), log_preview(error, 300)
             )
             print(f"❌ [{chat_id}] Ошибка отправки в чат {title}: {error}")
+        finally:
+            _cleanup_post_media(post)
 
     save_message_cache()
     save_photo_cache()
@@ -916,17 +1047,31 @@ def _process_posts(chat_id: int, title: str, posts: list) -> tuple:
         "CHAT_PROCESS_COMPLETE chat_id=%s title=%s sent=%s skipped=%s failed=%s",
         chat_id, log_preview(title, 100), new_count, skipped_count, failed_count
     )
-    _store_parse_diagnostic(
-        chat_id, title, new_count, skipped_count, failed_count, diagnostic_posts
-    )
+    if diagnostics_out is not None:
+        diagnostics_out.extend(diagnostic_posts)
+    if record_diagnostics:
+        _store_parse_diagnostic(
+            chat_id, title, new_count, skipped_count, failed_count, diagnostic_posts
+        )
     return new_count, skipped_count
 
 
-def _process_chat_posts_if_present(chat_id, title, posts):
+def _process_chat_posts_if_present(chat_id, title, posts, record_diagnostics=True, diagnostics_out=None):
     with CHAT_LIFECYCLE_LOCK:
         if not get_chat_by_id(chat_id):
+            for post in posts or []:
+                _cleanup_post_media(post)
             return None
-        return _process_posts(chat_id, title, posts)
+        try:
+            return _process_posts(
+                chat_id, title, posts,
+                record_diagnostics=record_diagnostics,
+                diagnostics_out=diagnostics_out,
+            )
+        except Exception:
+            for post in posts or []:
+                _cleanup_post_media(post)
+            raise
 
 
 def _record_parse_failure_if_present(chat_id, title, error):
@@ -974,16 +1119,33 @@ def run_one_parse_cycle():
         chat_id = chat["chat_id"]
         max_url = chat["max_url"]
         title = chat["title"]
+        parse_counts = {"new": 0, "skipped": 0}
+        parse_diagnostics = []
+
+        def consume_post(post):
+            processed = _process_chat_posts_if_present(
+                chat_id, title, [post], record_diagnostics=False,
+                diagnostics_out=parse_diagnostics,
+            )
+            if processed is not None:
+                parse_counts["new"] += processed[0]
+                parse_counts["skipped"] += processed[1]
+
         try:
-            posts = parse_max_group_media(
+            parse_max_group_media(
                 group_url=max_url,
                 chat_id=chat_id,
                 session_path=_session_path_for_chat(chat),
+                post_callback=consume_post,
             )
-            processed = _process_chat_posts_if_present(chat_id, title, posts)
-            if processed is None:
+            if not get_chat_by_id(chat_id):
                 continue
-            new_count, skipped_count = processed
+            new_count, skipped_count = parse_counts["new"], parse_counts["skipped"]
+            _store_parse_diagnostic(
+                chat_id, title, new_count, skipped_count,
+                sum(item.get("status") == "failed" for item in parse_diagnostics),
+                parse_diagnostics,
+            )
             if new_count:
                 results.append(
                     f"✅ <b>{title}</b>: +{new_count} новых, ⏭ {skipped_count} пропущено"
@@ -993,7 +1155,11 @@ def run_one_parse_cycle():
                     f"ℹ️ <b>{title}</b>: новых сообщений нет (⏭ {skipped_count} пропущено)"
                 )
         except Exception as error:
-            _record_parse_failure_if_present(chat_id, title, error)
+            _store_parse_diagnostic(
+                chat_id, title, parse_counts["new"], parse_counts["skipped"],
+                sum(item.get("status") == "failed" for item in parse_diagnostics),
+                parse_diagnostics, error=error,
+            )
             error_str = str(error)
             login_command = "/project_login" if chat.get("account_mode") == "project" else f"/login {chat_id}"
             if "SESSION_EXPIRED" in error_str:
@@ -1046,16 +1212,34 @@ def process_single_chat(chat):
     chat_id = chat["chat_id"]
     max_url = chat["max_url"]
     title = chat["title"]
+    parse_counts = {"new": 0, "skipped": 0}
+    parse_diagnostics = []
+
+    def consume_post(post):
+        processed = _process_chat_posts_if_present(
+            chat_id, title, [post], record_diagnostics=False,
+            diagnostics_out=parse_diagnostics,
+        )
+        if processed is not None:
+            parse_counts["new"] += processed[0]
+            parse_counts["skipped"] += processed[1]
+
     try:
         owner_id = int(chat.get("owner_id") or 0)
         if owner_id and _user_needs_subscription(owner_id):
             return False
-        posts = parse_max_group_media(
+        parse_max_group_media(
             group_url=max_url,
             chat_id=chat_id,
             session_path=_session_path_for_chat(chat),
+            post_callback=consume_post,
         )
-        _process_chat_posts_if_present(chat_id, title, posts)
+        if get_chat_by_id(chat_id):
+            _store_parse_diagnostic(
+                chat_id, title, parse_counts["new"], parse_counts["skipped"],
+                sum(item.get("status") == "failed" for item in parse_diagnostics),
+                parse_diagnostics,
+            )
         if chat.get("is_active") and owner_id > 0:
             try:
                 _maybe_offer_review(owner_id)
@@ -1066,7 +1250,11 @@ def process_single_chat(chat):
                 )
         return True
     except Exception as error:
-        _record_parse_failure_if_present(chat_id, title, error)
+        _store_parse_diagnostic(
+            chat_id, title, parse_counts["new"], parse_counts["skipped"],
+            sum(item.get("status") == "failed" for item in parse_diagnostics),
+            parse_diagnostics, error=error,
+        )
         print(f"❌ Ошибка парсинга чата {title}: {error}")
         traceback.print_exc()
         return False
@@ -1074,25 +1262,32 @@ def process_single_chat(chat):
 def background_parser():
     time.sleep(5)
     while True:
+        cycle_started = time.monotonic()
         try:
             active_chats = _get_payable_active_chats()
             if not active_chats:
-                time.sleep(60)
+                time.sleep(max(1, PARSER_CYCLE_INTERVAL_SECONDS - (time.monotonic() - cycle_started)))
                 continue
             print(f"🔄 Начинаю параллельный парсинг {len(active_chats)} чатов...")
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(active_chats)
+                max_workers=min(len(active_chats), MAX_CONCURRENT_CHAT_PARSERS)
             ) as executor:
                 futures = [
                     executor.submit(process_single_chat, chat)
                     for chat in active_chats
                 ]
                 concurrent.futures.wait(futures)
-            print("✅ Цикл парсинга завершен. Ожидание 60 секунд до следующего...")
-            time.sleep(60)
+            elapsed = time.monotonic() - cycle_started
+            wait_seconds = max(0, PARSER_CYCLE_INTERVAL_SECONDS - elapsed)
+            print(
+                f"✅ Цикл парсинга завершен за {elapsed:.1f} сек. "
+                f"Следующий цикл через {wait_seconds:.1f} сек."
+            )
+            if wait_seconds:
+                time.sleep(wait_seconds)
         except Exception as error:
             print(f"❌ Критическая ошибка парсера: {error}")
-            time.sleep(60)
+            time.sleep(max(1, PARSER_CYCLE_INTERVAL_SECONDS - (time.monotonic() - cycle_started)))
 
 
 load_message_cache()
@@ -1310,6 +1505,9 @@ def format_message(post: dict) -> str:
     else:
         header = ""
     body = _escape_text_with_links(raw_text, post.get("inline_links") or [])
+    if post.get("media_omitted"):
+        omission_note = "📎 Одно из вложений слишком большое для отправки в Telegram и пропущено."
+        body = f"{body}\n\n{omission_note}" if body else omission_note
     result = f"{header}{body}"
     time_footer = format_message_time(raw_time, raw_date)
     if time_footer:
