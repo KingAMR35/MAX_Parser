@@ -331,7 +331,34 @@ def _save_sent_parser_messages_locked():
             _SENT_PARSER_MESSAGES_FILE, log_preview(exc),
         )
 
-def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=False):
+def _post_media_hashes(post: dict) -> list[str]:
+    hashes = []
+    for media in post.get("media_files", []) or []:
+        if not isinstance(media, dict):
+            continue
+        media_hash = str(media.get("hash") or media.get("content_hash") or "").strip()
+        if not media_hash:
+            data = media.get("bytes")
+            if isinstance(data, (bytes, bytearray)) and data:
+                media_hash = get_media_hash(data=data)
+            elif media.get("url"):
+                media_hash = get_media_hash(url=str(media.get("url")))
+        if media_hash and media_hash not in hashes:
+            hashes.append(media_hash)
+    return hashes
+
+
+def _post_time_key(value) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip()).upper().replace(".", "")
+    for time_format in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+        try:
+            return datetime.strptime(raw, time_format).strftime("%H:%M")
+        except ValueError:
+            continue
+    return raw.casefold()
+
+
+def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=False, captioned=False, text_sent=False):
     ids = []
     for value in message_ids or []:
         try:
@@ -362,6 +389,14 @@ def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=Fals
         "sent_at": datetime.now(timezone.utc).isoformat(),
         "preview": preview,
         "partial": bool(partial),
+        "captioned": bool(captioned),
+        "text_sent": bool(text_sent),
+        "has_media": bool(post.get("media_files")),
+        "media_hashes": _post_media_hashes(post),
+        "source_id_is_index": bool(post.get("source_id_is_index")),
+        "name": str(post.get("name") or "")[:100],
+        "date": str(post.get("date") or "")[:32],
+        "time": str(post.get("time") or "")[:24],
     }
     with _sent_parser_messages_lock:
         _sent_parser_messages.append(record)
@@ -383,6 +418,104 @@ def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=Fals
                 retained.append(item)
         _sent_parser_messages[:] = retained[-1000:]
         _save_sent_parser_messages_locked()
+
+
+def _find_uncaptioned_media_record(chat_id: int, post: dict):
+    source_id = str(post.get("source_id") or post.get("idx") or "").strip()
+    if not source_id or not str(post.get("text") or "").strip():
+        return None
+    post_hashes = set(_post_media_hashes(post))
+    post_is_index = bool(post.get("source_id_is_index"))
+    with _sent_parser_messages_lock:
+        for item in reversed(_sent_parser_messages):
+            try:
+                same_chat = int(item.get("chat_id") or 0) == int(chat_id)
+            except (TypeError, ValueError):
+                same_chat = False
+            if not same_chat or str(item.get("source_id") or "").strip() != source_id:
+                continue
+            # Older records predate the explicit caption flag. Their fallback
+            # preview means the original delivery contained media without text.
+            captioned = item.get("captioned")
+            if captioned is True or item.get("text_sent") is True:
+                continue
+            if captioned is None and item.get("preview") != "Медиа или вложение":
+                continue
+            record_is_index = bool(item.get("source_id_is_index"))
+            if not item.get("has_media") and not item.get("media_hashes"):
+                # Pre-migration records used this preview for media-only sends.
+                # Stable MAX IDs are sufficient to try attaching the late caption.
+                if record_is_index or post_is_index or item.get("preview") != "Медиа или вложение":
+                    continue
+            if post_is_index or record_is_index:
+                old_hashes = set(str(value) for value in (item.get("media_hashes") or []) if value)
+                has_matching_media = bool(old_hashes.intersection(post_hashes))
+                old_date = str(item.get("date") or "").strip()
+                new_date = str(post.get("date") or "").strip()
+                old_time = str(item.get("time") or "").strip()
+                new_time = str(post.get("time") or "").strip()
+                old_name = str(item.get("name") or "").strip().casefold()
+                new_name = str(post.get("name") or "").strip().casefold()
+                if old_hashes and post_hashes and not has_matching_media:
+                    continue
+                if old_date and new_date and old_date != new_date:
+                    continue
+                if old_time and new_time and _post_time_key(old_time) != _post_time_key(new_time):
+                    continue
+                if old_name and new_name and old_name != new_name:
+                    continue
+                if not has_matching_media and not (old_date and new_date and old_time and new_time):
+                    continue
+            return dict(item)
+    return None
+
+
+def _mark_parser_record_captioned(record_id: str, post: dict):
+    preview = re.sub(r"<[^>]*>", " ", str(post.get("text") or ""))
+    preview = " ".join(preview.split())[:100]
+    with _sent_parser_messages_lock:
+        for index, item in enumerate(_sent_parser_messages):
+            if item.get("record_id") != record_id:
+                continue
+            updated = dict(item)
+            updated["captioned"] = True
+            updated["text_sent"] = False
+            updated["preview"] = preview or updated.get("preview") or "Медиа или вложение"
+            updated["name"] = str(post.get("name") or updated.get("name") or "")[:100]
+            updated["date"] = str(post.get("date") or updated.get("date") or "")[:32]
+            updated["time"] = str(post.get("time") or updated.get("time") or "")[:24]
+            media_hashes = _post_media_hashes(post)
+            if media_hashes:
+                updated["media_hashes"] = media_hashes
+            _sent_parser_messages[index] = updated
+            _save_sent_parser_messages_locked()
+            return True
+    return False
+
+
+def _mark_parser_record_text_sent(record_id: str, post: dict, message_ids):
+    preview = re.sub(r"<[^>]*>", " ", str(post.get("text") or ""))
+    preview = " ".join(preview.split())[:100]
+    with _sent_parser_messages_lock:
+        for index, item in enumerate(_sent_parser_messages):
+            if item.get("record_id") != record_id:
+                continue
+            updated = dict(item)
+            ids = [int(value) for value in (updated.get("message_ids") or []) if str(value).lstrip("-").isdigit()]
+            for value in message_ids or []:
+                try:
+                    message_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if message_id not in ids:
+                    ids.append(message_id)
+            updated["message_ids"] = ids
+            updated["text_sent"] = True
+            updated["preview"] = preview or updated.get("preview") or "Медиа или вложение"
+            _sent_parser_messages[index] = updated
+            _save_sent_parser_messages_locked()
+            return True
+    return False
 
 def _sent_record_is_deletable(record, now=None):
     try:
@@ -648,6 +781,22 @@ def _telegram_payload_preview(fn, args, kwargs):
         return log_preview(" | ".join(captions), 240)
     return ""
 
+
+def _telegram_call_has_media_caption(method_name, args, kwargs) -> bool:
+    if method_name not in {"send_photo", "send_video", "send_document", "send_animation", "send_media_group"}:
+        return False
+    if str(kwargs.get("caption") or "").strip():
+        return True
+    media = kwargs.get("media")
+    if media is None and method_name == "send_media_group" and len(args) > 1:
+        media = args[1]
+    if isinstance(media, (list, tuple)):
+        return any(
+            str(getattr(item, "caption", "") or (item.get("caption") if isinstance(item, dict) else "") or "").strip()
+            for item in media
+        )
+    return False
+
 def _rewind_telegram_uploads(value):
     if isinstance(value, io.IOBase):
         value.seek(0)
@@ -742,6 +891,10 @@ def _telegram_call(fn, *args, **kwargs):
             ids = _telegram_result_ids(result)
             ctx["api_ok"] += 1
             ctx["message_ids"].extend(ids)
+            if method_name == "send_message":
+                ctx["text_sent"] = True
+            if _telegram_call_has_media_caption(method_name, args, kwargs):
+                ctx["caption_sent"] = True
             debug_logger.info(
                 "TELEGRAM_SEND_OK chat_id=%s source_id=%s method=%s telegram_message_ids=%s payload=%s",
                 ctx["chat_id"], ctx["source_id"], getattr(fn, "__name__", "telegram_api"),
@@ -749,6 +902,57 @@ def _telegram_call(fn, *args, **kwargs):
             )
         return result
     raise RuntimeError("Не удалось отправить сообщение в Telegram после нескольких попыток")
+
+
+def _attach_caption_to_prior_media(chat_id: int, post: dict) -> bool:
+    record = _find_uncaptioned_media_record(chat_id, post)
+    if not record:
+        return False
+    message_ids = record.get("message_ids") or []
+    if not message_ids:
+        return False
+    caption = format_message(post)
+    if not caption or len(caption) > 1024:
+        return False
+    try:
+        bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=int(message_ids[0]),
+            caption=caption,
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        debug_logger.warning(
+            "MEDIA_CAPTION_ATTACH_FAILED chat_id=%s source_id=%s message_id=%s error=%s",
+            chat_id, post.get("source_id") or post.get("idx") or "?", message_ids[0],
+            log_preview(exc, 220),
+        )
+        if "message is not modified" in str(exc).casefold():
+            _mark_parser_record_captioned(str(record.get("record_id") or ""), post)
+            return True
+        try:
+            fallback = _telegram_call(bot.send_message, chat_id, caption, **NO_PREVIEW)
+        except Exception as fallback_exc:
+            debug_logger.warning(
+                "MEDIA_CAPTION_TEXT_FALLBACK_FAILED chat_id=%s source_id=%s error=%s",
+                chat_id, post.get("source_id") or post.get("idx") or "?",
+                log_preview(fallback_exc, 220),
+            )
+            return False
+        _mark_parser_record_text_sent(
+            str(record.get("record_id") or ""), post, _telegram_result_ids(fallback)
+        )
+        debug_logger.info(
+            "MEDIA_CAPTION_SENT_AS_TEXT chat_id=%s source_id=%s",
+            chat_id, post.get("source_id") or post.get("idx") or "?",
+        )
+        return True
+    _mark_parser_record_captioned(str(record.get("record_id") or ""), post)
+    debug_logger.info(
+        "MEDIA_CAPTION_ATTACHED chat_id=%s source_id=%s message_id=%s",
+        chat_id, post.get("source_id") or post.get("idx") or "?", message_ids[0],
+    )
+    return True
 
 def _send_post_impl(chat_id: int, post: dict) -> None:
     msg_text = format_message(post)
@@ -1034,6 +1238,8 @@ def _send_post(chat_id: int, post: dict) -> bool:
         "api_errors": 0,
         "message_ids": [],
         "suppressed_media": 0,
+        "caption_sent": False,
+        "text_sent": False,
         "upload_files": [],
     }
     previous = getattr(_send_context, "current", None)
@@ -1055,7 +1261,10 @@ def _send_post(chat_id: int, post: dict) -> bool:
     try:
         _send_post_impl(chat_id, post)
         if context["message_ids"]:
-            _record_parser_sent_post(chat_id, post, context["message_ids"])
+            _record_parser_sent_post(
+                chat_id, post, context["message_ids"],
+                captioned=context["caption_sent"], text_sent=context["text_sent"],
+            )
             sent_record_saved = True
         if post.get("poll") and context["message_ids"]:
             _remember_sent_poll(chat_id, post, context["message_ids"][0])
@@ -1075,7 +1284,8 @@ def _send_post(chat_id: int, post: dict) -> bool:
     except Exception as exc:
         if context["message_ids"] and not sent_record_saved:
             _record_parser_sent_post(
-                chat_id, post, context["message_ids"], partial=True
+                chat_id, post, context["message_ids"], partial=True,
+                captioned=context["caption_sent"], text_sent=context["text_sent"],
             )
         debug_logger.exception(
             "POST_SEND_COMPLETE chat_id=%s source_id=%s result=failed api_ok=%s api_errors=%s error=%s",
@@ -1217,6 +1427,26 @@ def _process_posts(chat_id: int, title: str, posts: list, record_diagnostics=Tru
                     chat_id, source_id or "?",
                 )
                 continue
+
+        if (
+            not force_poll_send
+            and str(post.get("text") or "").strip()
+            and not post.get("location")
+            and not (post.get("contact") or {}).get("is_contact")
+            and _attach_caption_to_prior_media(chat_id, post)
+        ):
+            _commit_successful_post(chat_id, post)
+            increment_message_count(chat_id)
+            new_count += 1
+            diagnostic_posts.append(
+                _diagnostic_post(post, "sent", "подпись добавлена к ранее отправленному фото")
+            )
+            _cleanup_post_media(post)
+            debug_logger.info(
+                "MESSAGE_CAPTION_ATTACHED chat_id=%s source_id=%s",
+                chat_id, source_id or "?",
+            )
+            continue
 
         if not force_poll_send and not is_new_message(post, chat_id=chat_id):
             _cleanup_post_media(post)

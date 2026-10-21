@@ -103,6 +103,47 @@ def _normalize_message_lines(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
+def _coalesce_leading_emoji_lines(text: str, emoji_values) -> str:
+    """Keep a run of MAX's visually-spaced animated emoji on one text line."""
+    values = sorted(
+        {str(value).strip() for value in (emoji_values or []) if str(value).strip()},
+        key=len,
+        reverse=True,
+    )
+    if not values:
+        return text
+
+    lines = str(text or "").split("\n")
+    emoji_lines = []
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line:
+            if emoji_lines:
+                index += 1
+                continue
+            index += 1
+            continue
+        remainder = line
+        for emoji in values:
+            remainder = remainder.replace(emoji, "")
+        remainder = re.sub(r"[\s\u200d\u20e3\ufe0e\ufe0f]+", "", remainder)
+        if not remainder:
+            emoji_lines.append(line)
+            index += 1
+            continue
+        break
+
+    if not emoji_lines:
+        return text
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index < len(lines):
+        first_line = " ".join([*emoji_lines, lines[index].strip()])
+        return "\n".join([first_line, *lines[index + 1:]]).strip()
+    return " ".join(emoji_lines)
+
+
 def _message_datetime(message: dict):
     """Parse MAX's displayed date/time when available; return None if uncertain."""
     date_text = str((message or {}).get("date") or "").strip()
@@ -127,6 +168,38 @@ def _message_datetime(message: dict):
     if parsed_time is None:
         parsed_time = datetime.min.time()
     return datetime.combine(parsed_date, parsed_time)
+
+
+def _order_max_messages(messages: list[dict]) -> list[dict]:
+    """Order the extracted window oldest-to-newest, preferring MAX's stable IDs."""
+    ordered = list(messages or [])
+    if len(ordered) < 2:
+        return ordered
+
+    stable_ids = []
+    for message in ordered:
+        source_id = str(message.get("source_id") or "").strip()
+        if message.get("source_id_is_index") or not re.fullmatch(r"-?\d+", source_id):
+            stable_ids = []
+            break
+        stable_ids.append(int(source_id))
+    if len(stable_ids) == len(ordered) and len(set(stable_ids)) == len(stable_ids):
+        return [message for _, message in sorted(zip(stable_ids, ordered), key=lambda pair: pair[0])]
+
+    message_datetimes = [_message_datetime(message) for message in ordered]
+    if all(value is not None for value in message_datetimes):
+        dom_order_descending = bool(ordered[0].get("dom_order_descending"))
+        return sorted(
+            ordered,
+            key=lambda message: (
+                _message_datetime(message),
+                -int(message.get("idx") or 0) if dom_order_descending else int(message.get("idx") or 0),
+            ),
+        )
+
+    if bool(ordered[0].get("dom_order_descending")):
+        ordered.reverse()
+    return ordered
 
 #! ==========================================
 #! 1. QR-АВТОРИЗАЦИЯ
@@ -4718,14 +4791,19 @@ def parse_max_group_media(
                             const inner = Array.from(node.childNodes).map(flatten).join("");
                             if (!blockTags.test(node.tagName)) return inner;
                             const visibleInner = inner.replace(/[\uE000-\uE003]/g, "").trim();
-                            if (visibleInner && emojiClusters(visibleInner).join("") === visibleInner) {
+                            const visibleEmojis = emojiClusters(visibleInner);
+                            const nonEmojiRemainder = visibleEmojis.reduce(
+                                (value, emoji) => value.split(emoji).join(""), visibleInner
+                            ).replace(/[\s\uFE0E\uFE0F\u200D\u20E3]/g, "");
+                            if (visibleInner && visibleEmojis.length && !nonEmojiRemainder) {
                                 return `${emojiBlockStart}${inner}${emojiBlockEnd}`;
                             }
                             return `${blockBreak}${inner}${blockBreak}`;
                         };
                         const flattenText = node => cleanMessageText(
                             flatten(node)
-                                .replace(new RegExp(`${blockBreak}*${emojiBlockStart}([\\s\\S]*?)${emojiBlockEnd}${blockBreak}*`, "g"), "$1")
+                                .replace(new RegExp(`${emojiBlockEnd}${blockBreak}*${emojiBlockStart}`, "g"), " ")
+                                .replace(new RegExp(`${blockBreak}*${emojiBlockStart}([\\s\\S]*?)${emojiBlockEnd}${blockBreak}*`, "g"), "$1 ")
                                 .replace(/[\uE000\uE001]/g, "\n")
                         );
                         const links = Array.from(clone.querySelectorAll("a[href]")).map(anchor => {
@@ -6035,6 +6113,7 @@ def parse_max_group_media(
         seen_ids = set()
         for msg in raw_messages:
             text = _normalize_message_lines(msg.get("text") or "")
+            text = _coalesce_leading_emoji_lines(text, msg.get("emoji_texts") or [])
             text = _strip_browser_video_fallback(text)
             name = " ".join((msg.get("name") or "").split()).strip()
             source_id = str(msg.get("source_id") or "").strip()
@@ -6108,15 +6187,7 @@ def parse_max_group_media(
         dom_order_descending = bool(
             all_messages and all_messages[0].get("dom_order_descending")
         )
-        if all_messages and all(_message_datetime(message) is not None for message in all_messages):
-            all_messages.sort(
-                key=lambda message: (
-                    _message_datetime(message),
-                    -int(message.get("idx") or 0) if dom_order_descending else int(message.get("idx") or 0),
-                )
-            )
-        elif dom_order_descending:
-            all_messages.reverse()
+        all_messages = _order_max_messages(all_messages)
         first_connection = not message_cache_by_chat.get(chat_id) and not message_signatures_by_chat.get(chat_id)
         if first_connection:
             # A new/empty cache has no trustworthy high-water mark. Treat every
