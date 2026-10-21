@@ -5028,13 +5028,15 @@ def parse_max_group_media(
                     const out = [];
                     const seen = new Set();
                     function push(type, url, filename, extra = {}) {
-                        if (!url) return;
+                        if (!url) return null;
                         url = String(url).trim();
-                        if (!url || url.startsWith("data:")) return;
+                        if (!url || url.startsWith("data:")) return null;
                         const key = `${type}|${url}`;
-                        if (seen.has(key)) return;
+                        if (seen.has(key)) return out.find(item => item.type === type && item.url === url) || null;
                         seen.add(key);
-                        out.push({type, url, filename: filename || "", ...extra});
+                        const attachment = {type, url, filename: filename || "", ...extra};
+                        out.push(attachment);
+                        return attachment;
                     }
                     function classify(meta, tag) {
                         meta = String(meta || "").toLowerCase();
@@ -5077,6 +5079,7 @@ def parse_max_group_media(
                     // several <source> nodes and MAX's data-* attributes. Keep the
                     // URL candidates together so they remain one attachment.
                     const mediaOwners = Array.from(row.querySelectorAll("video, audio"));
+                    const videoOwnerAttachments = new Map();
                     mediaOwners.forEach(el => {
                         if (isEmojiAttachment(el)) return;
                         const tagName = String(el.tagName || "").toLowerCase();
@@ -5151,8 +5154,53 @@ def parse_max_group_media(
                             ? Number(el.duration) : 0;
                         const poster = mediaTag === "video"
                             ? (safeAttr(el, "poster") || (typeof el.poster === "string" ? el.poster : "")) : "";
-                        if (url) push(classify(meta, mediaTag), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || "", {duration, poster, source_urls:sourceUrls});
+                        if (url) {
+                            const attachment = push(classify(meta, mediaTag), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || "", {duration, poster, source_urls:sourceUrls});
+                            if (tagName === "video" && attachment) videoOwnerAttachments.set(el, attachment);
+                        }
                     });
+                    function addAttachmentOrVideoSource(el, type, url, filename) {
+                        if (url) {
+                            const addAlternative = ownerVideo => {
+                                if (!ownerVideo) return false;
+                                let ownerAttachment = videoOwnerAttachments.get(ownerVideo);
+                                if (!ownerAttachment) {
+                                    let ownerMeta = "";
+                                    for (let node = ownerVideo, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
+                                        ownerMeta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
+                                    }
+                                    let ownerType = classify(ownerMeta, "video");
+                                    if (ownerType !== "video_note") ownerType = "video";
+                                    const duration = Number.isFinite(Number(ownerVideo.duration)) && Number(ownerVideo.duration) > 0
+                                        ? Number(ownerVideo.duration) : 0;
+                                    const poster = safeAttr(ownerVideo, "poster") || "";
+                                    ownerAttachment = push(ownerType, url, filename, {duration, poster, source_urls:[url]});
+                                    if (ownerAttachment) videoOwnerAttachments.set(ownerVideo, ownerAttachment);
+                                    return Boolean(ownerAttachment);
+                                }
+                                if (!Array.isArray(ownerAttachment.source_urls)) ownerAttachment.source_urls = [ownerAttachment.url];
+                                if (!ownerAttachment.source_urls.includes(url)) {
+                                    ownerAttachment.source_urls.splice(Math.min(1, ownerAttachment.source_urls.length), 0, url);
+                                }
+                                if (!ownerAttachment.filename && filename) ownerAttachment.filename = filename;
+                                return true;
+                            };
+                            if (el.querySelectorAll) {
+                                const containedVideos = el.querySelectorAll("video");
+                                if (containedVideos.length === 1 && addAlternative(containedVideos[0])) return;
+                            }
+                            if (type === "video" || type === "video_note") {
+                                let node = el.parentElement;
+                                for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+                                    const videos = node.querySelectorAll ? node.querySelectorAll("video") : [];
+                                    const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")}`;
+                                    if (videos.length === 1 && /video|media|player|attachment/i.test(meta) &&
+                                        addAlternative(videos[0])) return;
+                                }
+                            }
+                        }
+                        push(type, url, filename || "");
+                    }
                     const elements = row.querySelectorAll(
                         "[data-video-url], [data-audio-url], [data-voice-url], [data-media-url], [data-sticker-url], " +
                         "[data-video], [data-audio], [data-voice], [data-media], [data-voice-message], [data-video-note]"
@@ -5164,7 +5212,14 @@ def parse_max_group_media(
                         if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         const url = candidate(el);
-                        if (url) push(classify(meta, String(el.tagName || "").toLowerCase()), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || "");
+                        const explicitVideoUrl = safeAttr(el,"data-video-url") || safeAttr(el,"data-video") || safeAttr(el,"data-video-note");
+                        const attachmentType = explicitVideoUrl
+                            ? classify(`${meta} video`, String(el.tagName || "").toLowerCase())
+                            : classify(meta, String(el.tagName || "").toLowerCase());
+                        if (url) addAttachmentOrVideoSource(
+                            el, attachmentType, url,
+                            safeAttr(el,"download") || safeAttr(el,"data-filename") || ""
+                        );
                     });
                     // Некоторые версии MAX держат медиа в div/span как background-image.
                     row.querySelectorAll("div,span,a,canvas").forEach(el => {
@@ -5835,7 +5890,7 @@ def parse_max_group_media(
                                     } catch(e) {}
                                 }
                                 if (absoluteHref && richMediaUrls.has(absoluteHref)) return;
-                                if (hasRichMediaSurface && /\.(?:mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|3gp|ts|m2ts|ogv)(?:[?#\s]|$)/i.test(pathName)) return;
+                                if (hasRichMediaSurface && /\.(?:mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|3gp|ts|m2ts|ogv)(?:[?#\s]|$)/i.test(`${pathName} ${downloadAttr}`)) return;
                                 let filename = filenameHint || downloadAttr || "document.file";
                                 if (pathName) {
                                     if (/\.(pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)$/i.test(pathName)) {
@@ -6615,7 +6670,10 @@ def parse_max_group_media(
                 parsed_post.get("time") or "<missing>",
                 parsed_post.get("media_duration_seconds") or 0,
                 media_info,
-                [(a.get("type"), bool(a.get("url"))) for a in (msg.get("attachments") or []) if isinstance(a, dict)],
+                [
+                    (a.get("type"), 1 + len(a.get("source_urls") or []), a.get("duration") or 0)
+                    for a in (msg.get("attachments") or []) if isinstance(a, dict)
+                ],
                 log_preview("".join(str(x) for x in (parsed_post.get("emoji_texts") or [])), 80) or "<none>",
                 len(msg.get("emoji_image_urls") or []),
                 log_preview(json.dumps(parsed_post.get("poll"), ensure_ascii=False), 220) if parsed_post.get("poll") else "<none>",
