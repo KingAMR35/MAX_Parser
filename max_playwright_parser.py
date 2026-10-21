@@ -1843,6 +1843,10 @@ def _media_filename(filename: str, url: str, content_type: str, data: bytes, med
     }
     if media_type not in valid_suffixes:
         return name
+    stem = os.path.splitext(name)[0]
+    if media_type in {"video", "video_note", "animation"} and re.fullmatch(r"\d+", stem):
+        name = "video" + suffix
+        stem = "video"
     if suffix not in valid_suffixes[media_type]:
         content_type = (content_type or "").lower()
         path_suffix = os.path.splitext(urlparse(url).path)[1].lower()
@@ -5042,6 +5046,26 @@ def parse_max_group_media(
                         if (/sticker/.test(meta)) return "image";
                         return "document";
                     }
+                    function isEmojiAttachment(el) {
+                        let node = el;
+                        let sticker = false;
+                        let emoji = false;
+                        for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+                            const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"alt")} ${safeAttr(node,"title")} ${safeAttr(node,"data-type")}`;
+                            if (/sticker|стикер/i.test(meta)) sticker = true;
+                            if (/(?:^|[ _:-])emoji(?:[ _:-]|$)|animated.?emoji|эмодзи|emoticon|smiley|custom.?emoji/i.test(meta)) emoji = true;
+                            const codepoints = ["data-codepoint", "data-codepoints", "data-unicode", "data-emoji-id"]
+                                .map(attr => safeAttr(node, attr)).join(" ");
+                            if (/(?:^|\s)(?:U\+|0x)?[0-9a-f]{4,6}(?:[-,\s]+(?:U\+|0x)?[0-9a-f]{4,6})*(?:$|\s)/i.test(codepoints)) emoji = true;
+                            for (const attr of ["alt", "aria-label", "title", "data-emoji", "data-emoji-char", "data-emoji-text"]) {
+                                const label = clean(safeAttr(node, attr));
+                                let remainder = label;
+                                for (const glyph of emojiClusters(label)) remainder = remainder.split(glyph).join("");
+                                if (label && emojiClusters(label).length && !remainder.replace(/[\s\uFE0E\uFE0F\u200D\u20E3]/g, "")) emoji = true;
+                            }
+                        }
+                        return emoji && !sticker;
+                    }
                     function candidate(el) {
                         let u = getCandidateUrl(el);
                         if (!u) u = safeAttr(el,"src") || safeAttr(el,"current-src") || safeAttr(el,"data-src") ||
@@ -5054,7 +5078,14 @@ def parse_max_group_media(
                     // URL candidates together so they remain one attachment.
                     const mediaOwners = Array.from(row.querySelectorAll("video, audio"));
                     mediaOwners.forEach(el => {
+                        if (isEmojiAttachment(el)) return;
                         const tagName = String(el.tagName || "").toLowerCase();
+                        try {
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            if (style.display === "none" || style.visibility === "hidden") return;
+                            if (tagName === "video" && (!rect.width || !rect.height)) return;
+                        } catch(e) {}
                         const mediaTag = tagName;
                         const sourceUrls = [];
                         const addSourceUrl = value => {
@@ -5068,7 +5099,11 @@ def parse_max_group_media(
                             addSourceUrl(safeAttr(el, attr));
                         }
                         let parent = el.parentElement;
-                        for (let depth = 0; parent && depth < 3; depth++, parent = parent.parentElement) {
+                        for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
+                            // Stay inside this media's wrapper. A message row can hold
+                            // several attachments; its download links must not become
+                            // alternate sources for every video in that row.
+                            if (parent.querySelectorAll("video, audio").length !== 1) break;
                             for (const attr of ["data-original", "data-original-src", "data-download-url", "data-file-url",
                                 "data-attachment-url", "data-content-url", "data-video-url", "data-media-url"]) {
                                 addSourceUrl(safeAttr(parent, attr));
@@ -5081,7 +5116,24 @@ def parse_max_group_media(
                             } catch(e) {}
                         }
                         try {
-                            el.querySelectorAll("source").forEach(source => {
+                            const sourceQuality = source => {
+                                const attrs = ["data-width", "width", "data-height", "height", "data-bitrate", "bitrate", "data-quality", "label"];
+                                const meta = attrs.map(attr => safeAttr(source, attr)).join(" ") + " " + safeAttr(source, "src");
+                                const width = Number(safeAttr(source, "data-width") || safeAttr(source, "width") || 0);
+                                const height = Number(safeAttr(source, "data-height") || safeAttr(source, "height") || 0);
+                                let score = width > 0 && height > 0 ? width * height : 0;
+                                const resolution = meta.match(/(?:^|[^\d])(\d{3,4})\s*p(?:[^\d]|$)/i);
+                                if (resolution) score = Math.max(score, Number(resolution[1]) ** 2 * 16 / 9);
+                                const bitrate = meta.match(/(\d{3,7})\s*(?:kbps|kbit|bps)/i);
+                                if (bitrate) {
+                                    const value = Number(bitrate[1]);
+                                    score = Math.max(score, /kbps|kbit/i.test(bitrate[0]) ? value * 1000 : value);
+                                }
+                                return score;
+                            };
+                            const sources = Array.from(el.querySelectorAll("source"))
+                                .sort((left, right) => sourceQuality(right) - sourceQuality(left));
+                            sources.forEach(source => {
                                 addSourceUrl(safeAttr(source, "data-original"));
                                 addSourceUrl(safeAttr(source, "src"));
                                 addSourceUrl(source.src);
@@ -5092,7 +5144,7 @@ def parse_max_group_media(
                         addSourceUrl(safeAttr(el, "src"));
                         const url = sourceUrls[0] || "";
                         let meta = "";
-                        for (let node = el, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
+                        for (let node = el, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
                             meta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"role")}`;
                         }
                         const duration = Number.isFinite(Number(el.duration)) && Number(el.duration) > 0
@@ -5109,12 +5161,14 @@ def parse_max_group_media(
                         // Attributes nested in an actual media element are alternate
                         // URLs for that same clip, already handled above.
                         if (el.closest && el.closest("video, audio")) return;
+                        if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         const url = candidate(el);
                         if (url) push(classify(meta, String(el.tagName || "").toLowerCase()), url, safeAttr(el,"download") || safeAttr(el,"data-filename") || "");
                     });
                     // Некоторые версии MAX держат медиа в div/span как background-image.
                     row.querySelectorAll("div,span,a,canvas").forEach(el => {
+                        if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|sticker|media)/i.test(meta)) return;
                         if (el.closest && el.closest("video, audio")) return;
@@ -5135,6 +5189,7 @@ def parse_max_group_media(
                     // Дополнительный fallback: некоторые MAX-карточки хранят видео/voice URL
                     // в произвольных data-* атрибутах контейнера.
                     row.querySelectorAll("*").forEach(el => {
+                        if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|media|videonote|video-note)/i.test(meta)) return;
                         if (el.closest && el.closest("video, audio")) return;
@@ -5747,6 +5802,12 @@ def parse_max_group_media(
                             bubble.querySelector("video,audio") ||
                             richAttachments.some(a => ["video", "video_note", "voice", "audio", "animation"].includes(a.type))
                         );
+                        const richMediaUrls = new Set();
+                        for (const attachment of richAttachments) {
+                            for (const url of [attachment.url, ...(attachment.source_urls || [])]) {
+                                try { if (url) richMediaUrls.add(new URL(url, location.href).href); } catch(e) {}
+                            }
+                        }
 
                         getFileNodes(bubble).forEach((el, nodeIndex) => {
                             try {
@@ -5764,11 +5825,19 @@ def parse_max_group_media(
                                     /скачать|download|файл|file|document|attachment/i.test(hint)
                                 );
                                 if (!looksLikeFile) return;
-                                let filename = filenameHint || downloadAttr || "document.file";
+                                let absoluteHref = "";
+                                let pathName = "";
                                 if (href) {
-                                    const pathName = decodeURIComponent(
-                                        new URL(href, location.href).pathname.split("/").pop() || ""
-                                    );
+                                    try {
+                                        const parsedHref = new URL(href, location.href);
+                                        absoluteHref = parsedHref.href;
+                                        pathName = decodeURIComponent(parsedHref.pathname.split("/").pop() || "");
+                                    } catch(e) {}
+                                }
+                                if (absoluteHref && richMediaUrls.has(absoluteHref)) return;
+                                if (hasRichMediaSurface && /\.(?:mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|3gp|ts|m2ts|ogv)(?:[?#\s]|$)/i.test(pathName)) return;
+                                let filename = filenameHint || downloadAttr || "document.file";
+                                if (pathName) {
                                     if (/\.(pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)$/i.test(pathName)) {
                                         filename = pathName;
                                     }
@@ -6177,6 +6246,20 @@ def parse_max_group_media(
                 if media and media.get("oversized"):
                     msg["_oversized_media"] = True
                 elif media and media.get("bytes"):
+                    # MAX sometimes exposes a real MP4 through a generic download
+                    # link. Treat it as video instead of uploading a numbered .mp4
+                    # as an unrelated document.
+                    payload_kind = _media_payload_kind(media)
+                    if payload_kind in {"video", "audio"}:
+                        media["type"] = (
+                            "video_note" if payload_kind == "video" and msg.get("video_note_hint")
+                            else "voice" if payload_kind == "audio" and msg.get("voice_hint")
+                            else payload_kind
+                        )
+                        media["filename"] = _media_filename(
+                            media.get("filename", ""), doc_url,
+                            media.get("content_type", ""), media["bytes"], media["type"],
+                        )
                     media_files.append(media)
             candidate_count = max(0, candidate_count - len(non_image_urls))
             if non_image_urls and candidate_count == 0:
@@ -6213,9 +6296,12 @@ def parse_max_group_media(
                         candidate_url = str(candidate_url or "").strip()
                         if candidate_url and candidate_url not in source_urls:
                             source_urls.append(candidate_url)
-                    source_urls = source_urls[:6]
+                    # Compare a few candidates from the same video so a low-quality
+                    # player rendition is not selected just because it appeared first.
+                    source_urls = source_urls[:3]
                 downloaded_candidates = []
                 oversized_candidates = []
+                oversized_video_candidate = False
                 for source_url in source_urls:
                     candidate_media = _download_document_to_memory(
                         page=page,
@@ -6228,8 +6314,9 @@ def parse_max_group_media(
                     if candidate_media and candidate_media.get("oversized"):
                         oversized_candidates.append(candidate_media)
                         if att_type in {"video", "video_note"}:
-                            # Do not silently replace an oversized original with a
-                            # smaller playback rendition from the same attachment.
+                            # Do not silently replace a high-quality source with a
+                            # smaller rendition if the preferred candidate is too large.
+                            oversized_video_candidate = True
                             break
                         continue
                     if not candidate_media or not candidate_media.get("bytes"):
@@ -6266,18 +6353,14 @@ def parse_max_group_media(
                         except (TypeError, ValueError):
                             pass
                     downloaded_candidates.append(candidate_media)
-                    if candidate_media.get("type") in {"video", "video_note"}:
-                        # Prefer the first valid source in the browser-provided
-                        # order (original/download URL before playback rendition).
-                        # Avoid downloading every quality variant from MAX.
-                        break
 
-                if downloaded_candidates:
+                if downloaded_candidates and not oversized_video_candidate:
                     if att_type in {"video", "video_note"}:
                         media = max(downloaded_candidates, key=lambda item: len(item.get("bytes") or b""))
                         debug_logger.info(
-                            "MAX_VIDEO_SOURCE_SELECTED chat_id=%s source_id=%s candidates=%s selected_bytes=%s selected_type=%s",
+                            "MAX_VIDEO_SOURCE_SELECTED chat_id=%s source_id=%s candidates=%s candidate_bytes=%s selected_bytes=%s selected_type=%s",
                             chat_id, msg.get("source_id") or msg.get("idx"), len(downloaded_candidates),
+                            sorted([len(item.get("bytes") or b"") for item in downloaded_candidates], reverse=True),
                             len(media.get("bytes") or b""), media.get("content_type") or "<none>",
                         )
                     else:
@@ -6300,7 +6383,7 @@ def parse_max_group_media(
                                 chat_id, msg.get("source_id") or msg.get("idx"), log_preview(exc, 160),
                             )
                     media_files.append(media)
-                elif oversized_candidates:
+                elif oversized_candidates or oversized_video_candidate:
                     msg["_oversized_media"] = True
             # Exact media element fallback: read bytes from the <audio>/<video>
             # belonging to this message card only. No page-wide resource scan.
@@ -6405,6 +6488,26 @@ def parse_max_group_media(
                         chat_id, msg.get("source_id") or msg.get("idx"), media.get("type"),
                     )
                     continue
+                payload_kind = _media_payload_kind(media)
+                if media.get("type") in {"document", "file", "unknown"} and payload_kind == "video":
+                    # MAX can expose an MP4 through a generic download card, especially
+                    # when the video element itself is lazy-loaded. Keep it as video so
+                    # Telegram can play it inline and include it in a mixed album.
+                    media["type"] = "video"
+                    media["filename"] = _media_filename(
+                        media.get("filename", ""), str(media.get("url") or ""),
+                        media.get("content_type", ""), bytes(media.get("bytes") or b""), "video",
+                    )
+                    debug_logger.info(
+                        "MAX_MEDIA_DOCUMENT_RECLASSIFIED chat_id=%s source_id=%s bytes=%s filename=%s",
+                        chat_id, msg.get("source_id") or msg.get("idx"),
+                        len(media.get("bytes") or b""), media.get("filename") or "<none>",
+                    )
+                elif media.get("type") in {"video", "video_note"}:
+                    media["filename"] = _media_filename(
+                        media.get("filename", ""), str(media.get("url") or ""),
+                        media.get("content_type", ""), bytes(media.get("bytes") or b""), media["type"],
+                    )
                 if (msg.get("video_note_hint") or msg.get("voice_hint")) and not _media_satisfies_hint(media, msg):
                     debug_logger.warning(
                         "MAX_MEDIA_PAYLOAD_KIND_MISMATCH chat_id=%s source_id=%s expected=%s detected=%s content_type=%s bytes=%s",

@@ -126,6 +126,60 @@ def _video_upload_details(media: dict, post: dict) -> dict:
             post.get("source_id") or post.get("idx") or "?", log_preview(exc, 180),
         )
     return result
+
+
+def _media_is_mp4_file(media: dict) -> bool:
+    """True when the downloaded payload is an MPEG-4 container Telegram can play inline."""
+    data = media.get("bytes")
+    if isinstance(data, (bytes, bytearray)) and len(data) >= 12:
+        return bytes(data[4:8]) == b"ftyp"
+    temp_path = str(media.get("temp_path") or "")
+    if temp_path and os.path.isfile(temp_path):
+        try:
+            with open(temp_path, "rb") as source:
+                header = source.read(12)
+            return len(header) >= 12 and header[4:8] == b"ftyp"
+        except OSError:
+            return False
+    return False
+
+
+def _normalize_inline_video_media(media: dict, post: dict) -> bool:
+    """Promote an MP4 hidden in a generic file card to Telegram's playable video type."""
+    if media.get("type") not in {"document", "file", "unknown"} or not _media_is_mp4_file(media):
+        return False
+    media["type"] = "video_note" if post.get("video_note_hint") else "video"
+    filename = str(media.get("filename") or "").strip()
+    stem, suffix = os.path.splitext(filename)
+    if suffix.lower() != ".mp4" or re.fullmatch(r"\d+", stem):
+        media["filename"] = "video.mp4"
+    if not media.get("content_type") or "video" not in str(media.get("content_type")).lower():
+        media["content_type"] = "video/mp4"
+    debug_logger.info(
+        "TELEGRAM_MEDIA_RECLASSIFIED source_id=%s media_type=video filename=%s spooled=%s",
+        post.get("source_id") or post.get("idx") or "?", media.get("filename"),
+        bool(media.get("temp_path")),
+    )
+    return True
+
+
+def _telegram_media_input(media: dict, post: dict, caption: str = ""):
+    """Build a photo/video album item while keeping the original uploaded bytes."""
+    file_obj = _media_to_bytesio(media)
+    parse_mode = "HTML" if caption else None
+    if media.get("type") == "image":
+        return types.InputMediaPhoto(file_obj, caption=caption or None, parse_mode=parse_mode)
+
+    details = _video_upload_details(media, post)
+    thumbnail = details.pop("thumbnail", None)
+    if thumbnail:
+        thumbnail_file = io.BytesIO(thumbnail)
+        thumbnail_file.name = "video-thumbnail.jpg"
+        details["thumbnail"] = thumbnail_file
+    details["supports_streaming"] = True
+    return types.InputMediaVideo(
+        file_obj, caption=caption or None, parse_mode=parse_mode, **details
+    )
 support_message_routes = get_support_message_routes()
 support_state_lock = threading.RLock()
 PARSE_DIAGNOSTICS = {}
@@ -709,6 +763,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
     for media in media_files:
         if media.get("type") == "emoji" or str(media.get("url") or "").strip() in emoji_image_urls:
             continue
+        _normalize_inline_video_media(media, post)
         is_poll_image = bool(post.get("poll")) and media.get("type") == "image"
         if media.get("type") in {"image", "video_note"} and not is_poll_image and _media_already_sent(media, chat_id):
             if ctx is not None:
@@ -814,20 +869,22 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
     has_voice_or_circle=any(m.get("type") in ("voice","video_note") for m in send_media)
     caption_pending=bool(actual_text) and not special_sent and not has_voice_or_circle
 
-    photos=[m for m in send_media if m.get("type")=="image"]
+    album_media = [
+        media for media in send_media
+        if media.get("type") == "image"
+        or (media.get("type") == "video" and _media_is_mp4_file(media))
+    ]
     album_sent_ids=set()
-    if len(photos)>=2:
-        for start in range(0,len(photos)-1,10):
-            chunk=photos[start:start+10]
+    if len(album_media)>=2:
+        for start in range(0,len(album_media),10):
+            chunk=album_media[start:start+10]
             if len(chunk)<2:
-                break
+                continue
             album=[]
             caption_in_album=False
             for media in chunk:
-                obj=_media_to_bytesio(media)
                 caption=msg_text if caption_pending and not caption_in_album and len(msg_text)<=1024 else None
-                parse_mode="HTML" if caption else None
-                album.append(types.InputMediaPhoto(obj,caption=caption,parse_mode=parse_mode))
+                album.append(_telegram_media_input(media, post, caption=caption or ""))
                 if caption:
                     caption_in_album=True
             try:
@@ -837,19 +894,15 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                     caption_pending=False
             except Exception as album_error:
                 debug_logger.warning(
-                    "PHOTO_ALBUM_SEND_FAILED chat_id=%s source_id=%s photos=%s error=%s",
+                    "MEDIA_ALBUM_SEND_FAILED chat_id=%s source_id=%s media=%s error=%s",
                     chat_id, post.get("source_id") or post.get("idx") or "?",
                     len(chunk), log_preview(album_error, 240),
                 )
-                print(f"⚠️ [{chat_id}] Не удалось отправить фотоальбом с подписью: {album_error}")
-                # Если Telegram отклонил именно подпись/разметку, сохраняем фотографии
-                # одним альбомом без подписи, а текст отправляем отдельным сообщением.
+                print(f"⚠️ [{chat_id}] Не удалось отправить альбом медиа: {album_error}")
+                # Если Telegram отклонил подпись/HTML, повторяем тот же альбом без неё.
                 if caption_in_album:
                     try:
-                        retry_album = [
-                            types.InputMediaPhoto(_media_to_bytesio(media))
-                            for media in chunk
-                        ]
+                        retry_album = [_telegram_media_input(media, post) for media in chunk]
                         _telegram_call(bot.send_media_group, chat_id, retry_album)
                         album_sent_ids.update(id(media) for media in chunk)
                         if caption_pending:
@@ -857,7 +910,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                                 _telegram_call(bot.send_message, chat_id, msg_text, **NO_PREVIEW)
                             except Exception as text_error:
                                 debug_logger.warning(
-                                    "PHOTO_ALBUM_CAPTION_FALLBACK_FAILED chat_id=%s source_id=%s error=%s",
+                                    "MEDIA_ALBUM_CAPTION_FALLBACK_FAILED chat_id=%s source_id=%s error=%s",
                                     chat_id, post.get("source_id") or post.get("idx") or "?",
                                     log_preview(text_error, 240),
                                 )
@@ -865,12 +918,11 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                         continue
                     except Exception as retry_error:
                         debug_logger.warning(
-                            "PHOTO_ALBUM_RETRY_FAILED chat_id=%s source_id=%s photos=%s error=%s",
+                            "MEDIA_ALBUM_RETRY_FAILED chat_id=%s source_id=%s media=%s error=%s",
                             chat_id, post.get("source_id") or post.get("idx") or "?",
                             len(chunk), log_preview(retry_error, 240),
                         )
-                        print(f"⚠️ [{chat_id}] Не удалось повторно отправить фотоальбом: {retry_error}")
-                break
+                        print(f"⚠️ [{chat_id}] Не удалось повторно отправить альбом: {retry_error}")
         if album_sent_ids:
             send_media=[m for m in send_media if id(m) not in album_sent_ids]
 
@@ -889,17 +941,50 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 _telegram_call(bot.send_video_note,chat_id,obj)
                 caption_pending=False
             elif media_type=="video":
-                # Upload as a document to preserve MAX's original bytes and file
-                # size; Telegram's video pipeline can generate a lower-quality
-                # playback rendition. The document remains downloadable as-is.
-                if caption_pending and len(msg_text)<=1024:
-                    _telegram_call(
-                        bot.send_document, chat_id, obj, caption=msg_text,
-                        parse_mode="HTML", visible_file_name=filename,
-                    )
-                    caption_pending=False
+                if _media_is_mp4_file(media):
+                    video_options = _video_upload_details(media, post)
+                    thumbnail = video_options.pop("thumbnail", None)
+                    if thumbnail:
+                        thumbnail_file = io.BytesIO(thumbnail)
+                        thumbnail_file.name = "video-thumbnail.jpg"
+                        video_options["thumbnail"] = thumbnail_file
+                    video_options["supports_streaming"] = True
+                    if caption_pending and len(msg_text)<=1024:
+                        video_options.update(caption=msg_text, parse_mode="HTML")
+                    try:
+                        _telegram_call(bot.send_video, chat_id, obj, **video_options)
+                        if caption_pending and len(msg_text)<=1024:
+                            caption_pending=False
+                    except Exception as video_error:
+                        debug_logger.warning(
+                            "TELEGRAM_VIDEO_FALLBACK_TO_DOCUMENT source_id=%s filename=%s error=%s",
+                            post.get("source_id") or post.get("idx") or "?", filename,
+                            log_preview(video_error, 240),
+                        )
+                        print(f"⚠️ [{chat_id}] Telegram не принял видео как видео: {video_error}; отправляю исходник файлом")
+                        obj.seek(0)
+                        document_options = {"visible_file_name": filename}
+                        if caption_pending and len(msg_text)<=1024:
+                            document_options.update(caption=msg_text, parse_mode="HTML")
+                        _telegram_call(bot.send_document, chat_id, obj, **document_options)
+                        if caption_pending and len(msg_text)<=1024:
+                            caption_pending=False
                 else:
-                    _telegram_call(bot.send_document, chat_id, obj, visible_file_name=filename)
+                    debug_logger.warning(
+                        "TELEGRAM_VIDEO_SENT_AS_DOCUMENT source_id=%s filename=%s content_type=%s bytes=%s spooled=%s",
+                        post.get("source_id") or post.get("idx") or "?", filename,
+                        media.get("content_type") or "<none>",
+                        media.get("size_bytes") or len(media.get("bytes") or b""),
+                        bool(media.get("temp_path")),
+                    )
+                    if caption_pending and len(msg_text)<=1024:
+                        _telegram_call(
+                            bot.send_document, chat_id, obj, caption=msg_text,
+                            parse_mode="HTML", visible_file_name=filename,
+                        )
+                        caption_pending=False
+                    else:
+                        _telegram_call(bot.send_document, chat_id, obj, visible_file_name=filename)
             elif media_type=="voice":
                 try:
                     _telegram_call(bot.send_voice,chat_id,obj)
