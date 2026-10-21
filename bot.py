@@ -226,23 +226,6 @@ def _media_to_bytesio(media: dict) -> io.IOBase:
     file_obj.seek(0)
     return file_obj
 
-def _media_is_mp4_file(media: dict) -> bool:
-    filename = str(media.get("filename") or "").lower()
-    if os.path.splitext(filename)[1] not in {".mp4", ".m4v"}:
-        return False
-    data = media.get("bytes")
-    if isinstance(data, (bytes, bytearray)) and len(data) >= 12:
-        return bytes(data[4:8]) == b"ftyp"
-    temp_path = str(media.get("temp_path") or "")
-    if temp_path and os.path.isfile(temp_path):
-        try:
-            with open(temp_path, "rb") as video_file:
-                header = video_file.read(12)
-            return len(header) >= 12 and header[4:8] == b"ftyp"
-        except OSError:
-            return False
-    return False
-
 def _media_already_sent(media: dict, chat_id: int) -> bool:
     data = media.get("bytes")
     media_hash = media.get("hash") or get_media_hash(data=data)
@@ -895,7 +878,6 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         media_type=media.get("type")
         obj=_media_to_bytesio(media)
         filename=media.get("filename") or "document.bin"
-        video_as_document = media_type == "video" and not _media_is_mp4_file(media)
         try:
             if media_type=="image":
                 if caption_pending and len(msg_text)<=1024:
@@ -907,28 +889,17 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 _telegram_call(bot.send_video_note,chat_id,obj)
                 caption_pending=False
             elif media_type=="video":
-                if video_as_document:
-                    if caption_pending and len(msg_text)<=1024:
-                        _telegram_call(
-                            bot.send_document, chat_id, obj, caption=msg_text,
-                            parse_mode="HTML", visible_file_name=filename,
-                        )
-                        caption_pending=False
-                    else:
-                        _telegram_call(bot.send_document, chat_id, obj, visible_file_name=filename)
+                # Upload as a document to preserve MAX's original bytes and file
+                # size; Telegram's video pipeline can generate a lower-quality
+                # playback rendition. The document remains downloadable as-is.
+                if caption_pending and len(msg_text)<=1024:
+                    _telegram_call(
+                        bot.send_document, chat_id, obj, caption=msg_text,
+                        parse_mode="HTML", visible_file_name=filename,
+                    )
+                    caption_pending=False
                 else:
-                    video_details = _video_upload_details(media, post)
-                    thumbnail = video_details.pop("thumbnail", None)
-                    if thumbnail:
-                        thumbnail_file = io.BytesIO(thumbnail)
-                        thumbnail_file.name = "video-thumbnail.jpg"
-                        video_details["thumbnail"] = thumbnail_file
-                    video_options = {"supports_streaming": True, **video_details}
-                    if caption_pending and len(msg_text)<=1024:
-                        _telegram_call(bot.send_video,chat_id,obj,caption=msg_text,**video_options)
-                        caption_pending=False
-                    else:
-                        _telegram_call(bot.send_video,chat_id,obj,**video_options)
+                    _telegram_call(bot.send_document, chat_id, obj, visible_file_name=filename)
             elif media_type=="voice":
                 try:
                     _telegram_call(bot.send_voice,chat_id,obj)
@@ -952,7 +923,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                     _telegram_call(bot.send_document,chat_id,obj,visible_file_name=filename)
         except Exception as error:
             print(f"⚠️ [{chat_id}] Ошибка отправки {media_type}: {error}")
-            if media_type == "video" and video_as_document:
+            if media_type == "video":
                 raise
             if media_type not in ("voice","video_note","image","sticker"):
                 try:
