@@ -1837,7 +1837,7 @@ def _media_filename(filename: str, url: str, content_type: str, data: bytes, med
     valid_suffixes = {
         "voice": {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav"},
         "audio": {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav"},
-        "video": {".mp4", ".m4v", ".mov", ".webm", ".gif", ".webp"},
+        "video": {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".mpeg", ".mpg", ".3gp", ".ts", ".m2ts", ".ogv", ".gif", ".webp"},
         "video_note": {".mp4", ".m4v", ".webm"},
         "animation": {".gif", ".mp4", ".m4v"},
     }
@@ -1863,12 +1863,19 @@ def _media_filename(filename: str, url: str, content_type: str, data: bytes, med
             "audio/ogg": ".ogg", "application/ogg": ".ogg", "audio/opus": ".opus",
             "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
             "audio/wav": ".wav", "audio/x-wav": ".wav", "video/mp4": ".mp4",
-            "video/webm": ".webm", "video/quicktime": ".mov", "image/gif": ".gif",
+            "video/webm": ".webm", "video/quicktime": ".mov", "video/x-matroska": ".mkv",
+            "video/x-msvideo": ".avi", "video/mpeg": ".mpeg", "video/3gpp": ".3gp",
+            "video/mp2t": ".ts", "video/ogg": ".ogv", "image/gif": ".gif",
             "image/webp": ".webp",
         }
         detected = signature_suffix or suffix_by_type.get(content_type) or path_suffix
         if detected not in valid_suffixes[media_type]:
-            detected = ".ogg" if media_type == "voice" else ".mp4" if media_type in ("video", "video_note") else ".gif"
+            detected = (
+                ".ogg" if media_type == "voice"
+                else ".mp4" if media_type == "video_note"
+                else ".bin" if media_type == "video"
+                else ".gif"
+            )
         name = os.path.splitext(name)[0] + detected
     return name[:240]
 
@@ -4842,14 +4849,26 @@ def parse_max_group_media(
                             parts.push(safeAttr(n,'class'),safeAttr(n,'data-testid'),safeAttr(n,'aria-label'),safeAttr(n,'alt'),
                                 safeAttr(n,'title'),safeAttr(n,'data-type'),safeAttr(n,'role'),safeAttr(n,'data-emoji'),
                                 safeAttr(n,'data-emoji-char'),safeAttr(n,'data-emoji-text'),safeAttr(n,'data-animated-emoji'),
-                                safeAttr(n,'data-custom-emoji'),safeAttr(n,'data-emoji-id'),safeAttr(n,'data-emoji-name'));
+                                safeAttr(n,'data-custom-emoji'),safeAttr(n,'data-emoji-id'),safeAttr(n,'data-emoji-name'),
+                                safeAttr(n,'data-codepoint'),safeAttr(n,'data-codepoints'),safeAttr(n,'data-unicode'));
                         }
                         return parts.join(' ').toLowerCase();
                     };
-                    row.querySelectorAll('img,video,canvas,[role="img"],[class*="emoji" i],[class*="animated" i],[data-type*="emoji" i],[data-testid*="emoji" i],[data-emoji],[data-emoji-char],[data-animated-emoji],[data-custom-emoji],[data-emoji-id],[data-emoji-name],[data-emoji-code],[data-emoji-codepoint]').forEach(el=>{
+                    const onlyEmojiLabel = value => {
+                        let text = clean(String(value || ""));
+                        const emojis = emojiClusters(text);
+                        if (!emojis.length) return false;
+                        for (const emoji of emojis) text = text.split(emoji).join("");
+                        return !text.replace(/[\s\uFE0E\uFE0F\u200D]/g, "");
+                    };
+                    row.querySelectorAll('img,video,canvas,[role="img"],[class*="emoji" i],[class*="animated" i],[data-type*="emoji" i],[data-testid*="emoji" i],[data-emoji],[data-emoji-char],[data-animated-emoji],[data-custom-emoji],[data-emoji-id],[data-emoji-name],[data-emoji-code],[data-emoji-codepoint],[data-codepoint],[data-codepoints],[data-unicode]').forEach(el=>{
                         const meta=emojiMeta(el);
                         if(/sticker|стикер/.test(meta)) return;
-                        if(!/(emoji|эмодзи|animated.?emoji|custom.?emoji|emoticon|smiley)/i.test(meta)) return;
+                        if(/avatar|userpic|profile|favicon|spacer|blank/i.test(meta)) return;
+                        const explicitEmoji=/(emoji|эмодзи|animated.?emoji|custom.?emoji|emoticon|smiley)/i.test(meta)
+                            || /(?:^|\s)(?:U\+|0x)?[0-9a-f]{4,6}(?:[-,\s]+(?:U\+|0x)?[0-9a-f]{4,6})*(?:$|\s)/i.test(meta);
+                        const glyphEmoji=[safeAttr(el,'alt'),safeAttr(el,'aria-label'),safeAttr(el,'title'),safeAttr(el,'data-emoji'),safeAttr(el,'data-emoji-char'),safeAttr(el,'data-emoji-text')].some(onlyEmojiLabel);
+                        if(!explicitEmoji&&!glyphEmoji) return;
                         const attrs=['src','current-src','data-src','data-image-url','data-media-url','data-emoji-url','data-animation-url','data-original','data-original-src'];
                         for(const a of attrs){ const v=(a==='src'&&el.currentSrc)?el.currentSrc:safeAttr(el,a); if(/^(https?:|blob:)/i.test(v)) add(v); }
                         try{ const bg=getComputedStyle(el).backgroundImage||''; const m=bg.match(/url\(["']?(.*?)["']?\)/i); if(m) add(m[1]); }catch(e){}
@@ -6059,6 +6078,8 @@ def parse_max_group_media(
 
             non_image_urls = set()
             for img_url in image_urls:
+                if img_url in emoji_image_urls:
+                    continue
                 media = get_media_bytes(
                     img_url,
                     media_type="image",
@@ -6073,9 +6094,9 @@ def parse_max_group_media(
                     if detected_type in {"video", "audio"}:
                         non_image_urls.add(img_url)
                         if detected_type == "video" and rich_video_hint:
-                            # MAX can expose a low-resolution preview URL beside the
-                            # real attachment. Keep it only as a fallback if the
-                            # attachment itself cannot be downloaded.
+                            # This URL is MAX's preview, not the original attachment.
+                            # Keep it only as a marker; later extraction must try the
+                            # actual media element before deciding the video is missing.
                             image_video_fallbacks.append(media)
                             continue
                         if detected_type == "video" and msg.get("video_note_hint"):
@@ -6124,7 +6145,7 @@ def parse_max_group_media(
 
             for attachment in msg.get("attachments", []) or []:
                 att_url = (attachment.get("url") or "").strip()
-                if not att_url:
+                if not att_url or att_url in emoji_image_urls:
                     continue
                 att_type = attachment.get("type") or "document"
                 if att_type == "emoji":
@@ -6186,22 +6207,6 @@ def parse_max_group_media(
                                 chat_id, msg.get("source_id") or msg.get("idx"), log_preview(exc, 160),
                             )
                     media_files.append(media)
-            if image_video_fallbacks and not any(
-                _media_payload_kind(media) == "video" for media in media_files
-            ):
-                fallback_video = max(
-                    image_video_fallbacks,
-                    key=lambda media: len(media.get("bytes") or b""),
-                )
-                fallback_video["type"] = "video"
-                fallback_video["filename"] = _media_filename(
-                    fallback_video.get("filename", ""),
-                    fallback_video.get("url", ""),
-                    fallback_video.get("content_type", ""),
-                    fallback_video["bytes"],
-                    "video",
-                )
-                media_files.append(fallback_video)
             # Exact media element fallback: read bytes from the <audio>/<video>
             # belonging to this message card only. No page-wide resource scan.
             if not has_expected_rich_media():
@@ -6277,6 +6282,16 @@ def parse_max_group_media(
                     recorded_sticker = _capture_animated_sticker(page, msg, chat_id=chat_id)
                     if recorded_sticker:
                         media_files = recorded_sticker
+            video_preview_omitted = bool(
+                image_video_fallbacks
+                and not any(_media_payload_kind(media) == "video" for media in media_files)
+            )
+            if video_preview_omitted:
+                debug_logger.warning(
+                    "MAX_VIDEO_PREVIEW_OMITTED chat_id=%s source_id=%s previews=%s",
+                    chat_id, msg.get("source_id") or msg.get("idx"),
+                    [(len(media.get("bytes") or b""), media.get("content_type") or "") for media in image_video_fallbacks],
+                )
             unique_media = []
             seen_media_hashes = set()
             seen_direct_visual_hashes = []
@@ -6289,6 +6304,12 @@ def parse_max_group_media(
             if any(isinstance(media, dict) and media.get("oversized") for media in media_files):
                 msg["_oversized_media"] = True
             for media in media_files:
+                if str(media.get("url") or "").strip() in emoji_image_urls:
+                    debug_logger.info(
+                        "MAX_EMOJI_MEDIA_SKIPPED chat_id=%s source_id=%s media_type=%s",
+                        chat_id, msg.get("source_id") or msg.get("idx"), media.get("type"),
+                    )
+                    continue
                 if (msg.get("video_note_hint") or msg.get("voice_hint")) and not _media_satisfies_hint(media, msg):
                     debug_logger.warning(
                         "MAX_MEDIA_PAYLOAD_KIND_MISMATCH chat_id=%s source_id=%s expected=%s detected=%s content_type=%s bytes=%s",
@@ -6358,6 +6379,7 @@ def parse_max_group_media(
                 "text": msg.get("text", ""),
                 "inline_links": msg.get("inline_links", []),
                 "emoji_texts": msg.get("emoji_texts", []),
+                "emoji_image_urls": sorted(emoji_image_urls),
                 "time": msg.get("time", ""),
                 "date": msg.get("date", ""),
                 "date_source": msg.get("date_source", "unresolved"),
@@ -6371,6 +6393,7 @@ def parse_max_group_media(
                 },
                 "media_files": unique_media,
                 "media_omitted": bool(msg.get("_oversized_media")),
+                "video_preview_omitted": video_preview_omitted,
                 "photo_visual_hint": bool(msg.get("photo_visual_hint")),
                 "voice_hint": bool(msg.get("voice_hint")),
                 "video_note_hint": bool(msg.get("video_note_hint")),

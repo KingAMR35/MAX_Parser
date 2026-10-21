@@ -226,6 +226,23 @@ def _media_to_bytesio(media: dict) -> io.IOBase:
     file_obj.seek(0)
     return file_obj
 
+def _media_is_mp4_file(media: dict) -> bool:
+    filename = str(media.get("filename") or "").lower()
+    if os.path.splitext(filename)[1] not in {".mp4", ".m4v"}:
+        return False
+    data = media.get("bytes")
+    if isinstance(data, (bytes, bytearray)) and len(data) >= 12:
+        return bytes(data[4:8]) == b"ftyp"
+    temp_path = str(media.get("temp_path") or "")
+    if temp_path and os.path.isfile(temp_path):
+        try:
+            with open(temp_path, "rb") as video_file:
+                header = video_file.read(12)
+            return len(header) >= 12 and header[4:8] == b"ftyp"
+        except OSError:
+            return False
+    return False
+
 def _media_already_sent(media: dict, chat_id: int) -> bool:
     data = media.get("bytes")
     media_hash = media.get("hash") or get_media_hash(data=data)
@@ -699,12 +716,15 @@ def _telegram_call(fn, *args, **kwargs):
 def _send_post_impl(chat_id: int, post: dict) -> None:
     msg_text = format_message(post)
     media_files = post.get("media_files", []) or []
+    emoji_image_urls = {
+        str(url).strip() for url in (post.get("emoji_image_urls") or []) if str(url).strip()
+    }
     ctx = getattr(_send_context, "current", None)
     if ctx is not None:
         ctx["suppressed_media"] = 0
     send_media = []
     for media in media_files:
-        if media.get("type") == "emoji":
+        if media.get("type") == "emoji" or str(media.get("url") or "").strip() in emoji_image_urls:
             continue
         is_poll_image = bool(post.get("poll")) and media.get("type") == "image"
         if media.get("type") in {"image", "video_note"} and not is_poll_image and _media_already_sent(media, chat_id):
@@ -875,6 +895,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         media_type=media.get("type")
         obj=_media_to_bytesio(media)
         filename=media.get("filename") or "document.bin"
+        video_as_document = media_type == "video" and not _media_is_mp4_file(media)
         try:
             if media_type=="image":
                 if caption_pending and len(msg_text)<=1024:
@@ -886,18 +907,28 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 _telegram_call(bot.send_video_note,chat_id,obj)
                 caption_pending=False
             elif media_type=="video":
-                video_details = _video_upload_details(media, post)
-                thumbnail = video_details.pop("thumbnail", None)
-                if thumbnail:
-                    thumbnail_file = io.BytesIO(thumbnail)
-                    thumbnail_file.name = "video-thumbnail.jpg"
-                    video_details["thumbnail"] = thumbnail_file
-                video_options = {"supports_streaming": True, **video_details}
-                if caption_pending and len(msg_text)<=1024:
-                    _telegram_call(bot.send_video,chat_id,obj,caption=msg_text,**video_options)
-                    caption_pending=False
+                if video_as_document:
+                    if caption_pending and len(msg_text)<=1024:
+                        _telegram_call(
+                            bot.send_document, chat_id, obj, caption=msg_text,
+                            parse_mode="HTML", visible_file_name=filename,
+                        )
+                        caption_pending=False
+                    else:
+                        _telegram_call(bot.send_document, chat_id, obj, visible_file_name=filename)
                 else:
-                    _telegram_call(bot.send_video,chat_id,obj,**video_options)
+                    video_details = _video_upload_details(media, post)
+                    thumbnail = video_details.pop("thumbnail", None)
+                    if thumbnail:
+                        thumbnail_file = io.BytesIO(thumbnail)
+                        thumbnail_file.name = "video-thumbnail.jpg"
+                        video_details["thumbnail"] = thumbnail_file
+                    video_options = {"supports_streaming": True, **video_details}
+                    if caption_pending and len(msg_text)<=1024:
+                        _telegram_call(bot.send_video,chat_id,obj,caption=msg_text,**video_options)
+                        caption_pending=False
+                    else:
+                        _telegram_call(bot.send_video,chat_id,obj,**video_options)
             elif media_type=="voice":
                 try:
                     _telegram_call(bot.send_voice,chat_id,obj)
@@ -921,6 +952,8 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                     _telegram_call(bot.send_document,chat_id,obj,visible_file_name=filename)
         except Exception as error:
             print(f"⚠️ [{chat_id}] Ошибка отправки {media_type}: {error}")
+            if media_type == "video" and video_as_document:
+                raise
             if media_type not in ("voice","video_note","image","sticker"):
                 try:
                     obj.seek(0)
@@ -1628,6 +1661,9 @@ def format_message(post: dict) -> str:
     if post.get("media_omitted"):
         omission_note = "📎 Одно из вложений слишком большое для отправки в Telegram и пропущено."
         body = f"{body}\n\n{omission_note}" if body else omission_note
+    if post.get("video_preview_omitted"):
+        video_note = "⚠️ Не удалось получить оригинал видео из MAX. Чтобы не отправлять уменьшенное превью, видео пропущено."
+        body = f"{body}\n\n{video_note}" if body else video_note
     result = f"{header}{body}"
     time_footer = format_message_time(raw_time, raw_date)
     if time_footer:
@@ -2440,7 +2476,12 @@ def process_add_chat_step1(message, admin_chat_id):
     try:
         chat_id = int(message.text.strip())
     except:
-        bot.send_message(message.chat.id, "❌ Неверный формат ID. Попробуйте ещё раз или нажмите Отмена", **NO_PREVIEW)
+        bot.send_message(
+            message.chat.id,
+            "❌ Неверный формат ID. Попробуйте ещё раз или нажмите кнопку «❌ Отмена».",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
         bot.register_next_step_handler(message, process_add_chat_step1, admin_chat_id)
         return
     existing_chat = get_chat_by_id(chat_id)
@@ -2492,11 +2533,6 @@ def process_add_chat_step1(message, admin_chat_id):
 
 def process_add_chat_step2(message, admin_chat_id):
     track_user(message)
-    if message.text == '/cancel':
-        bot.send_message(message.chat.id, " Отменено", **NO_PREVIEW)
-        if hasattr(process_add_chat_step1, 'pending_chats'):
-            process_add_chat_step1.pending_chats.pop(message.from_user.id, None)
-        return
     url = message.text.strip()
     if not url.startswith('http'):
         bot.send_message(message.chat.id, "❌ URL должен начинаться с http", **NO_PREVIEW)
@@ -2540,9 +2576,6 @@ def process_add_admin(message, admin_chat_id):
 
 def process_set_url(message, target_chat_id, admin_chat_id):
     track_user(message)
-    if message.text == '/cancel':
-        bot.send_message(message.chat.id, " Отменено", **NO_PREVIEW)
-        return
     url = message.text.strip()
     if not url.startswith('http'):
         bot.send_message(message.chat.id, "❌ URL должен начинаться с http", **NO_PREVIEW)
@@ -2699,7 +2732,7 @@ def process_send_to_user_id(message):
         bot.send_message(
             message.chat.id,
             "❌ ID пользователя должен быть числом.\n"
-            "Отправь ID ещё раз или нажми «❌ Отмена».",
+            "Отправь ID ещё раз или нажми кнопку «❌ Отмена».",
             reply_markup=get_cancel_keyboard()
         )
         bot.register_next_step_handler(
@@ -2731,7 +2764,7 @@ def process_send_to_chat_id(message):
         bot.send_message(
             message.chat.id,
             "❌ ID чата должен быть числом.\n"
-            "Отправь ID ещё раз или нажми «❌ Отмена».",
+            "Отправь ID ещё раз или нажми кнопку «❌ Отмена».",
             reply_markup=get_cancel_keyboard()
         )
         bot.register_next_step_handler(
@@ -3678,13 +3711,13 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         return False
     pending_setup_modes.pop(owner_id, None)
     customer_setup_state[owner_id] = {"chat_id": chat_id, "mode": account_mode}
-    setup_keyboard = None
+    setup_keyboard = types.InlineKeyboardMarkup(row_width=1)
     if account_mode == "project":
-        setup_keyboard = types.InlineKeyboardMarkup(row_width=1)
         setup_keyboard.add(types.InlineKeyboardButton(
             "Не получается добавить аккаунт?",
             callback_data=f"project_add_help_{chat_id}",
         ))
+    setup_keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
     bot.send_message(
         owner_id,
         f"✅ Группа <b>{escape_html(title)}</b> закреплена за вами.\n\n"
@@ -3696,7 +3729,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
            "Если MAX отправит заявку, владелец/администратор должен её одобрить. "
            "Затем бот проверит, видит ли аккаунт сообщения.\n\n"
            if account_mode == "project" else "")
-        + "Для отмены отправьте /cancel.",
+        + "Чтобы остановить настройку, нажмите «❌ Отмена».",
         parse_mode="HTML",
         reply_markup=setup_keyboard,
         **NO_PREVIEW,
@@ -3791,22 +3824,6 @@ def customer_source_url(message):
         )
 
 
-@bot.message_handler(commands=['cancel'])
-def cancel_customer_setup(message):
-    if cancel_review(message.from_user.id):
-        awaiting_review_text.discard(message.from_user.id)
-        bot.send_message(message.chat.id, "Отзыв отменён. Спасибо, что подключились!", **NO_PREVIEW)
-        return
-    state = customer_setup_state.pop(message.from_user.id, None)
-    pending_setup_modes.pop(message.from_user.id, None)
-    if state:
-        bot.send_message(message.chat.id, "Настройка отменена. Можно начать заново командой /connect.", **NO_PREVIEW)
-    elif _close_support(message.from_user.id):
-        return
-    else:
-        bot.send_message(message.chat.id, "Нечего отменять.", **NO_PREVIEW)
-
-
 @bot.message_handler(func=lambda m: m.chat.type == "private" and m.text == SUPPORT_END_TEXT)
 def end_support_button(message):
     if _close_support(message.from_user.id):
@@ -3825,12 +3842,18 @@ def handle_customer_review(message):
     if review_text.startswith("/"):
         bot.send_message(
             message.chat.id,
-            "Отправьте отзыв обычным текстом или используйте /cancel для отмены.",
+            "Отправьте отзыв обычным текстом или нажмите кнопку «❌ Отмена».",
+            reply_markup=get_cancel_keyboard(),
             **NO_PREVIEW,
         )
         return
     if not review_text:
-        bot.send_message(message.chat.id, "Отзыв пустой. Напишите пару слов или отправьте /cancel.", **NO_PREVIEW)
+        bot.send_message(
+            message.chat.id,
+            "Отзыв пустой. Напишите пару слов или нажмите кнопку «❌ Отмена».",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
         return
     if len(review_text) > 500:
         bot.send_message(message.chat.id, "Отзыв слишком длинный. Сократите его до 500 символов.", **NO_PREVIEW)
@@ -4195,6 +4218,7 @@ def admin_callbacks(call):
     is_allowed_customer_review = action == "reviews_show" or action.startswith("reviews_page_")
     is_allowed_project_retry = False
     is_allowed_project_setup = False
+    is_allowed_customer_cancel = False
     if not is_admin(call.from_user.id) and action.startswith("qr_"):
         try:
             qr_target = _qr_target_from_action(action)
@@ -4235,7 +4259,19 @@ def admin_callbacks(call):
             )
         except (ValueError, IndexError, TypeError):
             is_allowed_project_setup = False
-    if not is_admin(call.from_user.id) and not is_allowed_customer_qr and not is_allowed_customer_review and not is_allowed_project_retry and not is_allowed_project_setup:
+    if not is_admin(call.from_user.id) and action == "cancel_step":
+        customer_id = int(call.from_user.id)
+        is_allowed_customer_cancel = (
+            customer_id in pending_setup_modes
+            or customer_id in customer_setup_state
+            or customer_id in awaiting_review_text
+        )
+        if not is_allowed_customer_cancel:
+            try:
+                is_allowed_customer_cancel = get_review_status(customer_id) == "writing"
+            except Exception:
+                is_allowed_customer_cancel = False
+    if not is_admin(call.from_user.id) and not is_allowed_customer_qr and not is_allowed_customer_review and not is_allowed_project_retry and not is_allowed_project_setup and not is_allowed_customer_cancel:
         bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
         return
     if action.startswith("support_close_"):
@@ -4258,10 +4294,35 @@ def admin_callbacks(call):
             pass
         return
     if action == "cancel_step":
+        user_id = int(call.from_user.id)
+        review_is_writing = user_id in awaiting_review_text
+        if not review_is_writing:
+            try:
+                review_is_writing = get_review_status(user_id) == "writing"
+            except Exception:
+                review_is_writing = False
+        notice = None
         try:
             bot.clear_step_handler(call.message)
+            if review_is_writing:
+                cancel_review(user_id)
+                awaiting_review_text.discard(user_id)
+                notice = "Отзыв отменён. Спасибо, что подключились!"
+            elif user_id in customer_setup_state or user_id in pending_setup_modes:
+                customer_setup_state.pop(user_id, None)
+                pending_setup_modes.pop(user_id, None)
+                notice = "Настройка отменена. Её можно начать заново через /connect."
+            elif is_admin(call.from_user.id):
+                pending_chats = getattr(process_add_chat_step1, "pending_chats", None)
+                if isinstance(pending_chats, dict):
+                    pending_chats.pop(user_id, None)
+            else:
+                bot.answer_callback_query(call.id, "Сейчас нечего отменять")
+                return
             bot.delete_message(call.message.chat.id, call.message.message_id)
             bot.answer_callback_query(call.id, "❌ Отменено")
+            if notice:
+                bot.send_message(call.message.chat.id, notice, **NO_PREVIEW)
         except Exception as e:
             print(f"Ошибка при отмене: {e}")
             bot.answer_callback_query(call.id, "⚠️ Ошибка при отмене")
@@ -4386,7 +4447,8 @@ def admin_callbacks(call):
         bot.send_message(
             call.message.chat.id,
             "✍️ Напишите отзыв одним текстовым сообщением (до 500 символов).\n"
-            "Чтобы отменить, отправьте /cancel.",
+            "Чтобы отменить, нажмите кнопку «❌ Отмена».",
+            reply_markup=get_cancel_keyboard(),
             **NO_PREVIEW,
         )
         return
@@ -5051,8 +5113,8 @@ def callback_handler(call):
 • Не нужно постоянно включать и выключать VPN.
 • Ты сам выбираешь группу и настраиваешь, откуда получать сообщения.</blockquote>\n
 <blockquote><b>Выберите способ подключения:</b>\n
-• <b>Ваш аккаунт MAX:</b> вы входите в MAX, а бот читает выбранный вами чат.\n
-• <b>Аккаунт проекта:</b> добавьте его в исходную группу или канал. В закрытом источнике владелец может подтвердить вступление.\n
+• <b>Ваш аккаунт MAX:</b> вы входите в MAX, а бот читает и пересылает в выбранные вами чаты.\n
+• <b>Аккаунт проекта:</b> Здесь уже подготовленный аккаунт, который будет читать и пересылать в выбранные вами чаты.\n
 В обоих случаях бот пересылает сообщения только из источников, к которым у выбранного аккаунта есть доступ.</blockquote>
 
 ''', reply_markup=return_start(), parse_mode='HTML', **NO_PREVIEW)
@@ -5134,8 +5196,9 @@ def callback_handler(call):
                 f"Вы выбрали: <b>{label}</b>. Добавьте меня в Telegram-группу, в которую я буду присылать сообщения. "
                 "Когда я появлюсь в группе, настройка продолжится автоматически. Если я уже состою в ней, то "
                 "напишите в группе команду /bind.\n\n"
-                "Убедитесь, что мне разрешено отправлять сообщения. Для отмены отправьте /cancel.",
+                "Убедитесь, что мне разрешено отправлять сообщения. Чтобы остановить настройку, нажмите «❌ Отмена».",
                 parse_mode="HTML",
+                reply_markup=get_cancel_keyboard(),
                 **NO_PREVIEW,
             )
             try:
@@ -5209,7 +5272,7 @@ def callback_handler(call):
                     "и включит пересылку только после успешной проверки. Для закрытых источников владелец должен разрешить доступ.\n\n"
                     "<b>Управление и помощь</b>\n"
                     "• /mychats — посмотреть свои подключения.\n"
-                    "• /cancel — отменить текущий шаг настройки.\n"
+                    "• Чтобы отменить текущий шаг, нажмите «❌ Отмена» в сообщении бота.\n"
                     "• /help — открыть анонимный чат с поддержкой.\n\n"
                 ),
                 reply_markup=instruction_kb,
