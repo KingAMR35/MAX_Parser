@@ -1903,6 +1903,15 @@ def _normalize_document_filename(filename: str, url: str = "", content_type: str
     return filename[:240]
 
 
+def _is_html_page_payload(content_type: str, data: bytes) -> bool:
+    """Reject web pages returned for links that were mistaken for file attachments."""
+    mime_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if mime_type in {"text/html", "application/xhtml+xml"}:
+        return True
+    sample = bytes(data[:1024]).lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return bool(re.match(rb"(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)", sample))
+
+
 def _media_filename(filename: str, url: str, content_type: str, data: bytes, media_type: str) -> str:
     """Keep downloaded voice/video files recognizable to Telegram's media endpoints."""
     name = _normalize_document_filename(filename, url, content_type)
@@ -2828,6 +2837,17 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
     if not url:
         return None
     try:
+        parsed_url = urlparse(url)
+        parsed_host = (parsed_url.hostname or "").lower()
+        if parsed_host.startswith("www."):
+            parsed_host = parsed_host[4:]
+        if (
+            media_type == "document"
+            and parsed_host == "cloud.mail.ru"
+            and parsed_url.path.startswith("/public/")
+        ):
+            print(f"[{chat_id}] ℹ️ Ссылка на папку Облака Mail остаётся ссылкой, а не файлом")
+            return None
         if url.startswith("data:"):
             header, encoded = url.split(",", 1)
             if len(encoded) > (MAX_MEDIA_DOWNLOAD_BYTES * 4 // 3 + 8):
@@ -2892,6 +2912,10 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
             raise RuntimeError("получен пустой файл")
         if len(file_bytes) > MAX_MEDIA_DOWNLOAD_BYTES:
             return _media_size_limit_marker(chat_id, url, media_type, len(file_bytes))
+        if media_type == "document" and _is_html_page_payload(content_type, file_bytes):
+            host = urlparse(url).hostname or "веб-страница"
+            print(f"[{chat_id}] ℹ️ Пропускаю ссылку на веб-страницу вместо файла: {host}")
+            return None
         if (
             media_type == "image" and _looks_like_image(file_bytes, content_type)
             and len(file_bytes) > MAX_TELEGRAM_PHOTO_BYTES
@@ -5950,12 +5974,27 @@ def parse_max_group_media(
                                 const aria = safeAttr(el, "aria-label");
                                 const title = safeAttr(el, "title");
                                 const className = typeof el.className === "string" ? el.className : "";
-                                const hint = [ownText, aria, title, className, fullRowText].join(" ");
+                                const dataTestId = safeAttr(el, "data-testid");
+                                const dataType = safeAttr(el, "data-type");
+                                const role = safeAttr(el, "role");
+                                const tagName = String(el.tagName || "").toLowerCase();
+                                const hint = [ownText, aria, title, className, dataTestId, dataType].join(" ");
                                 const isCancelAction = /cancel|отменить|отмена|stop/i.test([ownText, aria, title, className].join(" "));
-                                const looksLikeFile = !isCancelAction && (
-                                    Boolean(downloadAttr) ||
-                                    /\.(pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)(?:[?#\s]|$)/i.test(hint) ||
-                                    /скачать|download|файл|file|document|attachment/i.test(hint)
+                                const hasDownloadAttribute = Boolean(el.hasAttribute && el.hasAttribute("download"));
+                                const mailCloudSharePage = /^https?:\/\/(?:www\.)?cloud\.mail\.ru\/public(?:\/|$)/i.test(href || "");
+                                const hasFileName = /\.(pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)(?:[?#\s]|$)/i.test(
+                                    [href, downloadAttr, ownText, aria, title].join(" ")
+                                );
+                                const attachmentMeta = [aria, title, className, dataTestId, dataType].join(" ");
+                                const hasAttachmentMeta = /file|document|attachment|файл|документ|вложен/i.test(attachmentMeta);
+                                const explicitDownloadControl = /скачать|download/i.test(attachmentMeta) && (
+                                    tagName === "button" || role === "button" || hasDownloadAttribute ||
+                                    /download|file|document|attachment/i.test(attachmentMeta)
+                                );
+                                const downloadLinkLabel = tagName === "a" && /^(?:скачать|download)$/i.test(ownText);
+                                const looksLikeFile = !isCancelAction && !mailCloudSharePage && (
+                                    hasDownloadAttribute || hasFileName || hasAttachmentMeta ||
+                                    explicitDownloadControl || downloadLinkLabel
                                 );
                                 if (!looksLikeFile) return;
                                 let absoluteHref = "";
@@ -6000,9 +6039,11 @@ def parse_max_group_media(
                             const aria = safeAttr(el, "aria-label");
                             const title = safeAttr(el, "title");
                             const cls = typeof el.className === "string" ? el.className : "";
+                            const controlHref = getCandidateUrl(el);
+                            const mailCloudSharePage = /^https?:\/\/(?:www\.)?cloud\.mail\.ru\/public(?:\/|$)/i.test(controlHref);
                             const isCancelAction = /cancel|отменить|отмена|stop/i.test([ownText, aria, title, cls].join(" "));
                             if (
-                                !hasRichMediaSurface && !isCancelAction && (
+                                !mailCloudSharePage && !hasRichMediaSurface && !isCancelAction && (
                                     /^(скачать|download)$/i.test(ownText) ||
                                     /скачать|download/i.test(aria + " " + title + " " + cls)
                                 )
