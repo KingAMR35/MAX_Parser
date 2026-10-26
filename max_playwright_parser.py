@@ -1242,6 +1242,75 @@ def get_legacy_message_hash(post: dict) -> str:
     return hashlib.md5(f"max-message:{source_id}".encode("utf-8")).hexdigest()
 
 
+def _is_near_max_midnight(now=None) -> bool:
+    """Use MAX's configured timezone when guarding against its relative-date rollover."""
+    try:
+        from zoneinfo import ZoneInfo
+        max_timezone = ZoneInfo(MAX_TIMEZONE_ID)
+        current = now or datetime.now(max_timezone)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=max_timezone)
+        else:
+            current = current.astimezone(max_timezone)
+    except Exception:
+        current = now or datetime.now()
+    return (current.hour == 23 and current.minute >= 30) or (
+        current.hour == 0 and current.minute < 30
+    )
+
+
+def _message_with_shifted_date(post: dict, days: int) -> dict | None:
+    date_text = str((post or {}).get("date") or "").strip()
+    for date_format in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            shifted_date = datetime.strptime(date_text, date_format) + timedelta(days=days)
+            shifted_post = dict(post)
+            shifted_post["date"] = shifted_date.strftime(date_format)
+            return shifted_post
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _matches_cached_message_across_midnight(post: dict, cache: set, known_signatures: set) -> bool:
+    """Match fallback-index messages when MAX changes only their date at midnight."""
+    source_id = str(post.get("source_id") or "").strip()
+    if not _is_near_max_midnight() or (source_id and not post.get("source_id_is_index")):
+        return False
+    has_text_content = _has_media_independent_content(post)
+    media_keys = {
+        str(item.get("hash") or item.get("content_hash") or item.get("url") or "").strip()
+        for item in (post.get("media_files") or [])
+        if isinstance(item, dict)
+    }
+    media_keys.discard("")
+    if not has_text_content and not media_keys:
+        return False
+
+    for day_shift in (-1, 1):
+        shifted_post = _message_with_shifted_date(post, day_shift)
+        if not shifted_post:
+            continue
+        shifted_content_signature = _get_post_content_signature(shifted_post)
+        if shifted_content_signature in known_signatures:
+            return True
+        if has_text_content:
+            shifted_text_signature = _get_post_text_signature(shifted_post)
+            if (
+                shifted_text_signature in known_signatures
+                or any(
+                    isinstance(signature, str) and signature.startswith(shifted_text_signature + "|")
+                    for signature in known_signatures
+                )
+            ):
+                return True
+        shifted_message_hash = get_message_hash(shifted_post)
+        shifted_text_hash = get_text_message_hash(shifted_post) if has_text_content else ""
+        if shifted_message_hash in cache or (shifted_text_hash and shifted_text_hash in cache):
+            return True
+    return False
+
+
 def _message_cache_stub(msg: dict) -> dict:
     """Build the stable, attachment-free part of a MAX row for cache checks."""
     special = {
@@ -1399,6 +1468,12 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
             cache.add(text_hash)
         if signature:
             message_signatures_by_chat.setdefault(chat_id, set()).add(signature)
+        return False
+    if _matches_cached_message_across_midnight(post, cache, known_signatures):
+        # Persist the new date form so the same old card remains suppressed after
+        # the midnight guard window and across a bot restart.
+        mark_message_seen(post, chat_id=chat_id)
+        save_message_cache()
         return False
     return True
 

@@ -3113,9 +3113,10 @@ def return_start():
     return keyboard
 
 def parser_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("1️⃣ Мой аккаунт MAX — 250 ₽/мес", callback_data="my_acc_250"))
     keyboard.add(types.InlineKeyboardButton("2️⃣ Через готовый аккаунт — 500 ₽/мес", callback_data="not_my_acc_250"))
+    keyboard.add(types.InlineKeyboardButton("ℹ️ Разница способов", callback_data="compare_modes"))
     keyboard.add(types.InlineKeyboardButton("📖 Инструкция", callback_data="instruction"))
     keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
     return keyboard
@@ -3835,13 +3836,12 @@ def _chat_delete_allowed(user_id, chat):
 
 def _project_access_help():
     return (
-        "Чтобы читать закрытый чат, аккаунт проекта <code>"
-        f"{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> должен вступить в него. "
-        "Можно добавить его по номеру или прислать боту ссылку-приглашение: бот попробует открыть её и вступить. "
-        "Если MAX отправит заявку, владелец или администратор должен её одобрить. "
-        "Для канала достаточно права читать публикации — права администратора не нужны. "
-        "Открытые чаты можно подключить по ссылке, если MAX показывает сообщения аккаунту проекта. "
-        "После отправки ссылки бот проверит доступ; если MAX не даст открыть чат, парсинг останется выключен."
+        "Чтобы читать закрытую группу, аккаунту проекта <code>"
+        f"{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> нужен доступ: добавьте его в группу или отправьте ссылку-приглашение. "
+        "Если MAX попросит одобрить заявку, это должен сделать владелец или администратор. "
+        "Для канала достаточно доступа к публикациям — права администратора не нужны. "
+        "После ссылки бот проверит доступ и включит пересылку только если аккаунт видит сообщения. "
+        "Если добавить аккаунт или вступить по приглашению нельзя, этот способ не подойдёт: выберите подключение через свой аккаунт MAX."
     )
 
 
@@ -3997,12 +3997,28 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         return False
     pending_setup_modes.pop(owner_id, None)
     customer_setup_state[owner_id] = {"chat_id": chat_id, "mode": account_mode}
-    setup_keyboard = types.InlineKeyboardMarkup(row_width=1)
     if account_mode == "project":
-        setup_keyboard.add(types.InlineKeyboardButton(
-            "Не получается добавить аккаунт?",
-            callback_data=f"project_add_help_{chat_id}",
+        source_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        source_keyboard.add(types.InlineKeyboardButton(
+            "📢 Канал",
+            callback_data=f"project_source_channel_{chat_id}",
         ))
+        source_keyboard.add(types.InlineKeyboardButton(
+            "👥 Группа или чат",
+            callback_data=f"project_source_group_{chat_id}",
+        ))
+        source_keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
+        bot.send_message(
+            owner_id,
+            f"✅ Telegram-группа <b>{escape_html(title)}</b> выбрана для получения сообщений.\n\n"
+            "<b>Шаг 2 из 2.</b> Что хотите подключить в MAX?",
+            parse_mode="HTML",
+            reply_markup=source_keyboard,
+            **NO_PREVIEW,
+        )
+        return True
+
+    setup_keyboard = types.InlineKeyboardMarkup(row_width=1)
     setup_keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
     bot.send_message(
         owner_id,
@@ -4060,6 +4076,24 @@ def customer_source_url(message):
         )
         return
     url = (message.text or "").strip()
+    mode = state.get("mode")
+    if mode == "project" and state.get("source_type") not in {"channel", "group"}:
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton(
+            "📢 Канал",
+            callback_data=f"project_source_channel_{state['chat_id']}",
+        ))
+        keyboard.add(types.InlineKeyboardButton(
+            "👥 Группа или чат",
+            callback_data=f"project_source_group_{state['chat_id']}",
+        ))
+        bot.send_message(
+            message.chat.id,
+            "Сначала выберите тип источника MAX кнопкой в сообщении выше.",
+            reply_markup=keyboard,
+            **NO_PREVIEW,
+        )
+        return
     if not _is_max_source_url(url):
         bot.send_message(
             message.chat.id,
@@ -4069,7 +4103,6 @@ def customer_source_url(message):
         )
         return
     chat_id = state["chat_id"]
-    mode = state["mode"]
     update_chat_url(chat_id, url)
     customer_setup_state.pop(message.from_user.id, None)
     if mode == "self":
@@ -4496,7 +4529,7 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
@@ -4531,7 +4564,7 @@ def admin_callbacks(call):
             )
         except (ValueError, IndexError, TypeError):
             is_allowed_project_retry = False
-    if not is_admin(call.from_user.id) and action.startswith(("project_add_help_", "project_help_channel_", "project_help_support_")):
+    if not is_admin(call.from_user.id) and action.startswith(("project_source_channel_", "project_source_group_", "project_add_help_", "project_help_invite_", "project_help_channel_", "project_help_support_")):
         try:
             setup_chat_id = int(action.rsplit("_", 1)[1])
             setup_chat = get_chat_by_id(setup_chat_id)
@@ -4621,7 +4654,7 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "⚠️ Не удалось удалить")
             print(f"Ошибка удаления: {e}")
         return
-    if action.startswith(("project_add_help_", "project_help_channel_", "project_help_support_")):
+    if action.startswith(("project_source_channel_", "project_source_group_", "project_add_help_", "project_help_invite_", "project_help_channel_", "project_help_support_")):
         try:
             setup_chat_id = int(action.rsplit("_", 1)[1])
         except (ValueError, IndexError):
@@ -4638,7 +4671,62 @@ def admin_callbacks(call):
         ):
             bot.answer_callback_query(call.id, "Этот шаг настройки уже завершён", show_alert=True)
             return
+        if action.startswith(("project_source_channel_", "project_source_group_")):
+            source_type = "channel" if action.startswith("project_source_channel_") else "group"
+            setup_state["source_type"] = source_type
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
+            if source_type == "group":
+                keyboard.add(types.InlineKeyboardButton(
+                    "Не могу добавить аккаунт",
+                    callback_data=f"project_add_help_{setup_chat_id}",
+                ))
+                prompt = (
+                    "<b>Шаг 2 из 2 · Группа или чат</b>\n\n"
+                    f"Сначала добавьте в группу аккаунт проекта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
+                    "Затем отправьте сюда ссылку на эту группу MAX.\n\n"
+                    "Если MAX отправит запрос на вступление, владелец или администратор должен его одобрить. "
+                    "После ссылки бот проверит доступ и включит пересылку."
+                )
+            else:
+                prompt = (
+                    "<b>Шаг 2 из 2 · Канал</b>\n\n"
+                    "Отправьте сюда ссылку на канал MAX. Если канал закрытый, отправьте ссылку-приглашение. "
+                    "После этого бот проверит доступ и включит пересылку."
+                )
+            keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                prompt,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            return
         if action.startswith("project_add_help_"):
+            if setup_state.get("source_type") == "group":
+                keyboard = types.InlineKeyboardMarkup(row_width=1)
+                keyboard.add(types.InlineKeyboardButton(
+                    "🔗 Есть ссылка-приглашение",
+                    callback_data=f"project_help_invite_{setup_chat_id}",
+                ))
+                keyboard.add(types.InlineKeyboardButton(
+                    "💬 Написать в поддержку",
+                    callback_data=f"project_help_support_{setup_chat_id}",
+                ))
+                bot.answer_callback_query(call.id)
+                bot.edit_message_text(
+                    "В закрытую группу аккаунт проекта сможет войти, только если владелец или администратор "
+                    "добавит его либо разрешит вступить по ссылке. Если MAX отправит запрос, его нужно одобрить.\n\n"
+                    "Если добавить аккаунт и выдать приглашение нельзя, этот способ не сможет читать группу. "
+                    "Тогда выберите подключение через свой аккаунт MAX или напишите в поддержку.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=keyboard,
+                    **NO_PREVIEW,
+                )
+                return
             keyboard = types.InlineKeyboardMarkup(row_width=1)
             keyboard.add(types.InlineKeyboardButton(
                 "📢 Это канал — отправлю приглашение",
@@ -4653,6 +4741,23 @@ def admin_callbacks(call):
                 "Не получается добавить аккаунт проекта?\n\n"
                 "Если источник — канал, нажмите первую кнопку и отправьте ссылку-приглашение. "
                 "Если это группа или чат и добавить аккаунт нельзя, нажмите «Поддержка».",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboard,
+                **NO_PREVIEW,
+            )
+            return
+        if action.startswith("project_help_invite_"):
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
+            keyboard.add(types.InlineKeyboardButton(
+                "💬 Написать в поддержку",
+                callback_data=f"project_help_support_{setup_chat_id}",
+            ))
+            keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "Отправьте ссылку-приглашение в закрытую группу MAX. Бот попробует открыть её. "
+                "Если MAX попросит одобрить вступление, владелец или администратор должен подтвердить запрос.",
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=keyboard,
@@ -5443,6 +5548,25 @@ def callback_handler(call):
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
+        elif call.data == "compare_modes":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "<b>Чем отличаются способы подключения</b>\n\n"
+                "<b>1️⃣ Ваш аккаунт MAX · 250 ₽/мес</b>\n"
+                "Вы входите в свой MAX через QR-код. Парсер читает выбранный вами источник, который доступен вашему аккаунту. "
+                "Подходит, если не хотите добавлять другой аккаунт в чат.\n\n"
+                "<b>2️⃣ Аккаунт проекта · 500 ₽/мес</b>\n"
+                f"Используется готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
+                "Для группы его нужно добавить или пригласить, для канала — дать доступ к публикациям. "
+                "Вы не вводите данные своего MAX.\n\n"
+                "В обоих случаях бот проверит доступ и будет пересылать сообщения в выбранную вами Telegram-группу. "
+                "Если аккаунт проекта нельзя добавить или пригласить, выберите первый способ.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=parser_keyboard(),
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
         elif call.data in ("renew_self", "renew_project"):
             if not call.message or call.message.chat.type != "private":
                 bot.answer_callback_query(
@@ -5538,9 +5662,9 @@ def callback_handler(call):
                     "После нажатия на кнопку «Подключить MAX_Parser» выберите способ работы с MAX. Затем добавьте этого бота "
                     "в Telegram-группу, куда должны приходить сообщения. После появления бота отправьте в группе /bind. "
                     "Если бот уже добавлен, то просто напишите /bind. Боту нужно разрешить отправлять сообщения.\n\n"
-                    "<b>Шаг 2 · Укажите источник MAX</b>\n"
-                    "Откройте <a href=\"https://web.max.ru\">web.max.ru</a>, перейдите в нужный чат, группу или канал "
-                    "и скопируйте ссылку из меню. Отправьте её боту в личном чате.\n\n"
+                    "<b>Шаг 2 · Выберите источник MAX</b>\n"
+                    "Во втором способе нажмите «Канал» или «Группа или чат». Затем откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
+                    "перейдите к источнику и скопируйте ссылку из меню.\n\n"
                     "<b>Вариант 1 · Ваш аккаунт MAX</b>\n"
                     "После отправки ссылки бот пришлёт QR-код. Отсканируйте его в приложении MAX и нажмите "
                     "«Готово, я отсканировал». Если MAX запросит пароль двухэтапной проверки, отправьте его боту в этой "
@@ -5549,13 +5673,11 @@ def callback_handler(call):
                     "Номер, код и пароль вводятся в удалённой странице MAX, не в Telegram. Сервер MAX_Parser технически "
                     "обрабатывает ввод, но приложение не сохраняет его и не пересылает в Telegram.\n\n"
                     "<b>Вариант 2 · Через готовый аккаунт MAX</b>\n"
-                    f"Попросите владельца или администратора добавить в источник аккаунт <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>. "
-                    "Для закрытого источника можно отправить боту ссылку-приглашение: он попробует вступить. "
-                    "Если MAX попросит одобрение, его должен дать владелец или администратор. "
-                    "Для канала достаточно обычного доступа к публикациям — права администратора не нужны.\n"
-                    "В личном чате с ботом выберите вариант 2, добавьте бота в Telegram-группу назначения и отправьте там /bind. "
-                    "Затем пришлите ссылку на источник MAX. Бот проверит, может ли аккаунт проекта открыть сообщения, "
-                    "и включит пересылку только после успешной проверки. Для закрытых источников владелец должен разрешить доступ.\n\n"
+                    f"Если выбрали группу, добавьте в неё аккаунт <code>{MAX_PROJECT_ACCOUNT_PHONE}</code>, а затем отправьте боту ссылку. "
+                    "Если MAX попросит одобрить вступление, это должен сделать владелец или администратор. Для канала отправьте ссылку; "
+                    "для закрытого канала может понадобиться приглашение. Бот проверит доступ и включит пересылку только после проверки.\n"
+                    "Если аккаунт проекта нельзя добавить и для закрытой группы нет приглашения, этот способ не сработает. "
+                    "Используйте свой аккаунт MAX или обратитесь в поддержку.\n\n"
                     "<b>Управление и помощь</b>\n"
                     "• /mychats — посмотреть свои подключения.\n"
                     "• Чтобы отменить текущий шаг, нажмите «❌ Отмена» в сообщении бота.\n"
