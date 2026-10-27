@@ -1529,19 +1529,19 @@ def _session_path_for_chat(chat):
     return os.path.join("sessions", f"{chat['chat_id']}.json")
 
 
-def _user_needs_subscription(user_id):
+def _user_needs_subscription(user_id, account_mode=None):
     if not PAYMENT_ACCESS_ENFORCEMENT_ENABLED:
         return False
     if PAYMENT_ADMIN_BYPASS and is_admin(user_id):
         return False
-    return not is_subscription_active(user_id)
+    return not is_subscription_active(user_id, account_mode)
 
 
 def _get_payable_active_chats():
     chats = get_active_chats()
     if not PAYMENT_ACCESS_ENFORCEMENT_ENABLED:
         return chats
-    active_owners = get_active_subscription_user_ids()
+    active_access = get_active_subscription_access()
     admin_ids = (
         {int(admin["user_id"]) for admin in get_all_admins()}
         if PAYMENT_ADMIN_BYPASS else set()
@@ -1549,7 +1549,11 @@ def _get_payable_active_chats():
     return [
         chat for chat in chats
         if not chat.get("owner_id")
-        or int(chat["owner_id"]) in (active_owners | admin_ids)
+        or int(chat["owner_id"]) in admin_ids
+        or bool(
+            active_access.get(int(chat["owner_id"]), set())
+            & {chat.get("account_mode", "self"), "multi"}
+        )
     ]
 
 
@@ -1669,7 +1673,7 @@ def process_single_chat(chat):
 
     try:
         owner_id = int(chat.get("owner_id") or 0)
-        if owner_id and _user_needs_subscription(owner_id):
+        if owner_id and _user_needs_subscription(owner_id, chat.get("account_mode", "self")):
             return False
         parse_max_group_media(
             group_url=max_url,
@@ -2664,34 +2668,57 @@ def show_free_subscription_users(chat_id, message_id, page=0):
     page = max(0, min(int(page), page_count - 1))
     first = page * ADMIN_LIST_PAGE_SIZE
     shown = users[first:first + ADMIN_LIST_PAGE_SIZE]
-    text = f"🎁 <b>Выдать бесплатную подписку</b> · {len(users)} пользователей\n\nВыберите пользователя:"
+    text = f"👤 <b>Пользователи</b> · {len(users)} всего"
+    if users:
+        text += f" · {first + 1}–{first + len(shown)} из {len(users)}"
+        text += "\n\nОтправьте сюда user ID из списка, чтобы выдать доступ."
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    for user in shown:
+    for index, user in enumerate(shown, first + 1):
         name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
-        display = f"@{user['username']}" if user.get("username") else (name or str(user["user_id"]))
-        text += f"\n\n<b>{escape_html(name or display)}</b> · <code>{user['user_id']}</code>"
-        keyboard.add(types.InlineKeyboardButton(
-            _short_button_label(f"🎁 {display}", 32),
-            callback_data=f"admin_free_sub_user_{user['user_id']}"
-        ))
+        name = escape_html(name or "Имя не указано")
+        username = f"@{escape_html(user['username'])}" if user.get("username") else "username не указан"
+        text += (
+            f"\n\n<b>{index}. {name}</b>"
+            f"\n{username}"
+            f"\n🆔 ID: <code>{user['user_id']}</code>"
+        )
     if not users:
-        text = "🎁 <b>Бесплатная подписка</b>\n\nПользователей пока нет."
+        text += "\n\nПользователей пока нет."
     _page_buttons(keyboard, page, page_count, "admin_free_sub_page")
     keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, **NO_PREVIEW)
 
 
-def show_free_subscription_options(chat_id, message_id, user_id):
-    user = next((item for item in get_all_users() if int(item["user_id"]) == int(user_id)), None)
-    if not user:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔙 К списку", callback_data="admin_free_subscriptions"))
-        safe_edit_message(
-            "Пользователь не найден. Обновите список и попробуйте ещё раз.",
-            chat_id, message_id,
-            reply_markup=keyboard,
+def process_free_subscription_user_id(message):
+    admin_id = int(message.from_user.id)
+    if not is_admin(admin_id):
+        return
+    raw_value = (message.text or "").strip()
+    if not re.fullmatch(r"\d{1,20}", raw_value):
+        prompt = bot.send_message(
+            message.chat.id,
+            "Пришлите только числовой user ID из таблицы пользователей.",
             **NO_PREVIEW,
         )
+        bot.register_next_step_handler(prompt, process_free_subscription_user_id)
+        return
+    user_id = int(raw_value)
+    user = next((item for item in get_all_users() if int(item["user_id"]) == user_id), None)
+    if not user:
+        prompt = bot.send_message(
+            message.chat.id,
+            "Пользователь с таким ID не найден. Проверьте ID в таблице и отправьте его ещё раз.",
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_free_subscription_user_id)
+        return
+    show_free_subscription_options(message.chat.id, user_id)
+
+
+def show_free_subscription_options(chat_id, user_id):
+    user = next((item for item in get_all_users() if int(item["user_id"]) == int(user_id)), None)
+    if not user:
+        bot.send_message(chat_id, "Пользователь не найден. Обновите список и попробуйте ещё раз.", **NO_PREVIEW)
         return
     name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
     username = f"@{escape_html(user['username'])}" if user.get("username") else "без username"
@@ -2699,24 +2726,55 @@ def show_free_subscription_options(chat_id, message_id, user_id):
         "🎁 <b>Выдача бесплатной подписки</b>\n\n"
         f"Пользователь: <b>{escape_html(name or 'Имя не указано')}</b> ({username})\n"
         f"ID: <code>{user_id}</code>\n\n"
-        "Выберите срок и способ подключения. Если подписка уже активна, новый срок добавится к ней."
+        "Сначала выберите мульти-подписку или один способ подключения. Затем выберите срок. "
+        "Новый срок добавится к уже активному тарифу того же типа."
     )
-    current = get_subscription(user_id)
-    if current and current["active_until"] > datetime.now(timezone.utc):
-        active_until = current["active_until"].astimezone(timezone.utc)
-        text += f"\n\nСейчас действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>."
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    for days, period in ((30, "30 дней"), (90, "3 месяца"), (365, "1 год")):
+    keyboard.add(types.InlineKeyboardButton(
+        "✨ Мульти-подписка", callback_data=f"admin_gift_multi_{user_id}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "📦 Отдельная подписка", callback_data=f"admin_gift_separate_{user_id}"
+    ))
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def show_free_subscription_separate_options(chat_id, user_id):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "1️⃣ Свой MAX-аккаунт", callback_data=f"admin_gift_plan_self_{user_id}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "2️⃣ Аккаунт проекта", callback_data=f"admin_gift_plan_project_{user_id}"
+    ))
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    bot.send_message(
+        chat_id,
+        f"👤 Пользователь: <code>{user_id}</code>\n\nВыберите отдельный способ подключения:",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+
+
+def show_free_subscription_terms(chat_id, user_id, plan_code):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for months in (1, 3, 12):
+        label = SUBSCRIPTION_PERIOD_LABELS[months]
         keyboard.add(types.InlineKeyboardButton(
-            f"🎁 {period} · ваш MAX",
-            callback_data=f"admin_free_sub_grant_self_{days}_{user_id}"
+            f"🎁 {label}",
+            callback_data=f"admin_gift_term_{plan_code}_{months}_{user_id}",
         ))
-        keyboard.add(types.InlineKeyboardButton(
-            f"🎁 {period} · MAX проекта",
-            callback_data=f"admin_free_sub_grant_project_{days}_{user_id}"
-        ))
-    keyboard.add(types.InlineKeyboardButton("🔙 К списку", callback_data="admin_free_subscriptions"))
-    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, **NO_PREVIEW)
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    bot.send_message(
+        chat_id,
+        f"🎁 Выдача доступа пользователю <code>{user_id}</code>\n"
+        f"Тариф: <b>{escape_html(SUBSCRIPTION_LABELS[plan_code])}</b>\n\nВыберите срок:",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
 
 
 def show_user_send_selector(chat_id, message_id, page=0):
@@ -3131,32 +3189,202 @@ def return_start():
 
 def parser_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(types.InlineKeyboardButton("1️⃣ Мой аккаунт MAX — 250 ₽/мес", callback_data="my_acc_250"))
-    keyboard.add(types.InlineKeyboardButton("2️⃣ Через готовый аккаунт — 500 ₽/мес", callback_data="not_my_acc_250"))
+    keyboard.add(types.InlineKeyboardButton("1️⃣ Свой MAX-аккаунт · от 249 ₽", callback_data="connect_self"))
+    keyboard.add(types.InlineKeyboardButton("2️⃣ Аккаунт проекта · от 499 ₽", callback_data="connect_project"))
+    keyboard.add(types.InlineKeyboardButton("✨ Мульти-подписка · от 599 ₽", callback_data="connect_multi"))
     keyboard.add(types.InlineKeyboardButton("ℹ️ Разница способов", callback_data="compare_modes"))
     keyboard.add(types.InlineKeyboardButton("📖 Инструкция", callback_data="instruction"))
     keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
     return keyboard
 
 
-def subscription_renewal_keyboard():
+SUBSCRIPTION_PRICES = {
+    "self": {1: 249, 3: 599, 12: 2499},
+    "project": {1: 499, 3: 1199, 12: 5499},
+    "multi": {1: 599, 3: 1499, 12: 6499},
+}
+SUBSCRIPTION_LABELS = {
+    "self": "Подключение своего MAX-аккаунта",
+    "project": "Подключение аккаунта MAX_Parser",
+    "multi": "Мульти-подписка",
+}
+SUBSCRIPTION_PERIOD_LABELS = {1: "1 месяц", 3: "3 месяца", 12: "1 год"}
+
+
+def subscription_products_keyboard(prefix="subscription_product"):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(types.InlineKeyboardButton("Продлить · свой MAX-аккаунт · 250 ₽", callback_data="renew_self"))
-    keyboard.add(types.InlineKeyboardButton("Продлить · аккаунт проекта · 500 ₽", callback_data="renew_project"))
+    keyboard.add(types.InlineKeyboardButton(
+        "1️⃣ Свой MAX-аккаунт · от 249 ₽", callback_data=f"{prefix}_self"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "2️⃣ Аккаунт проекта · от 499 ₽", callback_data=f"{prefix}_project"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "✨ Мульти-подписка · от 599 ₽", callback_data=f"{prefix}_multi"
+    ))
     return keyboard
 
 
+def subscription_period_keyboard(plan_code, back_callback="subscription_products"):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for months in (1, 3, 12):
+        amount = SUBSCRIPTION_PRICES[plan_code][months]
+        period = SUBSCRIPTION_PERIOD_LABELS[months]
+        keyboard.add(types.InlineKeyboardButton(
+            f"{period} · {amount:,} ₽".replace(",", " "),
+            callback_data=f"subscription_buy_{plan_code}_{months}",
+        ))
+    keyboard.add(types.InlineKeyboardButton("🔙 К тарифам", callback_data=back_callback))
+    return keyboard
+
+
+def subscription_renewal_keyboard():
+    return subscription_products_keyboard("subscription_product")
+
+
+def _product_marketing_text(plan_code):
+    if plan_code == "self":
+        return (
+            "Подключите свой аккаунт MAX и получайте сообщения из чатов, которые доступны именно вам. "
+            "Подходит, если вы не хотите добавлять аккаунт проекта в свои чаты."
+        )
+    if plan_code == "project":
+        return (
+            "Сообщения читает аккаунт MAX_Parser. Вам не нужно входить в свой MAX: для закрытой группы "
+            "достаточно предоставить аккаунту проекта доступ."
+        )
+    return (
+        "Оба способа в одной подписке: можно подключать чаты через свой аккаунт MAX и через аккаунт "
+        "проекта. Выбирайте удобный способ отдельно для каждого подключения."
+    )
+
+
+def show_subscription_terms(chat_id, message_id, plan_code, back_callback="subscription_products"):
+    if plan_code not in SUBSCRIPTION_PRICES:
+        return
+    title = SUBSCRIPTION_LABELS[plan_code]
+    text = (
+        f"💳 <b>{escape_html(title)}</b>\n\n"
+        f"{escape_html(_product_marketing_text(plan_code))}\n\n"
+        "Подписка действует на весь ваш аккаунт MAX_Parser и покрывает до 5 подключённых чатов.\n\n"
+        "Выберите срок подписки:"
+    )
+    safe_edit_message(
+        text,
+        chat_id,
+        message_id,
+        reply_markup=subscription_period_keyboard(plan_code, back_callback),
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+
+
+def show_connection_method_picker(chat_id, message_id=None):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "1️⃣ Подключить через свой MAX", callback_data="setup_mode_self"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "2️⃣ Подключить через аккаунт проекта", callback_data="setup_mode_project"
+    ))
+    text = (
+        "✨ <b>Мульти-подписка активна</b>\n\n"
+        "Вам доступны оба способа подключения. Выберите, какой использовать для этого чата."
+    )
+    if message_id:
+        safe_edit_message(
+            text, chat_id, message_id, reply_markup=keyboard,
+            parse_mode="HTML", **NO_PREVIEW,
+        )
+    else:
+        bot.send_message(
+            chat_id, text, reply_markup=keyboard,
+            parse_mode="HTML", **NO_PREVIEW,
+        )
+
+
+def _user_has_product_access(user_id, plan_code):
+    if PAYMENT_ADMIN_BYPASS and is_admin(user_id):
+        return True
+    if plan_code == "multi":
+        return (
+            is_subscription_active(user_id, "self")
+            and is_subscription_active(user_id, "project")
+        )
+    return is_subscription_active(user_id, plan_code)
+
+
+def _begin_connection_for_plan(user_id, plan_code, chat_id, message_id=None):
+    if len(get_user_chats(user_id)) >= MAX_CUSTOMER_CHATS:
+        bot.send_message(chat_id, _chat_limit_notice(), **NO_PREVIEW)
+        return
+    if plan_code == "multi" and _user_has_product_access(user_id, "multi"):
+        show_connection_method_picker(chat_id, message_id)
+        return
+    if plan_code in {"self", "project"} and _user_has_product_access(user_id, plan_code):
+        _start_customer_setup_prompt(user_id, plan_code, chat_id, message_id)
+        return
+    if PAYMENTS_ENABLED:
+        if message_id:
+            show_subscription_terms(
+                chat_id, message_id, plan_code, back_callback="parse_setup"
+            )
+        else:
+            bot.send_message(chat_id, "Выберите срок подписки:", **NO_PREVIEW)
+        return
+    if plan_code == "multi":
+        show_connection_method_picker(chat_id, message_id)
+    else:
+        _start_customer_setup_prompt(user_id, plan_code, chat_id, message_id)
+
+
+def _start_customer_setup_prompt(user_id, account_mode, chat_id, message_id=None):
+    if account_mode not in {"self", "project"}:
+        return
+    if len(get_user_chats(user_id)) >= MAX_CUSTOMER_CHATS:
+        bot.send_message(chat_id, _chat_limit_notice(), **NO_PREVIEW)
+        return
+    if _user_needs_subscription(user_id, account_mode):
+        bot.send_message(
+            chat_id,
+            "Для этого способа подключения нужна активная подписка. Выберите тариф:",
+            reply_markup=subscription_products_keyboard("subscription_product"),
+            **NO_PREVIEW,
+        )
+        return
+    pending_setup_modes[user_id] = account_mode
+    label = "настройку своего аккаунта MAX" if account_mode == "self" else "настройку через аккаунт проекта"
+    bot.send_message(
+        chat_id,
+        f"<b>Шаг 1 из {2 if account_mode == 'project' else 3} · Telegram-группа</b>\n\n"
+        f"Вы выбрали: <b>{label}</b>. Добавьте меня в Telegram-группу, в которую я буду присылать сообщения. "
+        "Когда я появлюсь в группе, настройка продолжится автоматически. Если я уже состою в ней, то "
+        "напишите в группе команду /bind.\n\n"
+        "Убедитесь, что мне разрешено отправлять сообщения. Чтобы остановить настройку, нажмите «❌ Отмена».",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+        **NO_PREVIEW,
+    )
+    if message_id:
+        try:
+            bot.edit_message_text(
+                "Настройка начата. Продолжите её в вашей Telegram-группе; подробная инструкция доступна по кнопке ниже.",
+                chat_id,
+                message_id,
+                reply_markup=parser_keyboard(),
+                **NO_PREVIEW,
+            )
+        except Exception:
+            pass
+
+
 def _subscription_plan(plan_code):
-    plans = {
-        "self": (25000, "подключение через ваш аккаунт MAX"),
-        "project": (50000, "подключение через аккаунт проекта MAX"),
-    }
-    if plan_code not in plans:
+    if plan_code not in SUBSCRIPTION_PRICES:
         raise ValueError("Некорректный тариф подписки")
-    return plans[plan_code]
+    return SUBSCRIPTION_LABELS[plan_code]
 
 
-def _yookassa_receipt_provider_data(plan_code, amount):
+def _yookassa_receipt_provider_data(plan_code, duration_months, amount):
     if not YOOKASSA_RECEIPTS_ENABLED:
         return None
     try:
@@ -3170,7 +3398,7 @@ def _yookassa_receipt_provider_data(plan_code, amount):
 
     receipt = {
         "items": [{
-            "description": "Подписка на MAX_Parser — доступ к сервису на 30 дней",
+            "description": f"{SUBSCRIPTION_LABELS[plan_code]} — {SUBSCRIPTION_PERIOD_LABELS[duration_months]}",
             "quantity": "1.00",
             "amount": {
                 "value": f"{amount // 100}.{amount % 100:02d}",
@@ -3189,7 +3417,7 @@ def _yookassa_receipt_provider_data(plan_code, amount):
     return json.dumps({"receipt": receipt}, ensure_ascii=False)
 
 
-def _send_subscription_invoice(user_id, plan_code):
+def _send_subscription_invoice(user_id, plan_code, duration_months):
     if not TELEGRAM_PAYMENT_PROVIDER_TOKEN:
         bot.send_message(
             user_id,
@@ -3205,9 +3433,12 @@ def _send_subscription_invoice(user_id, plan_code):
             **NO_PREVIEW,
         )
         return False
-    amount, plan_description = _subscription_plan(plan_code)
+    if plan_code not in SUBSCRIPTION_PRICES or duration_months not in (1, 3, 12):
+        raise ValueError("Некорректный тариф или срок подписки")
+    amount = SUBSCRIPTION_PRICES[plan_code][duration_months] * 100
+    plan_description = _subscription_plan(plan_code)
     try:
-        provider_data = _yookassa_receipt_provider_data(plan_code, amount)
+        provider_data = _yookassa_receipt_provider_data(plan_code, duration_months, amount)
     except RuntimeError as error:
         debug_logger.error("YOOKASSA_RECEIPT_CONFIGURATION_INCOMPLETE: %s", error)
         bot.send_message(
@@ -3219,15 +3450,18 @@ def _send_subscription_invoice(user_id, plan_code):
         return False
 
     try:
-        payload = create_payment_order(user_id, plan_code, amount)
+        payload = create_payment_order(user_id, plan_code, amount, duration_months)
         invoice_options = {
             "chat_id": user_id,
-            "title": "MAX_Parser — подписка",
-            "description": f"Доступ к MAX_Parser на 30 дней · {plan_description}",
+            "title": "MAX_Parser · подписка",
+            "description": f"{plan_description} · {SUBSCRIPTION_PERIOD_LABELS[duration_months]}",
             "invoice_payload": payload,
             "provider_token": TELEGRAM_PAYMENT_PROVIDER_TOKEN,
             "currency": "RUB",
-            "prices": [types.LabeledPrice(label="Подписка на 30 дней", amount=amount)],
+            "prices": [types.LabeledPrice(
+                label=f"{SUBSCRIPTION_PERIOD_LABELS[duration_months]} · MAX_Parser",
+                amount=amount,
+            )],
             "start_parameter": payload,
             "need_email": YOOKASSA_RECEIPTS_ENABLED,
             "send_email_to_provider": YOOKASSA_RECEIPTS_ENABLED,
@@ -3300,9 +3534,17 @@ def show_approved_reviews(chat_id, message_id, page=0):
     review = reviews[page]
     created_at = review.get("created_at")
     date_label = created_at.strftime("%d.%m.%Y") if created_at else ""
+    if review.get("username"):
+        author_label = f"@{escape_html(review['username'])}"
+    else:
+        author_name = " ".join(
+            part for part in (review.get("first_name"), review.get("last_name")) if part
+        )
+        author_label = escape_html(author_name or "Пользователь MAX_Parser")
     review_text = escape_html(str(review.get("review_text") or "").strip()[:700])
     text = (
         f"⭐ <b>Отзывы о MAX_Parser</b> · {page + 1}/{len(reviews)}\n\n"
+        f"👤 <b>{author_label}</b>\n\n"
         f"<blockquote>{review_text}</blockquote>"
     )
     if date_label:
@@ -3310,9 +3552,9 @@ def show_approved_reviews(chat_id, message_id, page=0):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     row = []
     if page > 0:
-        row.append(types.InlineKeyboardButton("◀️", callback_data=f"reviews_page_{page - 1}"))
+        row.append(types.InlineKeyboardButton("◀️ Предыдущий", callback_data=f"reviews_page_{page - 1}"))
     if page + 1 < page_count:
-        row.append(types.InlineKeyboardButton("▶️", callback_data=f"reviews_page_{page + 1}"))
+        row.append(types.InlineKeyboardButton("Следующий ▶️", callback_data=f"reviews_page_{page + 1}"))
     if row:
         keyboard.row(*row)
     keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
@@ -3553,16 +3795,22 @@ def subscription_status_command(message):
     subscription = get_subscription(message.from_user.id)
     if subscription and subscription["active_until"] > datetime.now(timezone.utc):
         active_until = subscription["active_until"].astimezone(timezone.utc)
+        active_methods = []
+        if is_subscription_active(message.from_user.id, "self"):
+            active_methods.append("свой MAX-аккаунт")
+        if is_subscription_active(message.from_user.id, "project"):
+            active_methods.append("аккаунт проекта")
+        methods_label = " и ".join(active_methods) or "MAX_Parser"
         text = (
             "💳 <b>Ваша подписка MAX_Parser активна</b>\n\n"
+            f"Доступны: <b>{escape_html(methods_label)}</b>\n"
             f"Действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
-            "Подписка распространяется на все подключённые группы вашего аккаунта.\n\n"
-            "Продлить её можно заранее — оплаченный срок добавится к текущему."
+            "Продлите её заранее: новый срок добавится к действующему."
         )
     else:
         text = (
             "💳 <b>Активной подписки нет</b>\n\n"
-            "Выберите тариф, чтобы оформить доступ или продлить его."
+            "Выберите способ подключения и удобный срок. Мульти-подписка включает оба способа."
         )
     bot.send_message(
         message.chat.id,
@@ -3644,11 +3892,10 @@ def handle_successful_payment(message):
 
     active_until = result["active_until"].astimezone(timezone.utc)
     amount_rub = payment.total_amount / 100
-    plan_label = (
-        "Подключение через ваш аккаунт MAX"
-        if result["plan_code"] == "self"
-        else "Подключение через аккаунт проекта MAX"
-    )
+    plan_code = result["plan_code"]
+    duration_months = int(result["duration_months"])
+    plan_label = SUBSCRIPTION_LABELS[plan_code]
+    duration_label = SUBSCRIPTION_PERIOD_LABELS[duration_months]
     paid_at = datetime.fromtimestamp(message.date, tz=timezone.utc)
     provider_charge_id = escape_html(payment.provider_payment_charge_id or "не получен")
     fiscal_receipt_note = (
@@ -3656,19 +3903,20 @@ def handle_successful_payment(message):
         if YOOKASSA_RECEIPTS_ENABLED
         else "ℹ️ Это подтверждение оплаты от MAX_Parser. Фискальные чеки ЮKassa в текущих настройках не подключены."
     )
+    multi_note = "Мульти-подписка включает оба способа подключения.\n" if plan_code == "multi" else ""
     bot.send_message(
         user_id,
         "🧾 <b>Квитанция MAX_Parser</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "✅ <b>Статус:</b> оплачено\n"
-        "📦 <b>Услуга:</b> подписка на 30 дней\n"
+        f"📦 <b>Услуга:</b> подписка · {duration_label}\n"
         f"🔧 <b>Способ:</b> {plan_label}\n"
         f"💳 <b>Сумма:</b> {amount_rub:.2f} ₽\n"
         f"🕒 <b>Оплачено:</b> {paid_at:%d.%m.%Y %H:%M} UTC\n"
         f"📅 <b>Действует до:</b> {active_until:%d.%m.%Y %H:%M} UTC\n"
         f"🔖 <b>ID платежа:</b> <code>{provider_charge_id}</code>\n\n"
-        f"<blockquote>Доступ распространяется на все группы вашего аккаунта.\n"
-        "Автоматического списания нет — заранее напомню о продлении.</blockquote>\n"
+        f"<blockquote>Подписка распространяется на весь ваш аккаунт MAX_Parser и покрывает до {MAX_CUSTOMER_CHATS} подключённых чатов.\n"
+        f"{multi_note}Для подключения чата отправьте /connect. Автоматического списания нет — заранее напомню о продлении.</blockquote>\n"
         f"<i>{fiscal_receipt_note}</i>",
         parse_mode="HTML",
         **NO_PREVIEW,
@@ -3687,16 +3935,10 @@ def handle_successful_payment(message):
         pass
 
     if not get_user_chats(user_id):
-        pending_setup_modes[user_id] = result["plan_code"]
-        label = "ваш аккаунт MAX" if result["plan_code"] == "self" else "аккаунт проекта MAX"
-        bot.send_message(
-            user_id,
-            "Теперь можно подключить первую группу.\n\n"
-            f"Выбранный способ: <b>{label}</b>. Добавьте меня в нужную Telegram-группу и отправьте там /bind. "
-            "Если я уже нахожусь в ней, просто отправьте /bind. Затем пришлите ссылку на источник MAX.",
-            parse_mode="HTML",
-            **NO_PREVIEW,
-        )
+        if plan_code == "multi":
+            show_connection_method_picker(user_id)
+        else:
+            _start_customer_setup_prompt(user_id, plan_code, user_id)
 
 
 def subscription_reminder_loop():
@@ -3715,7 +3957,7 @@ def subscription_reminder_loop():
                         reply_markup=subscription_renewal_keyboard(),
                         **NO_PREVIEW,
                     )
-                    mark_subscription_reminder_sent(user_id)
+                    mark_subscription_reminder_sent(user_id, subscription["plan_code"])
                 except Exception as error:
                     debug_logger.error(
                         "SUBSCRIPTION_REMINDER_SEND_FAILED user_id=%s error_type=%s",
@@ -4461,7 +4703,7 @@ def _verify_project_chats_after_login(notify_chat_id):
 
 
 def _begin_customer_group_setup(chat_id, owner_id, account_mode):
-    if _user_needs_subscription(owner_id):
+    if _user_needs_subscription(owner_id, account_mode):
         pending_setup_modes.pop(owner_id, None)
         bot.send_message(
             owner_id,
@@ -4590,7 +4832,7 @@ def project_admin_source_url(message):
         _clear_project_invite_pending(chat_id, delete_admin_messages=True)
         bot.send_message(message.chat.id, "Настройка уже завершена или отменена. Новая ссылка не сохранена.", **NO_PREVIEW)
         return
-    if _user_needs_subscription(owner_id):
+    if _user_needs_subscription(owner_id, "project"):
         _clear_project_invite_pending(chat_id, delete_admin_messages=True)
         customer_setup_state.pop(owner_id, None)
         bot.send_message(
@@ -4669,7 +4911,7 @@ def customer_source_url(message):
     state = customer_setup_state.get(message.from_user.id)
     if not state:
         return
-    if _user_needs_subscription(message.from_user.id):
+    if _user_needs_subscription(message.from_user.id, state.get("mode")):
         _clear_project_invite_pending(int(state.get("chat_id") or 0), delete_admin_messages=True)
         customer_setup_state.pop(message.from_user.id, None)
         bot.send_message(
@@ -6106,29 +6348,51 @@ def admin_callbacks(call):
         )
     elif action == "admin_free_subscriptions":
         show_free_subscription_users(call.message.chat.id, call.message.message_id)
+        bot.register_next_step_handler(call.message, process_free_subscription_user_id)
     elif action.startswith("admin_free_sub_page_"):
         show_free_subscription_users(
             call.message.chat.id, call.message.message_id,
             int(action.rsplit("_", 1)[1]),
         )
-    elif action.startswith("admin_free_sub_user_"):
+        bot.register_next_step_handler(call.message, process_free_subscription_user_id)
+    elif action.startswith("admin_gift_separate_"):
         try:
             target_user_id = int(action.rsplit("_", 1)[1])
         except ValueError:
             bot.answer_callback_query(call.id, "Не удалось определить пользователя", show_alert=True)
             return
-        show_free_subscription_options(
-            call.message.chat.id, call.message.message_id, target_user_id
-        )
-    elif action.startswith("admin_free_sub_grant_"):
+        bot.answer_callback_query(call.id)
+        show_free_subscription_separate_options(call.message.chat.id, target_user_id)
+    elif action.startswith("admin_gift_multi_"):
         try:
-            parts = action.split("_")
-            plan_code, days_value, user_id_value = parts[4], parts[5], parts[6]
+            target_user_id = int(action.rsplit("_", 1)[1])
+            bot.answer_callback_query(call.id)
+            show_free_subscription_terms(call.message.chat.id, target_user_id, "multi")
+        except (ValueError, TypeError, IndexError) as error:
+            bot.answer_callback_query(call.id, "Некорректный пользователь", show_alert=True)
+            debug_logger.warning("ADMIN_FREE_SUBSCRIPTION_INVALID admin_id=%s error=%s", call.from_user.id, log_preview(error, 120))
+            return
+    elif action.startswith("admin_gift_plan_"):
+        parts = action.split("_")
+        if len(parts) != 5 or parts[3] not in {"self", "project"}:
+            bot.answer_callback_query(call.id, "Некорректный тариф", show_alert=True)
+            return
+        plan_code = parts[3]
+        try:
+            target_user_id = int(parts[4])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Некорректный пользователь", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        show_free_subscription_terms(call.message.chat.id, target_user_id, plan_code)
+    elif action.startswith("admin_gift_term_"):
+        try:
+            _, _, _, plan_code, months_value, user_id_value = action.split("_")
             target_user_id = int(user_id_value)
-            days = int(days_value)
-            if plan_code not in {"self", "project"} or days not in {30, 90, 365}:
+            months = int(months_value)
+            if plan_code not in {"self", "project", "multi"} or months not in {1, 3, 12}:
                 raise ValueError("invalid subscription choice")
-            granted = grant_subscription(target_user_id, plan_code, days)
+            granted = grant_subscription(target_user_id, plan_code, months)
         except (ValueError, TypeError, IndexError) as error:
             bot.answer_callback_query(call.id, "Не удалось выдать подписку", show_alert=True)
             debug_logger.warning("ADMIN_FREE_SUBSCRIPTION_INVALID admin_id=%s error=%s", call.from_user.id, log_preview(error, 120))
@@ -6139,15 +6403,16 @@ def admin_callbacks(call):
             return
 
         active_until = granted["active_until"].astimezone(timezone.utc)
-        plan_label = "ваш аккаунт MAX" if plan_code == "self" else "аккаунт проекта MAX"
+        plan_label = SUBSCRIPTION_LABELS[plan_code]
+        duration_label = SUBSCRIPTION_PERIOD_LABELS[months]
         delivery_note = ""
         try:
             bot.send_message(
                 target_user_id,
-                "🎁 <b>Вам выдан бесплатный доступ к MAX_Parser</b>\n\n"
-                f"Срок: <b>{days} дней</b> · способ: <b>{plan_label}</b>.\n"
-                f"Подписка действует до <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n\n"
-                "Подключить или посмотреть чаты можно через /connect и /mychats.",
+                "🎁 <b>Вам подарили подписку MAX_Parser</b>\n\n"
+                f"Тариф: <b>{escape_html(plan_label)}</b>\n"
+                f"Срок: <b>{duration_label}</b> · действует до <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n\n"
+                "Подключите чат через /connect. Мульти-подписка включает оба способа подключения.",
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
@@ -6156,12 +6421,14 @@ def admin_callbacks(call):
         text = (
             "✅ <b>Бесплатная подписка выдана</b>\n\n"
             f"Пользователь: <code>{target_user_id}</code>\n"
-            f"Срок: {days} дней · {plan_label}\n"
+            f"Тариф: {escape_html(plan_label)}\n"
+            f"Срок: {duration_label}\n"
             f"Действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>."
             f"{delivery_note}"
         )
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+        bot.answer_callback_query(call.id, "Подписка выдана")
         safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, **NO_PREVIEW)
     elif action == "admin_parse_diagnostics":
         show_parse_diagnostics(call.message.chat.id, call.message.message_id)
@@ -6200,6 +6467,10 @@ def admin_callbacks(call):
             pass
         return
     elif action == "admin_back":
+        try:
+            bot.clear_step_handler_by_chat_id(call.message.chat.id)
+        except Exception:
+            pass
         show_admin_menu(call.message.chat.id)
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -6483,14 +6754,12 @@ def callback_handler(call):
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=(
-                    "<b>Подключение MAX → Telegram</b>\n\n"
-                    "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
-                    "<blockquote><b>1️⃣ Ваш аккаунт MAX</b>\n"
-                    "Бот будет читать только выбранный вами чат. Авторизация сохраняется для этого подключения.</blockquote>\n"
-                    "<blockquote><b>2️⃣ Аккаунт проекта</b>\n"
-                    f"Добавьте аккаунт проекта <code>{MAX_PROJECT_ACCOUNT_PHONE}</code> в нужный MAX-чат. "
-                    "После отправки ссылки бот проверит, видит ли он сообщения.</blockquote>\n\n"
-                    "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
+                    "✨ <b>Подключите MAX к Telegram</b>\n\n"
+                    "Новые сообщения будут автоматически приходить в выбранную Telegram-группу. "
+                    "Сначала выберите удобный способ — затем срок подписки.\n\n"
+                    "<b>Мульти-подписка</b> открывает оба способа: свой MAX-аккаунт и аккаунт проекта. "
+                    "Подписка действует на весь ваш аккаунт MAX_Parser и включает до 5 чатов.\n\n"
+                    "Подробная пошаговая инструкция — по кнопке ниже."
                 ),
                 reply_markup=parser_keyboard(),
                 parse_mode="HTML",
@@ -6500,20 +6769,66 @@ def callback_handler(call):
             bot.answer_callback_query(call.id)
             bot.edit_message_text(
                 "<b>Чем отличаются способы подключения</b>\n\n"
-                "<b>1️⃣ Ваш аккаунт MAX · 250 ₽/мес</b>\n"
-                "Вы входите в свой MAX через QR-код или через номер телефона. Парсер читает выбранный вами чат, который доступен вашему аккаунту.\n"
-                "Подходит, если не хотите добавлять другой аккаунт в чат.\n\n"
-                "<b>2️⃣ Аккаунт проекта · 500 ₽/мес</b>\n"
+                "<b>1️⃣ Свой MAX-аккаунт</b>\n"
+                "1 месяц — 249 ₽ · 3 месяца — 599 ₽ · 1 год — 2 499 ₽.\n"
+                "Вы входите в свой MAX. Парсер читает выбранные вами чаты, которые доступны вашему аккаунту.\n"
+                "Подходит, если не хотите добавлять аккаунт проекта в чат.\n\n"
+                "<b>2️⃣ Аккаунт проекта</b>\n"
+                "1 месяц — 499 ₽ · 3 месяца — 1 199 ₽ · 1 год — 5 499 ₽.\n"
                 f"Используется готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
                 "Для группы его нужно добавить или пригласить, для канала — просто скинуть ссылку.\n"
-                "Вы не вводите данные своего MAX.",
+                "Вы не вводите данные своего MAX.\n\n"
+                "<b>✨ Мульти-подписка</b>\n"
+                "1 месяц — 599 ₽ · 3 месяца — 1 499 ₽ · 1 год — 6 499 ₽. Включает оба способа, "
+                "чтобы выбирать удобный вариант для каждого чата. "
+                "Любой тариф действует на весь аккаунт и покрывает до 5 чатов.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=parser_keyboard(),
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
-        elif call.data in ("renew_self", "renew_project"):
+        elif call.data == "subscription_products":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "💳 <b>Выберите тариф</b>\n\n"
+                "Все тарифы действуют на весь ваш аккаунт MAX_Parser и включают до 5 чатов. "
+                "Мульти-подписка открывает оба способа подключения.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=subscription_products_keyboard(),
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        elif call.data.startswith("subscription_product_"):
+            plan_code = call.data.rsplit("_", 1)[1]
+            if plan_code not in SUBSCRIPTION_PRICES:
+                bot.answer_callback_query(call.id, "Не удалось определить тариф", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            show_subscription_terms(
+                call.message.chat.id,
+                call.message.message_id,
+                plan_code,
+                back_callback="subscription_products",
+            )
+        elif call.data.startswith("subscription_buy_"):
+            parts = call.data.split("_")
+            try:
+                plan_code = parts[2]
+                months = int(parts[3])
+                if plan_code not in SUBSCRIPTION_PRICES or months not in (1, 3, 12):
+                    raise ValueError("invalid product")
+            except (ValueError, IndexError):
+                bot.answer_callback_query(call.id, "Не удалось определить тариф", show_alert=True)
+                return
+            if call.message.chat.type != "private":
+                bot.answer_callback_query(call.id, "Оплатить можно в личном чате с ботом.", show_alert=True)
+                return
+            track_user(call)
+            bot.answer_callback_query(call.id, "Готовлю счёт")
+            _send_subscription_invoice(call.from_user.id, plan_code, months)
+        elif call.data in ("connect_self", "connect_project", "connect_multi"):
             if not call.message or call.message.chat.type != "private":
                 bot.answer_callback_query(
                     call.id,
@@ -6521,52 +6836,45 @@ def callback_handler(call):
                     show_alert=True,
                 )
                 return
-            mode = "self" if call.data == "renew_self" else "project"
+            plan_code = call.data.removeprefix("connect_")
             track_user(call)
-            bot.answer_callback_query(call.id, "Готовлю счёт")
-            _send_subscription_invoice(call.from_user.id, mode)
-        elif call.data in ("my_acc_250", "not_my_acc_250"):
-            if call.message.chat.type != "private":
-                bot.answer_callback_query(
-                    call.id,
-                    "Откройте личный чат с ботом, чтобы настроить подключение.",
-                    show_alert=True,
-                )
-                return
-            mode = "self" if call.data == "my_acc_250" else "project"
-            track_user(call)
-            if len(get_user_chats(call.from_user.id)) >= MAX_CUSTOMER_CHATS:
-                bot.answer_callback_query(call.id, "Достигнут лимит подключений", show_alert=True)
-                bot.send_message(call.from_user.id, _chat_limit_notice(), **NO_PREVIEW)
-                return
-            if _user_needs_subscription(call.from_user.id):
-                bot.answer_callback_query(call.id, "Сначала оформите подписку")
-                _send_subscription_invoice(call.from_user.id, mode)
-                return
-            pending_setup_modes[call.from_user.id] = mode
-            label = "настройку своего аккаунта MAX" if mode == "self" else "настройку через готовый аккаунт"
-            bot.answer_callback_query(call.id, "Настройка запущена")
-            bot.send_message(
+            bot.answer_callback_query(call.id)
+            _begin_connection_for_plan(
                 call.from_user.id,
-                f"<b>Шаг 1 из {2 if mode == 'project' else 3} · Telegram-группа</b>\n\n"
-                f"Вы выбрали: <b>{label}</b>. Добавьте меня в Telegram-группу, в которую я буду присылать сообщения. "
-                "Когда я появлюсь в группе, настройка продолжится автоматически. Если я уже состою в ней, то "
-                "напишите в группе команду /bind.\n\n"
-                "Убедитесь, что мне разрешено отправлять сообщения. Чтобы остановить настройку, нажмите «❌ Отмена».",
-                parse_mode="HTML",
-                reply_markup=get_cancel_keyboard(),
-                **NO_PREVIEW,
+                plan_code,
+                call.message.chat.id,
+                call.message.message_id,
             )
-            try:
-                bot.edit_message_text(
-                    "Настройка начата. Продолжите её в вашей Telegram-группе; подробная инструкция доступна по кнопке ниже.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=parser_keyboard(),
-                    **NO_PREVIEW,
-                )
-            except Exception:
-                pass
+        elif call.data in ("setup_mode_self", "setup_mode_project"):
+            account_mode = "self" if call.data.endswith("self") else "project"
+            if call.message.chat.type != "private":
+                bot.answer_callback_query(call.id, "Откройте личный чат с ботом.", show_alert=True)
+                return
+            if PAYMENTS_ENABLED and not _user_has_product_access(call.from_user.id, "multi"):
+                bot.answer_callback_query(call.id, "Для мульти-подписки сначала завершите оплату.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            _start_customer_setup_prompt(
+                call.from_user.id,
+                account_mode,
+                call.message.chat.id,
+                call.message.message_id,
+            )
+        elif call.data in ("renew_self", "renew_project"):
+            # Backward compatibility for old renewal buttons still in chat history.
+            plan_code = "self" if call.data == "renew_self" else "project"
+            bot.answer_callback_query(call.id)
+            show_subscription_terms(
+                call.message.chat.id, call.message.message_id, plan_code,
+                back_callback="subscription_products",
+            )
+        elif call.data in ("my_acc_250", "not_my_acc_250"):
+            # Backward compatibility for old connection buttons.
+            plan_code = "self" if call.data == "my_acc_250" else "project"
+            bot.answer_callback_query(call.id)
+            _begin_connection_for_plan(
+                call.from_user.id, plan_code, call.message.chat.id, call.message.message_id
+            )
         elif call.data == "support_start":
             bot.answer_callback_query(call.id)
             start_support(call.message.chat.id, call.from_user)

@@ -101,7 +101,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS telegram_payment_orders (
                 payload TEXT PRIMARY KEY,
                 user_id BIGINT NOT NULL,
-                plan_code TEXT NOT NULL CHECK (plan_code IN ('self', 'project')),
+                plan_code TEXT NOT NULL CHECK (plan_code IN ('self', 'project', 'multi')),
+                duration_months SMALLINT NOT NULL DEFAULT 1 CHECK (duration_months IN (1, 3, 12)),
                 amount BIGINT NOT NULL CHECK (amount > 0),
                 currency VARCHAR(3) NOT NULL DEFAULT 'RUB',
                 status TEXT NOT NULL DEFAULT 'pending'
@@ -119,6 +120,30 @@ def init_db():
             ON telegram_payment_orders (user_id, created_at DESC)
         """)
 
+        # Existing installations may still have the original two-plan constraint.
+        conn.execute("""
+            ALTER TABLE telegram_payment_orders
+            DROP CONSTRAINT IF EXISTS telegram_payment_orders_plan_code_check
+        """)
+        conn.execute("""
+            ALTER TABLE telegram_payment_orders
+            ADD CONSTRAINT telegram_payment_orders_plan_code_check
+            CHECK (plan_code IN ('self', 'project', 'multi'))
+        """)
+        conn.execute("""
+            ALTER TABLE telegram_payment_orders
+            ADD COLUMN IF NOT EXISTS duration_months SMALLINT NOT NULL DEFAULT 1
+        """)
+        conn.execute("""
+            ALTER TABLE telegram_payment_orders
+            DROP CONSTRAINT IF EXISTS telegram_payment_orders_duration_months_check
+        """)
+        conn.execute("""
+            ALTER TABLE telegram_payment_orders
+            ADD CONSTRAINT telegram_payment_orders_duration_months_check
+            CHECK (duration_months IN (1, 3, 12))
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS telegram_subscriptions (
                 user_id BIGINT PRIMARY KEY,
@@ -127,6 +152,40 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 reminder_sent_at TIMESTAMPTZ
             )
+        """)
+
+        # Keep independent access periods for the two single-method products and
+        # the multi subscription. This prevents one purchase from overwriting
+        # another active product.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_subscription_entitlements (
+                user_id BIGINT NOT NULL,
+                plan_code TEXT NOT NULL CHECK (plan_code IN ('self', 'project', 'multi')),
+                active_until TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reminder_sent_at TIMESTAMPTZ,
+                PRIMARY KEY (user_id, plan_code)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telegram_subscription_entitlements_active_until
+            ON telegram_subscription_entitlements (active_until)
+        """)
+        # Migrate the previous one-subscription-per-user records idempotently.
+        conn.execute("""
+            INSERT INTO telegram_subscription_entitlements
+                (user_id, plan_code, active_until, updated_at, reminder_sent_at)
+            SELECT user_id, plan_code, active_until, updated_at, reminder_sent_at
+            FROM telegram_subscriptions
+            ON CONFLICT (user_id, plan_code) DO UPDATE SET
+                active_until = GREATEST(
+                    telegram_subscription_entitlements.active_until,
+                    EXCLUDED.active_until
+                ),
+                updated_at = GREATEST(
+                    telegram_subscription_entitlements.updated_at,
+                    EXCLUDED.updated_at
+                )
         """)
 
         conn.execute("""
@@ -149,6 +208,27 @@ def init_db():
             ADD CONSTRAINT customer_reviews_status_check CHECK (status IN (
                 'eligible', 'invited', 'writing', 'pending', 'approved', 'rejected', 'skipped'
             ))
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Existing review text was test data. Clear it once while preserving
+        # each user's eligibility state so they are not prompted a second time.
+        conn.execute("""
+            WITH inserted AS (
+                INSERT INTO app_migrations (version)
+                VALUES ('2026-10-clear-test-approved-reviews')
+                ON CONFLICT (version) DO NOTHING
+                RETURNING version
+            )
+            UPDATE customer_reviews
+            SET status = 'skipped', review_text = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE (review_text IS NOT NULL OR status = 'approved')
+              AND EXISTS (SELECT 1 FROM inserted)
         """)
 
 #! ============ АДМИНЫ ============
@@ -184,26 +264,25 @@ def delete_admin(user_id: int):
         return cursor.rowcount == 1
 
 
-def grant_subscription(user_id: int, plan_code: str, days: int):
-    """Grant a free subscription, extending any time that is still active."""
-    if plan_code not in {"self", "project"}:
+def grant_subscription(user_id: int, plan_code: str, months: int):
+    """Grant a free product subscription, extending its active period."""
+    if plan_code not in {"self", "project", "multi"}:
         raise ValueError("Некорректный тариф подписки")
-    days = int(days)
-    if days < 1 or days > 3650:
-        raise ValueError("Срок подписки должен быть от 1 до 3650 дней")
+    months = int(months)
+    if months not in {1, 3, 12}:
+        raise ValueError("Срок подписки должен быть 1, 3 или 12 месяцев")
     with get_connection() as conn:
         return conn.execute("""
-            INSERT INTO telegram_subscriptions (user_id, plan_code, active_until)
-            VALUES (%s, %s, CURRENT_TIMESTAMP + (%s * INTERVAL '1 day'))
-            ON CONFLICT (user_id) DO UPDATE SET
-                plan_code = EXCLUDED.plan_code,
+            INSERT INTO telegram_subscription_entitlements (user_id, plan_code, active_until)
+            VALUES (%s, %s, CURRENT_TIMESTAMP + (%s * INTERVAL '1 month'))
+            ON CONFLICT (user_id, plan_code) DO UPDATE SET
                 active_until = GREATEST(
-                    telegram_subscriptions.active_until, CURRENT_TIMESTAMP
-                ) + (%s * INTERVAL '1 day'),
+                    telegram_subscription_entitlements.active_until, CURRENT_TIMESTAMP
+                ) + (%s * INTERVAL '1 month'),
                 updated_at = CURRENT_TIMESTAMP,
                 reminder_sent_at = NULL
             RETURNING user_id, plan_code, active_until
-        """, (int(user_id), plan_code, days, days)).fetchone()
+        """, (int(user_id), plan_code, months, months)).fetchone()
 
 
 #! ============ ПОЛЬЗОВАТЕЛИ ============
@@ -368,9 +447,14 @@ def moderate_review(user_id: int, decision: str):
 def get_approved_reviews():
     with get_connection() as conn:
         return list(conn.execute("""
-            SELECT user_id, review_text, created_at
-            FROM customer_reviews WHERE status = 'approved'
-            ORDER BY created_at DESC
+            SELECT r.user_id, r.review_text, r.created_at, u.username,
+                   u.first_name, u.last_name
+            FROM customer_reviews AS r
+            LEFT JOIN users AS u ON u.user_id = r.user_id
+            WHERE r.status = 'approved'
+              AND r.review_text IS NOT NULL
+              AND LENGTH(BTRIM(r.review_text)) > 0
+            ORDER BY r.created_at DESC
         """).fetchall())
 
 
@@ -543,22 +627,28 @@ def get_global_stats():
 
 #! ============ TELEGRAM PAYMENTS / SUBSCRIPTIONS ============
 
-def create_payment_order(user_id: int, plan_code: str, amount: int) -> str:
-    if plan_code not in ("self", "project"):
+def create_payment_order(
+    user_id: int, plan_code: str, amount: int, duration_months: int = 1
+) -> str:
+    if plan_code not in ("self", "project", "multi"):
         raise ValueError("Некорректный тариф")
+    duration_months = int(duration_months)
+    if duration_months not in {1, 3, 12}:
+        raise ValueError("Некорректный срок подписки")
     payload = f"maxparser_{uuid.uuid4().hex}"
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO telegram_payment_orders (payload, user_id, plan_code, amount)
-            VALUES (%s, %s, %s, %s)
-        """, (payload, int(user_id), plan_code, int(amount)))
+            INSERT INTO telegram_payment_orders
+                (payload, user_id, plan_code, duration_months, amount)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (payload, int(user_id), plan_code, duration_months, int(amount)))
     return payload
 
 
 def get_payment_order(payload: str):
     with get_connection() as conn:
         return conn.execute("""
-            SELECT payload, user_id, plan_code, amount, currency, status,
+            SELECT payload, user_id, plan_code, duration_months, amount, currency, status,
                    created_at, expires_at, paid_at,
                    provider_payment_charge_id, telegram_payment_charge_id
             FROM telegram_payment_orders
@@ -597,7 +687,7 @@ def complete_payment_order(
     with get_connection() as conn:
         with conn.transaction():
             order = conn.execute("""
-                SELECT payload, user_id, plan_code, amount, currency, status
+                SELECT payload, user_id, plan_code, duration_months, amount, currency, status
                 FROM telegram_payment_orders
                 WHERE payload = %s
                 FOR UPDATE
@@ -613,23 +703,27 @@ def complete_payment_order(
                 return {
                     "already_paid": True,
                     "plan_code": order["plan_code"],
+                    "duration_months": order["duration_months"],
                     "active_until": subscription["active_until"] if subscription else None,
                 }
             if order["status"] != "checkout":
                 raise ValueError("Счёт не был подтверждён перед оплатой")
 
             subscription = conn.execute("""
-                INSERT INTO telegram_subscriptions (user_id, plan_code, active_until)
-                VALUES (%s, %s, CURRENT_TIMESTAMP + INTERVAL '30 days')
-                ON CONFLICT (user_id) DO UPDATE SET
-                    plan_code = EXCLUDED.plan_code,
+                INSERT INTO telegram_subscription_entitlements
+                    (user_id, plan_code, active_until)
+                VALUES (%s, %s, CURRENT_TIMESTAMP + (%s * INTERVAL '1 month'))
+                ON CONFLICT (user_id, plan_code) DO UPDATE SET
                     active_until = GREATEST(
-                        telegram_subscriptions.active_until, CURRENT_TIMESTAMP
-                    ) + INTERVAL '30 days',
+                        telegram_subscription_entitlements.active_until, CURRENT_TIMESTAMP
+                    ) + (%s * INTERVAL '1 month'),
                     updated_at = CURRENT_TIMESTAMP,
                     reminder_sent_at = NULL
                 RETURNING active_until
-            """, (int(user_id), order["plan_code"])).fetchone()
+            """, (
+                int(user_id), order["plan_code"], int(order["duration_months"]),
+                int(order["duration_months"]),
+            )).fetchone()
 
             conn.execute("""
                 UPDATE telegram_payment_orders
@@ -646,6 +740,7 @@ def complete_payment_order(
             return {
                 "already_paid": False,
                 "plan_code": order["plan_code"],
+                "duration_months": order["duration_months"],
                 "active_until": subscription["active_until"],
             }
 
@@ -654,35 +749,64 @@ def get_subscription(user_id: int):
     with get_connection() as conn:
         return conn.execute("""
             SELECT user_id, plan_code, active_until, updated_at, reminder_sent_at
-            FROM telegram_subscriptions
+            FROM telegram_subscription_entitlements
             WHERE user_id = %s
+            ORDER BY active_until DESC
+            LIMIT 1
         """, (int(user_id),)).fetchone()
 
 
-def is_subscription_active(user_id: int) -> bool:
+def is_subscription_active(user_id: int, account_mode: str = None) -> bool:
+    if account_mode not in (None, "self", "project"):
+        raise ValueError("Некорректный способ подключения")
     with get_connection() as conn:
-        row = conn.execute("""
-            SELECT 1 AS active
-            FROM telegram_subscriptions
-            WHERE user_id = %s AND active_until > CURRENT_TIMESTAMP
-        """, (int(user_id),)).fetchone()
+        if account_mode is None:
+            row = conn.execute("""
+                SELECT 1 AS active
+                FROM telegram_subscription_entitlements
+                WHERE user_id = %s AND active_until > CURRENT_TIMESTAMP
+                LIMIT 1
+            """, (int(user_id),)).fetchone()
+        else:
+            row = conn.execute("""
+                SELECT 1 AS active
+                FROM telegram_subscription_entitlements
+                WHERE user_id = %s
+                  AND plan_code IN (%s, 'multi')
+                  AND active_until > CURRENT_TIMESTAMP
+                LIMIT 1
+            """, (int(user_id), account_mode)).fetchone()
         return row is not None
 
 
 def get_active_subscription_user_ids():
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT user_id FROM telegram_subscriptions
+            SELECT DISTINCT user_id FROM telegram_subscription_entitlements
             WHERE active_until > CURRENT_TIMESTAMP
         """).fetchall()
         return {int(row["user_id"]) for row in rows}
+
+
+def get_active_subscription_access():
+    """Return each user's currently active product entitlements."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT user_id, plan_code
+            FROM telegram_subscription_entitlements
+            WHERE active_until > CURRENT_TIMESTAMP
+        """).fetchall()
+        access = {}
+        for row in rows:
+            access.setdefault(int(row["user_id"]), set()).add(row["plan_code"])
+        return access
 
 
 def get_due_subscription_reminders():
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT user_id, plan_code, active_until
-            FROM telegram_subscriptions
+            FROM telegram_subscription_entitlements
             WHERE active_until > CURRENT_TIMESTAMP
               AND active_until <= CURRENT_TIMESTAMP + INTERVAL '3 days'
               AND reminder_sent_at IS NULL
@@ -691,16 +815,17 @@ def get_due_subscription_reminders():
         return list(rows)
 
 
-def mark_subscription_reminder_sent(user_id: int):
+def mark_subscription_reminder_sent(user_id: int, plan_code: str):
     with get_connection() as conn:
         conn.execute("""
-            UPDATE telegram_subscriptions
+            UPDATE telegram_subscription_entitlements
             SET reminder_sent_at = CURRENT_TIMESTAMP
             WHERE user_id = %s
+              AND plan_code = %s
               AND active_until > CURRENT_TIMESTAMP
               AND active_until <= CURRENT_TIMESTAMP + INTERVAL '3 days'
               AND reminder_sent_at IS NULL
-        """, (int(user_id),))
+        """, (int(user_id), plan_code))
 
 
 
