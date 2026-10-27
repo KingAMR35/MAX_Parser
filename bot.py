@@ -3933,14 +3933,18 @@ def _project_source_instructions(owner_id, source_type, chat_id):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     if source_type == "group":
         keyboard.add(types.InlineKeyboardButton(
-            "Не могу добавить аккаунт",
+            "🔗 Ссылка приглашения",
+            callback_data=f"project_help_invite_{chat_id}",
+        ))
+        keyboard.add(types.InlineKeyboardButton(
+            "Не могу добавить в чат",
             callback_data=f"project_add_help_{chat_id}",
         ))
         text = (
             "<b>Шаг 2 из 2 · Группа или чат</b>\n\n"
             f"Сначала добавьте в группу аккаунт проекта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
-            "Затем отправьте сюда обычную ссылку на чат MAX. Если добавить аккаунт нельзя, нажмите «Не могу добавить аккаунт»: "
-            "там можно передать приглашение администратору проекта для ручного вступления.\n\n"
+            "Затем отправьте сюда обычную ссылку на чат MAX. Если у вас есть ссылка-приглашение, нажмите «Ссылка приглашения». "
+            "Если аккаунт добавить не получается, нажмите «Не могу добавить в чат».\n\n"
             "Если MAX отправит запрос на вступление, владелец или администратор должен его одобрить. "
             "После ссылки бот проверит, что аккаунт действительно видит сообщения, и только потом включит пересылку."
         )
@@ -3970,10 +3974,6 @@ def _project_cannot_add_prompt(owner_id, chat_id):
     setup_state.update({"source_type": "group", "screen": "cannot_add"})
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
-        "🔗 Передать приглашение",
-        callback_data=f"project_help_invite_{chat_id}",
-    ))
-    keyboard.add(types.InlineKeyboardButton(
         "💬 Написать в поддержку",
         callback_data=f"project_help_support_{chat_id}",
     ))
@@ -3983,11 +3983,9 @@ def _project_cannot_add_prompt(owner_id, chat_id):
     ))
     keyboard.add(_setup_cancel_button(chat_id))
     text = (
-        "Не получается добавить аккаунт проекта?\n\n"
-        "Если у вас есть ссылка-приглашение, нажмите «Передать приглашение» и отправьте её боту. "
-        "Бот передаст её администратору проекта. Он вручную откроет ссылку и попробует вступить. "
-        "Если MAX отправит заявку, владелец или администратор должен её одобрить. После вступления понадобится обычная ссылка на чат.\n\n"
-        "Если приглашения нет или нужна помощь, нажмите «Написать в поддержку».\n\n"
+        "Не получается добавить аккаунт проекта в чат?\n\n"
+        "Напишите в поддержку — поможем выбрать способ подключения. Если MAX отправит запрос на вступление, "
+        "его должен одобрить владелец или администратор. После вступления понадобится обычная ссылка на чат.\n\n"
         "В закрытую группу аккаунт проекта сможет войти, только если владелец или администратор добавит его "
         "либо разрешит вступить по ссылке. Без такого доступа MAX не покажет сообщения для пересылки."
     )
@@ -4005,8 +4003,8 @@ def _project_invite_prompt(owner_id, chat_id):
         "💬 Написать в поддержку",
         callback_data=f"project_help_support_{chat_id}",
     ))
-    back_action = "project_back_channel" if source_type == "channel" else "project_back_help"
-    back_label = "🔙 Назад к шагу канала" if source_type == "channel" else "🔙 Назад к вариантам"
+    back_action = "project_back_channel" if source_type == "channel" else "project_back_group"
+    back_label = "🔙 Назад к шагу канала" if source_type == "channel" else "🔙 Назад к шагу группы"
     keyboard.add(types.InlineKeyboardButton(back_label, callback_data=f"{back_action}_{chat_id}"))
     keyboard.add(_setup_cancel_button(chat_id))
     return (
@@ -4117,8 +4115,8 @@ def _forward_project_invite_to_admin(owner_id, chat_id, invite_url):
     try:
         sent = bot.send_message(
             owner_id,
-            "✅ Ссылка-приглашение передана администратору проекта. "
-            f"Когда он вручную вступит в {source_label}, он сам отправит мне обычную ссылку. Вам больше ничего присылать не нужно.",
+            "✅ Ссылка-приглашение передана! "
+            f"Пожалуйста, ожидайте!",
             reply_markup=status_keyboard,
             **NO_PREVIEW,
         )
@@ -4274,7 +4272,7 @@ def _verify_project_chat_access(
 
     def report(text, reply_markup=None):
         if not destination:
-            return
+            return False
         if report_message_id:
             try:
                 bot.edit_message_text(
@@ -4286,20 +4284,28 @@ def _verify_project_chat_access(
                 )
                 if reply_markup is not None:
                     remember_status_message(report_message_id)
-                return
+                return True
             except Exception as error:
                 debug_logger.info(
                     "PROJECT_ACCESS_STATUS_EDIT_FAILED chat_id=%s error_type=%s",
                     chat_id, type(error).__name__,
                 )
-        sent = bot.send_message(
-            destination,
-            text,
-            reply_markup=reply_markup,
-            **NO_PREVIEW,
-        )
-        if reply_markup is not None:
-            remember_status_message(sent.message_id)
+        try:
+            sent = bot.send_message(
+                destination,
+                text,
+                reply_markup=reply_markup,
+                **NO_PREVIEW,
+            )
+            if reply_markup is not None:
+                remember_status_message(sent.message_id)
+            return True
+        except Exception as error:
+            debug_logger.warning(
+                "PROJECT_ACCESS_STATUS_SEND_FAILED chat_id=%s destination=%s error_type=%s",
+                chat_id, destination, type(error).__name__,
+            )
+            return False
 
     def clear_project_access_buttons():
         tracked = project_access_message_ids.pop(int(chat_id), set())
@@ -4361,10 +4367,20 @@ def _verify_project_chat_access(
                 bot.edit_message_reply_markup(owner_id, setup_prompt_id, reply_markup=None)
             except Exception:
                 pass
-        report(
-            "✅ Доступ проверен: MAX показал сообщения этого чата. Пересылка включена.\n\n"
-            "Бот будет пересылать новые сообщения. История чата не отправляется."
-        )
+        report("✅ Проверка завершена. MAX открыл источник, пересылка включена.")
+        try:
+            bot.send_message(
+                owner_id,
+                "🎉 Подключение завершено!\n\n"
+                "MAX открыл источник, и пересылка включена. Бот будет отправлять сообщения "
+                "в выбранную Telegram-группу.",
+                **NO_PREVIEW,
+            )
+        except Exception as notify_error:
+            debug_logger.error(
+                "PROJECT_ACCESS_SUCCESS_NOTIFY_FAILED chat_id=%s owner_id=%s error_type=%s",
+                chat_id, owner_id, type(notify_error).__name__,
+            )
         clear_project_access_buttons()
         refresh_chat_list()
         if owner_id > 0 and not is_admin(owner_id):
@@ -4400,8 +4416,8 @@ def _verify_project_chat_access(
         elif "MAX_INVITE_JOIN_REQUIRED" in str(error):
             access_message = (
                 "Аккаунту проекта пока не удалось вступить в этот чат. Попросите владельца или администратора "
-                "добавить его. Если есть ссылка-приглашение, нажмите «Не могу добавить аккаунт», "
-                "чтобы передать её администратору проекта для ручного вступления."
+                "добавить его. Если есть ссылка-приглашение, вернитесь к шагу группы и нажмите "
+                "«Ссылка приглашения», чтобы передать её администратору проекта."
             )
         elif "MAX_CHAT_NO_MESSAGES" in str(error):
             access_message = (
@@ -4685,8 +4701,8 @@ def customer_source_url(message):
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         if mode == "project":
             if state.get("screen") == "invite":
-                back_action = "project_back_channel" if state.get("source_type") == "channel" else "project_back_help"
-                back_label = "🔙 Назад к шагу канала" if state.get("source_type") == "channel" else "🔙 Назад к вариантам"
+                back_action = "project_back_channel" if state.get("source_type") == "channel" else "project_back_group"
+                back_label = "🔙 Назад к шагу канала" if state.get("source_type") == "channel" else "🔙 Назад к шагу группы"
             else:
                 back_action = "project_back_type"
                 back_label = "🔙 Назад к выбору источника"
@@ -5252,11 +5268,17 @@ def admin_callbacks(call):
                     bot.edit_message_reply_markup(owner_id, int(prompt_id), reply_markup=invite_keyboard)
                 except Exception:
                     pass
+            retry_keyboard = types.InlineKeyboardMarkup(row_width=1)
+            retry_keyboard.add(types.InlineKeyboardButton(
+                "🔁 Подключить ещё раз",
+                callback_data=f"project_help_invite_{invite_chat_id}",
+            ))
             bot.send_message(
                 owner_id,
                 "⚠️ Администратору не удалось вступить по этой ссылке. Проверьте, что ссылка ещё действует "
                 "и разрешает вступление, затем отправьте новую. Если MAX прислал заявку, попросите владельца "
                 "или администратора её одобрить.",
+                reply_markup=retry_keyboard,
                 **NO_PREVIEW,
             )
         return

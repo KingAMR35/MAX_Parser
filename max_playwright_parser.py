@@ -38,6 +38,8 @@ message_cache_by_chat = {}
 photo_cache_by_chat = {}
 recent_post_hashes_by_chat = {}
 message_signatures_by_chat = {}
+message_baseline_by_chat = {}
+MESSAGE_CACHE_LOCK = threading.RLock()
 
 
 def _strip_browser_video_fallback(text: str) -> str:
@@ -168,6 +170,66 @@ def _message_datetime(message: dict):
     if parsed_time is None:
         parsed_time = datetime.min.time()
     return datetime.combine(parsed_date, parsed_time)
+
+
+def _message_baseline_identity(message: dict) -> str:
+    """Identity used only to keep a chat's initial history boundary."""
+    source_id = str((message or {}).get("source_id") or "").strip()
+    if source_id and not (message or {}).get("source_id_is_index"):
+        return f"id:{source_id}"
+    return f"sig:{_get_post_text_signature(_message_cache_stub(message or {}))}"
+
+
+def _build_message_baseline(messages: list[dict], initial_candidates: list[dict]) -> dict:
+    initial_ids = {_message_baseline_identity(message) for message in initial_candidates}
+    older_messages = [
+        message for message in messages
+        if _message_baseline_identity(message) not in initial_ids
+    ]
+    numeric_ids = []
+    for message in messages:
+        source_id = str(message.get("source_id") or "").strip()
+        if source_id and not message.get("source_id_is_index") and re.fullmatch(r"-?\d+", source_id):
+            numeric_ids.append(int(source_id))
+    newest_datetime = _message_datetime(messages[-1]) if messages else None
+    return {
+        "initialized": True,
+        "high_water_id": max(numeric_ids) if numeric_ids else None,
+        "initial_keys": sorted(initial_ids),
+        "older_keys": sorted({_message_baseline_identity(message) for message in older_messages}),
+        "boundary_datetime": newest_datetime.isoformat(timespec="minutes") if newest_datetime else "",
+    }
+
+
+def _message_is_before_initial_boundary(message: dict, baseline: dict) -> bool:
+    """Suppress pre-connection history while allowing the first three rows and later posts."""
+    identity = _message_baseline_identity(message)
+    initial_keys = set(baseline.get("initial_keys") or [])
+    if identity in initial_keys:
+        return False
+
+    source_id = str(message.get("source_id") or "").strip()
+    high_water_id = baseline.get("high_water_id")
+    if source_id and not message.get("source_id_is_index") and high_water_id is not None:
+        try:
+            if int(source_id) <= int(high_water_id):
+                return True
+            return False
+        except (TypeError, ValueError):
+            pass
+
+    if identity in set(baseline.get("older_keys") or []):
+        return True
+    boundary_text = str(baseline.get("boundary_datetime") or "").strip()
+    if boundary_text:
+        try:
+            boundary_datetime = datetime.fromisoformat(boundary_text)
+            message_datetime = _message_datetime(message)
+            if message_datetime is not None and message_datetime < boundary_datetime:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
 
 def _order_max_messages(messages: list[dict]) -> list[dict]:
@@ -1120,9 +1182,10 @@ def cancel_qr_login(login_session):
 #! ==========================================
 
 def load_message_cache():
-    global message_cache_by_chat, message_signatures_by_chat
+    global message_cache_by_chat, message_signatures_by_chat, message_baseline_by_chat
     message_cache_by_chat.clear()
     message_signatures_by_chat.clear()
+    message_baseline_by_chat.clear()
     if os.path.exists(SEEN_MESSAGES_FILE):
         try:
             with open(SEEN_MESSAGES_FILE, "r", encoding="utf-8") as f:
@@ -1132,18 +1195,41 @@ def load_message_cache():
                 message_cache_by_chat[0] = set(data.get('message_hashes', []))
                 for chat_id_str, signatures in data.get('signatures_by_chat', {}).items():
                     message_signatures_by_chat[int(chat_id_str)] = set(signatures)
+                for chat_id_str, baseline in data.get('baseline_by_chat', {}).items():
+                    if isinstance(baseline, dict) and baseline.get("initialized"):
+                        message_baseline_by_chat[int(chat_id_str)] = baseline
         except Exception:
             message_cache_by_chat = {}
+            message_baseline_by_chat = {}
 
 def save_message_cache():
+    temp_path = None
     try:
-        with open(SEEN_MESSAGES_FILE, "w", encoding="utf-8") as f:
-            json.dump({
+        with MESSAGE_CACHE_LOCK:
+            payload = {
                 'by_chat': {str(k): list(v) for k, v in message_cache_by_chat.items()},
                 'signatures_by_chat': {str(k): list(v) for k, v in message_signatures_by_chat.items()},
-            }, f)
-    except Exception:
-        pass
+                'baseline_by_chat': {str(k): v for k, v in message_baseline_by_chat.items()},
+            }
+            cache_directory = os.path.dirname(os.path.abspath(SEEN_MESSAGES_FILE))
+            descriptor, temp_path = tempfile.mkstemp(
+                prefix=".seen_messages_", suffix=".tmp", dir=cache_directory
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(temp_path, SEEN_MESSAGES_FILE)
+            temp_path = None
+    except Exception as error:
+        debug_logger.warning(
+            "MESSAGE_CACHE_SAVE_FAILED error_type=%s",
+            type(error).__name__,
+        )
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 def load_photo_cache():
     global photo_cache_by_chat
@@ -1426,6 +1512,13 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
         print(f"⚠️ Некорректный chat_id в is_new_message: {chat_id}")
         return False
     cache = message_cache_by_chat.get(chat_id, set())
+    source_id = str(post.get("source_id") or "").strip()
+    if source_id and not post.get("source_id_is_index"):
+        # Stable MAX ids distinguish two legitimate posts with identical text
+        # and timestamps. Content signatures are only safe when MAX exposes no
+        # stable message id.
+        stable_id_hash = get_legacy_message_hash(post)
+        return bool(stable_id_hash and stable_id_hash not in cache)
     signature = _get_post_content_signature(post)
     known_signatures = message_signatures_by_chat.get(chat_id, set())
     if signature and signature in known_signatures:
@@ -1528,25 +1621,26 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
     return False
 
 def mark_message_seen(post: dict, chat_id: int = 0) -> None:
-    if chat_id not in message_cache_by_chat:
-        message_cache_by_chat[chat_id] = set()
-    if chat_id not in message_signatures_by_chat:
-        message_signatures_by_chat[chat_id] = set()
-    signature = _get_post_content_signature(post)
-    if signature:
-        message_signatures_by_chat[chat_id].add(signature)
-    text_signature = _get_post_text_signature(post)
-    if _has_media_independent_content(post) and text_signature:
-        message_signatures_by_chat[chat_id].add(text_signature)
-    msg_hash = get_message_hash(post)
-    if msg_hash:
-        message_cache_by_chat[chat_id].add(msg_hash)
-    text_hash = get_text_message_hash(post)
-    if text_hash:
-        message_cache_by_chat[chat_id].add(text_hash)
-    legacy_hash = get_legacy_message_hash(post)
-    if legacy_hash:
-        message_cache_by_chat[chat_id].add(legacy_hash)
+    with MESSAGE_CACHE_LOCK:
+        if chat_id not in message_cache_by_chat:
+            message_cache_by_chat[chat_id] = set()
+        if chat_id not in message_signatures_by_chat:
+            message_signatures_by_chat[chat_id] = set()
+        signature = _get_post_content_signature(post)
+        if signature:
+            message_signatures_by_chat[chat_id].add(signature)
+        text_signature = _get_post_text_signature(post)
+        if _has_media_independent_content(post) and text_signature:
+            message_signatures_by_chat[chat_id].add(text_signature)
+        msg_hash = get_message_hash(post)
+        if msg_hash:
+            message_cache_by_chat[chat_id].add(msg_hash)
+        text_hash = get_text_message_hash(post)
+        if text_hash:
+            message_cache_by_chat[chat_id].add(text_hash)
+        legacy_hash = get_legacy_message_hash(post)
+        if legacy_hash:
+            message_cache_by_chat[chat_id].add(legacy_hash)
 
 def is_new_media(data=None, chat_id: int = 0, url=None, media_hash=None) -> bool:
     if not isinstance(chat_id, int):
@@ -1572,17 +1666,21 @@ def mark_media_seen(data=None, chat_id: int = 0, url=None, media_hash=None) -> N
         photo_cache_by_chat[chat_id].add(media_hash)
 
 def clear_chat_cache(chat_id: int):
-    message_cache_by_chat.pop(chat_id, None)
-    message_signatures_by_chat.pop(chat_id, None)
+    with MESSAGE_CACHE_LOCK:
+        message_cache_by_chat.pop(chat_id, None)
+        message_signatures_by_chat.pop(chat_id, None)
+        message_baseline_by_chat.pop(chat_id, None)
     photo_cache_by_chat.pop(chat_id, None)
     recent_post_hashes_by_chat.pop(chat_id, None)
     save_message_cache()
     save_photo_cache()
 
 def clear_all_caches():
-    global message_cache_by_chat, photo_cache_by_chat, message_signatures_by_chat
-    message_cache_by_chat.clear()
-    message_signatures_by_chat.clear()
+    global message_cache_by_chat, photo_cache_by_chat, message_signatures_by_chat, message_baseline_by_chat
+    with MESSAGE_CACHE_LOCK:
+        message_cache_by_chat.clear()
+        message_signatures_by_chat.clear()
+        message_baseline_by_chat.clear()
     photo_cache_by_chat.clear()
     for filename in [SEEN_MESSAGES_FILE, PHOTO_CACHE_FILE]:
         if os.path.exists(filename):
@@ -6281,44 +6379,87 @@ def parse_max_group_media(
             all_messages and all_messages[0].get("dom_order_descending")
         )
         all_messages = _order_max_messages(all_messages)
-        first_connection = not message_cache_by_chat.get(chat_id) and not message_signatures_by_chat.get(chat_id)
+        baseline_state = message_baseline_by_chat.get(chat_id) or {}
+        first_connection = not bool(baseline_state.get("initialized"))
         if first_connection:
-            # A new/empty cache has no trustworthy high-water mark. Treat every
-            # older row as history. Only deliver the newest few when MAX gives
-            # them a usable, recent date; this prevents a reversed DOM from
-            # replaying the oldest cards as the initial batch.
-            now = datetime.now()
-            initial_candidates = all_messages[-MAX_FIRST_CONNECTION_MESSAGES:]
-            recent_initial = []
-            for candidate in initial_candidates:
-                candidate_datetime = _message_datetime(candidate)
-                age = now - candidate_datetime if candidate_datetime is not None else None
-                if age is not None and timedelta(0) <= age <= MAX_UNCACHED_MESSAGE_AGE:
-                    recent_initial.append(candidate)
-            recent_initial_ids = {id(candidate) for candidate in recent_initial}
-            baseline = [candidate for candidate in all_messages if id(candidate) not in recent_initial_ids]
-            for baseline_msg in baseline:
-                mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
-            if baseline:
-                save_message_cache()
-            all_messages = recent_initial
+            # Persist the boundary independently of delivery cache entries.
+            # Otherwise an empty/failed initial batch makes every polling cycle
+            # look like a first connection and replays the same three posts.
+            has_legacy_cache = bool(
+                message_cache_by_chat.get(chat_id)
+                or message_signatures_by_chat.get(chat_id)
+            )
+            cached_source_ids = []
+            migrated_known = 0
+            if has_legacy_cache:
+                cached_hashes = message_cache_by_chat.get(chat_id, set())
+                for candidate in all_messages:
+                    source_id = str(candidate.get("source_id") or "").strip()
+                    if (
+                        source_id
+                        and not candidate.get("source_id_is_index")
+                        and re.fullmatch(r"-?\d+", source_id)
+                        and get_legacy_message_hash(_message_cache_stub(candidate)) in cached_hashes
+                    ):
+                        cached_source_ids.append(int(source_id))
+
+            if cached_source_ids:
+                # Upgrade an existing cache without replaying history, while
+                # still catching up posts newer than its last known stable ID.
+                initial_candidates = []
+                baseline_state = _build_message_baseline(all_messages, initial_candidates)
+                baseline_state["high_water_id"] = max(cached_source_ids)
+                baseline_messages = []
+                migrated_new = []
+                for candidate in all_messages:
+                    if _message_is_before_initial_boundary(candidate, baseline_state):
+                        mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
+                        baseline_messages.append(candidate)
+                    elif (
+                        _message_can_be_prefiltered(candidate)
+                        and not is_new_message(_message_cache_stub(candidate), chat_id=chat_id)
+                    ):
+                        migrated_known += 1
+                    else:
+                        migrated_new.append(candidate)
+                initial_candidates = migrated_new
+            elif has_legacy_cache:
+                # If old cache entries cannot be matched to the visible stable
+                # IDs, prefer a quiet baseline over risking a replay of history.
+                initial_candidates = []
+                baseline_messages = all_messages
+                for baseline_msg in baseline_messages:
+                    mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
+                baseline_state = _build_message_baseline(all_messages, initial_candidates)
+            else:
+                # A genuinely new chat starts with exactly its latest three
+                # messages.
+                initial_candidates = all_messages[-MAX_FIRST_CONNECTION_MESSAGES:]
+                initial_candidate_ids = {id(candidate) for candidate in initial_candidates}
+                baseline_messages = [
+                    candidate for candidate in all_messages
+                    if id(candidate) not in initial_candidate_ids
+                ]
+                for baseline_msg in baseline_messages:
+                    mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
+                baseline_state = _build_message_baseline(all_messages, initial_candidates)
+            with MESSAGE_CACHE_LOCK:
+                message_baseline_by_chat[chat_id] = baseline_state
+            save_message_cache()
+            all_messages = initial_candidates
             debug_logger.info(
-                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s history_marked=%s initial_delivery=%s",
-                chat_id, len(baseline), len(all_messages),
+                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s legacy_cache=%s history_marked=%s known=%s initial_delivery=%s high_water_id=%s",
+                chat_id, has_legacy_cache, len(baseline_messages), migrated_known, len(all_messages),
+                baseline_state.get("high_water_id"),
             )
         else:
             unprocessed = []
             prefiltered = 0
-            stale_marked = 0
-            now = datetime.now()
+            history_marked = 0
             for candidate in all_messages:
-                candidate_datetime = _message_datetime(candidate)
-                if (
-                    candidate_datetime is not None
-                    and now - candidate_datetime > MAX_UNCACHED_MESSAGE_AGE
-                ):
+                if _message_is_before_initial_boundary(candidate, baseline_state):
                     mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
-                    stale_marked += 1
+                    history_marked += 1
                     continue
                 if (
                     _message_can_be_prefiltered(candidate)
@@ -6329,8 +6470,8 @@ def parse_max_group_media(
                 unprocessed.append(candidate)
             all_messages = unprocessed
             debug_logger.info(
-                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s stale=%s new=%s",
-                chat_id, len(cleaned), prefiltered, stale_marked, len(all_messages),
+                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s history=%s new=%s",
+                chat_id, len(cleaned), prefiltered, history_marked, len(all_messages),
             )
         print(f"[{chat_id}] После фильтрации: {len(all_messages)} сообщений (от старых к новым)")
 
