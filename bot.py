@@ -191,7 +191,7 @@ customer_setup_state = {}
 project_access_message_ids = {}
 project_invite_pending = {}
 project_admin_source_prompts = {}
-awaiting_review_text = set()
+awaiting_review_text = {}
 remote_auth_monitors = set()
 remote_auth_monitor_lock = threading.Lock()
 SUPPORT_END_TEXT = "✅ Завершить чат с поддержкой"
@@ -1689,7 +1689,10 @@ def process_single_chat(chat):
             )
         if chat.get("is_active") and owner_id > 0:
             try:
-                _maybe_offer_review(owner_id)
+                _maybe_offer_review(
+                    owner_id,
+                    f"{chat_id}:{chat.get('account_mode') or 'self'}",
+                )
             except Exception as notify_error:
                 debug_logger.warning(
                     "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
@@ -2070,7 +2073,10 @@ def _complete_login(target_chat_id, output_chat_id):
     elif chat and chat.get("owner_id"):
         owner_id = int(chat["owner_id"])
         try:
-            _offer_review_after_connection(owner_id)
+            _offer_review_after_connection(
+                owner_id,
+                f"{target_chat_id}:{chat.get('account_mode') or 'self'}",
+            )
         except Exception as error:
             debug_logger.warning(
                 "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
@@ -2190,7 +2196,10 @@ def do_qr_login(target_chat_id, admin_chat_id):
             ).start()
         elif chat and chat.get("owner_id"):
             owner_id = int(chat["owner_id"])
-            _offer_review_after_connection(owner_id)
+            _offer_review_after_connection(
+                owner_id,
+                f"{target_chat_id}:{chat.get('account_mode') or 'self'}",
+            )
         return
     if status == "error":
         bot.send_message(
@@ -2250,6 +2259,7 @@ def show_admin_menu(chat_id):
     kb.row(types.InlineKeyboardButton("👤 Отправить пользователю", callback_data="admin_send_to_user"))
     kb.add(types.InlineKeyboardButton("🎁 Бесплатная подписка", callback_data="admin_free_subscriptions"))
     kb.add(types.InlineKeyboardButton("🔧 Управление подпиской", callback_data="admin_revoke_subscriptions"))
+    kb.add(types.InlineKeyboardButton("🗑 Удалить отзывы", callback_data="admin_review_delete"))
     kb.add(types.InlineKeyboardButton("🔑 MAX-готовый аккаунт", callback_data="admin_project_login"))
     kb.add(types.InlineKeyboardButton("🗑 Очистить весь кэш", callback_data="admin_clear_cache", style="danger"))
     bot.send_message(chat_id, text, reply_markup=kb, **NO_PREVIEW)
@@ -3375,11 +3385,12 @@ def show_subscription_terms(chat_id, message_id, plan_code, back_callback="subsc
     if plan_code not in SUBSCRIPTION_PRICES:
         return
     title = SUBSCRIPTION_LABELS[plan_code]
+    chat_limit = MULTI_MAX_CUSTOMER_CHATS if plan_code == "multi" else MAX_CUSTOMER_CHATS
     text = (
         f"💳 <b>{escape_html(title)}</b>\n\n"
         f"{escape_html(_product_marketing_text(plan_code))}\n\n"
-        "Подписка действует на весь ваш аккаунт MAX_Parser и покрывает до 5 подключённых чатов.\n\n"
-        "Выберите срок подписки:"
+        f"<i>Подписка действует на весь ваш аккаунт MAX_Parser и покрывает до {chat_limit} подключённых чатов.</i>\n\n"
+        "<b>Выберите срок подписки:</b>"
     )
     safe_edit_message(
         text,
@@ -3427,8 +3438,11 @@ def _user_has_product_access(user_id, plan_code):
 
 
 def _begin_connection_for_plan(user_id, plan_code, chat_id, message_id=None):
-    if len(get_user_chats(user_id)) >= MAX_CUSTOMER_CHATS:
-        bot.send_message(chat_id, _chat_limit_notice(), **NO_PREVIEW)
+    chat_limit = get_customer_chat_limit(user_id)
+    if plan_code == "multi" and PAYMENTS_ENABLED:
+        chat_limit = max(chat_limit, MULTI_MAX_CUSTOMER_CHATS)
+    if len(get_user_chats(user_id)) >= chat_limit:
+        bot.send_message(chat_id, _chat_limit_notice(chat_limit), **NO_PREVIEW)
         return
     if plan_code == "multi" and _user_has_product_access(user_id, "multi"):
         show_connection_method_picker(chat_id, message_id)
@@ -3453,8 +3467,9 @@ def _begin_connection_for_plan(user_id, plan_code, chat_id, message_id=None):
 def _start_customer_setup_prompt(user_id, account_mode, chat_id, message_id=None):
     if account_mode not in {"self", "project"}:
         return
-    if len(get_user_chats(user_id)) >= MAX_CUSTOMER_CHATS:
-        bot.send_message(chat_id, _chat_limit_notice(), **NO_PREVIEW)
+    chat_limit = get_customer_chat_limit(user_id)
+    if len(get_user_chats(user_id)) >= chat_limit:
+        bot.send_message(chat_id, _chat_limit_notice(chat_limit), **NO_PREVIEW)
         return
     if _user_needs_subscription(user_id, account_mode):
         bot.send_message(
@@ -3596,15 +3611,15 @@ def _send_subscription_invoice(user_id, plan_code, duration_months):
         return False
 
 
-def _send_review_invitation(user_id):
-    if get_review_status(user_id) != "eligible" or not claim_review_invitation(user_id):
+def _send_review_invitation(user_id, review_id):
+    if get_review_entry_status(review_id) != "eligible" or not claim_review_entry_invitation(review_id):
         return False
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
-        "✍️ Оставить отзыв", callback_data=f"review_write_{int(user_id)}"
+        "✍️ Оставить отзыв", callback_data=f"review_write_{int(review_id)}"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        "Не хочу", callback_data=f"review_skip_{int(user_id)}"
+        "Не хочу", callback_data=f"review_skip_{int(review_id)}"
     ))
     try:
         bot.send_message(
@@ -3617,28 +3632,28 @@ def _send_review_invitation(user_id):
             **NO_PREVIEW,
         )
     except Exception:
-        release_review_invitation(user_id)
+        release_review_entry_invitation(review_id)
         raise
     return True
 
 
-def _maybe_offer_review(user_id):
-    status = get_review_status(user_id)
-    if status is None:
-        offer_review(user_id)
-        status = get_review_status(user_id)
+def _maybe_offer_review(user_id, connection_key):
+    entry = create_review_entry(int(user_id), str(connection_key))
+    if not entry:
+        return False
+    review_id = int(entry["review_id"])
+    status = entry["status"]
     if status == "eligible":
-        return _send_review_invitation(user_id)
+        return _send_review_invitation(user_id, review_id)
     return False
 
 
-def _offer_review_after_connection(user_id):
-    prepare_review_after_connection(int(user_id))
-    return _maybe_offer_review(int(user_id))
+def _offer_review_after_connection(user_id, connection_key):
+    return _maybe_offer_review(int(user_id), str(connection_key))
 
 
 def show_approved_reviews(chat_id, message_id, page=0):
-    reviews = get_approved_reviews()
+    reviews = get_approved_review_entries()
     if not reviews:
         text = "⭐ <b>Отзывы</b>\n\nПока отзывов нет."
         keyboard = types.InlineKeyboardMarkup()
@@ -3685,11 +3700,78 @@ def show_approved_reviews(chat_id, message_id, page=0):
     )
 
 
-def _send_review_for_moderation(user_id, review_text):
+def show_admin_review_delete_list(chat_id, message_id, page=0):
+    reviews = get_approved_review_entries()
+    page_size = ADMIN_LIST_PAGE_SIZE
+    page_count = max(1, (len(reviews) + page_size - 1) // page_size)
+    page = max(0, min(int(page), page_count - 1))
+    first = page * page_size
+    shown = reviews[first:first + page_size]
+    text = f"🗑 <b>Отзывы</b> · {len(reviews)} опубликовано"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if not reviews:
+        text += "\n\nПока нет опубликованных отзывов."
+    else:
+        text += f" · {first + 1}–{first + len(shown)} из {len(reviews)}"
+        for review in shown:
+            username = review.get("username")
+            if username:
+                author = f"@{escape_html(username)}"
+            else:
+                author_name = " ".join(
+                    part for part in (review.get("first_name"), review.get("last_name")) if part
+                )
+                author = escape_html(author_name or str(review["user_id"]))
+            date = review.get("created_at")
+            date_label = date.strftime("%d.%m.%Y") if date else ""
+            preview = escape_html(str(review.get("review_text") or "").strip()[:150])
+            text += (
+                f"\n\n<b>{author}</b> · <code>{review['review_id']}</code>"
+                f"\n{date_label}\n<blockquote>{preview}</blockquote>"
+            )
+            keyboard.add(types.InlineKeyboardButton(
+                f"🗑 Удалить отзыв {review['review_id']}",
+                callback_data=f"admin_review_delete_confirm_{int(review['review_id'])}_{page}",
+            ))
+    _page_buttons(keyboard, page, page_count, "admin_review_delete_page")
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    safe_edit_message(
+        text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW
+    )
+
+
+def show_admin_review_delete_confirmation(chat_id, message_id, review_id, page=0):
+    review = get_review_entry(review_id)
+    if not review or review.get("status") != "approved":
+        return
+    author_name = " ".join(
+        part for part in (review.get("first_name"), review.get("last_name")) if part
+    )
+    author = f"@{escape_html(review['username'])}" if review.get("username") else escape_html(author_name or str(review["user_id"]))
+    review_text = escape_html(str(review.get("review_text") or "").strip()[:500])
+    text = (
+        f"Удалить опубликованный отзыв пользователя {author}?\n\n"
+        f"<blockquote>{review_text}</blockquote>"
+    )
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "✅ Удалить отзыв",
+        callback_data=f"admin_review_delete_yes_{int(review_id)}_{int(page)}",
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "🔙 Назад к отзывам",
+        callback_data=f"admin_review_delete_page_{int(page)}",
+    ))
+    safe_edit_message(
+        text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW
+    )
+
+
+def _send_review_for_moderation(review_id, user_id, review_text):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.row(
-        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"review_approve_{int(user_id)}"),
-        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"review_reject_{int(user_id)}"),
+        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"review_approve_{int(review_id)}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"review_reject_{int(review_id)}"),
     )
     bot.send_message(
         ADMIN_ID,
@@ -4021,6 +4103,7 @@ def handle_successful_payment(message):
         else "ℹ️ Это подтверждение оплаты от MAX_Parser. Фискальные чеки ЮKassa в текущих настройках не подключены."
     )
     multi_note = "Мульти-подписка включает оба способа подключения.\n" if plan_code == "multi" else ""
+    chat_limit = MULTI_MAX_CUSTOMER_CHATS if plan_code == "multi" else MAX_CUSTOMER_CHATS
     bot.send_message(
         user_id,
         "🧾 <b>Квитанция MAX_Parser</b>\n"
@@ -4032,7 +4115,7 @@ def handle_successful_payment(message):
         f"🕒 <b>Оплачено:</b> {paid_at:%d.%m.%Y %H:%M} UTC\n"
         f"📅 <b>Действует до:</b> {active_until:%d.%m.%Y %H:%M} UTC\n"
         f"🔖 <b>ID платежа:</b> <code>{provider_charge_id}</code>\n\n"
-        f"<blockquote>Подписка распространяется на весь ваш аккаунт MAX_Parser и покрывает до {MAX_CUSTOMER_CHATS} подключённых чатов.\n"
+        f"<blockquote>Подписка распространяется на весь ваш аккаунт MAX_Parser и покрывает до {chat_limit} подключённых чатов.\n"
         f"{multi_note}Для подключения чата отправьте /connect. Автоматического списания нет — заранее напомню о продлении.</blockquote>\n"
         f"<i>{fiscal_receipt_note}</i>",
         parse_mode="HTML",
@@ -4099,9 +4182,9 @@ def connect_command(message):
     )
 
 
-def _chat_limit_notice():
+def _chat_limit_notice(chat_limit=MAX_CUSTOMER_CHATS):
     return (
-        f"У вас уже подключено {MAX_CUSTOMER_CHATS} чатов. "
+        f"У вас уже подключено {chat_limit} чатов. "
         "Чтобы подключить ещё один, напишите в поддержку через /help."
     )
 
@@ -4744,7 +4827,10 @@ def _verify_project_chat_access(
         refresh_chat_list()
         if owner_id > 0:
             try:
-                _offer_review_after_connection(owner_id)
+                _offer_review_after_connection(
+                    owner_id,
+                    f"{chat_id}:{chat.get('account_mode') or 'project'}",
+                )
             except Exception as notify_error:
                 debug_logger.warning(
                     "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
@@ -4837,7 +4923,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         claimed = claim_chat(chat_id, title, owner_id, account_mode)
     except ChatLimitReached:
         pending_setup_modes.pop(owner_id, None)
-        bot.send_message(owner_id, _chat_limit_notice(), **NO_PREVIEW)
+        bot.send_message(owner_id, _chat_limit_notice(get_customer_chat_limit(owner_id)), **NO_PREVIEW)
         return False
     if not claimed:
         pending_setup_modes.pop(owner_id, None)
@@ -5163,6 +5249,10 @@ def end_support_button(message):
 )
 def handle_customer_review(message):
     user_id = int(message.from_user.id)
+    review_id = awaiting_review_text.get(user_id)
+    if review_id is None:
+        awaiting_review_text.pop(user_id, None)
+        return
     review_text = (message.text or "").strip()
     if review_text.startswith("/"):
         bot.send_message(
@@ -5183,13 +5273,13 @@ def handle_customer_review(message):
     if len(review_text) > 500:
         bot.send_message(message.chat.id, "Отзыв слишком длинный. Сократите его до 500 символов.", **NO_PREVIEW)
         return
-    if not save_pending_review(user_id, review_text):
-        awaiting_review_text.discard(user_id)
+    if not save_pending_review_entry(review_id, user_id, review_text):
+        awaiting_review_text.pop(user_id, None)
         bot.send_message(message.chat.id, "Не удалось сохранить отзыв. Откройте приглашение и попробуйте ещё раз.", **NO_PREVIEW)
         return
-    awaiting_review_text.discard(user_id)
+    awaiting_review_text.pop(user_id, None)
     try:
-        _send_review_for_moderation(user_id, review_text)
+        _send_review_for_moderation(review_id, user_id, review_text)
     except Exception as error:
         debug_logger.warning(
             "REVIEW_MODERATION_NOTIFY_FAILED user_id=%s error_type=%s",
@@ -5657,7 +5747,8 @@ def admin_callbacks(call):
             is_allowed_customer_qr = False
     if not is_admin(call.from_user.id) and action.startswith(("review_write_", "review_skip_")):
         try:
-            is_allowed_customer_review = int(action.rsplit("_", 1)[1]) == int(call.from_user.id)
+            review_id = int(action.rsplit("_", 1)[1])
+            is_allowed_customer_review = get_review_entry_owner(review_id) == int(call.from_user.id)
         except (ValueError, IndexError):
             is_allowed_customer_review = False
     if not is_admin(call.from_user.id) and action.startswith(("project_retry_", "project_edit_source_")):
@@ -5705,7 +5796,7 @@ def admin_callbacks(call):
         )
         if not is_allowed_customer_cancel:
             try:
-                is_allowed_customer_cancel = get_review_status(customer_id) == "writing"
+                is_allowed_customer_cancel = get_user_writing_review_id(customer_id) is not None
             except Exception:
                 is_allowed_customer_cancel = False
     if not is_admin(call.from_user.id) and action.startswith((
@@ -5797,17 +5888,19 @@ def admin_callbacks(call):
     if action == "cancel_step":
         user_id = int(call.from_user.id)
         review_is_writing = user_id in awaiting_review_text
+        review_id = awaiting_review_text.get(user_id)
         if not review_is_writing:
             try:
-                review_is_writing = get_review_status(user_id) == "writing"
+                review_id = get_user_writing_review_id(user_id)
+                review_is_writing = review_id is not None
             except Exception:
                 review_is_writing = False
         notice = None
         try:
             bot.clear_step_handler(call.message)
             if review_is_writing:
-                cancel_review(user_id)
-                awaiting_review_text.discard(user_id)
+                cancel_review_entry(review_id, user_id)
+                awaiting_review_text.pop(user_id, None)
                 notice = "Отзыв отменён. Спасибо, что подключились!"
             elif user_id in customer_setup_state or user_id in pending_setup_modes:
                 setup_state = customer_setup_state.get(user_id) or {}
@@ -6127,14 +6220,15 @@ def admin_callbacks(call):
         return
     if action.startswith("review_write_"):
         try:
-            target_user = int(action.rsplit("_", 1)[1])
+            review_id = int(action.rsplit("_", 1)[1])
         except (ValueError, IndexError):
             bot.answer_callback_query(call.id, "Некорректное приглашение", show_alert=True)
             return
-        if target_user != int(call.from_user.id) or not begin_review(target_user):
+        target_user = int(call.from_user.id)
+        if get_review_entry_owner(review_id) != target_user or not begin_review_entry(review_id, target_user):
             bot.answer_callback_query(call.id, "Приглашение уже использовано или недоступно", show_alert=True)
             return
-        awaiting_review_text.add(target_user)
+        awaiting_review_text[target_user] = review_id
         bot.answer_callback_query(call.id)
         bot.send_message(
             call.message.chat.id,
@@ -6146,11 +6240,12 @@ def admin_callbacks(call):
         return
     if action.startswith("review_skip_"):
         try:
-            target_user = int(action.rsplit("_", 1)[1])
+            review_id = int(action.rsplit("_", 1)[1])
         except (ValueError, IndexError):
             bot.answer_callback_query(call.id, "Некорректное приглашение", show_alert=True)
             return
-        if target_user != int(call.from_user.id) or not skip_review(target_user):
+        target_user = int(call.from_user.id)
+        if get_review_entry_owner(review_id) != target_user or not skip_review_entry(review_id, target_user):
             bot.answer_callback_query(call.id, "Приглашение уже использовано", show_alert=True)
             return
         bot.answer_callback_query(call.id, "Хорошо, пропускаем")
@@ -6162,15 +6257,16 @@ def admin_callbacks(call):
         return
     if action.startswith("review_approve_") or action.startswith("review_reject_"):
         try:
-            target_user = int(action.rsplit("_", 1)[1])
+            review_id = int(action.rsplit("_", 1)[1])
         except (ValueError, IndexError):
             bot.answer_callback_query(call.id, "Некорректный отзыв", show_alert=True)
             return
         decision = "approved" if action.startswith("review_approve_") else "rejected"
-        review = moderate_review(target_user, decision)
+        review = moderate_review_entry(review_id, decision)
         if not review:
             bot.answer_callback_query(call.id, "Отзыв уже обработан или не найден", show_alert=True)
             return
+        target_user = int(review["user_id"])
         bot.answer_callback_query(call.id, "Отзыв опубликован" if decision == "approved" else "Отзыв отклонён")
         try:
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
@@ -6460,6 +6556,59 @@ def admin_callbacks(call):
             call.message.chat.id, call.message.message_id,
             int(action.rsplit("_", 1)[1]),
         )
+    elif action == "admin_review_delete":
+        bot.answer_callback_query(call.id)
+        show_admin_review_delete_list(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_review_delete_page_"):
+        try:
+            page = int(action.rsplit("_", 1)[1])
+        except ValueError:
+            page = 0
+        bot.answer_callback_query(call.id)
+        show_admin_review_delete_list(call.message.chat.id, call.message.message_id, page)
+    elif action.startswith("admin_review_delete_confirm_"):
+        parts = action.split("_")
+        if len(parts) != 6:
+            bot.answer_callback_query(call.id, "Некорректный отзыв", show_alert=True)
+            return
+        try:
+            review_id, page = int(parts[4]), int(parts[5])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Некорректный отзыв", show_alert=True)
+            return
+        review = get_review_entry(review_id)
+        if not review or review.get("status") != "approved":
+            bot.answer_callback_query(call.id, "Отзыв уже удалён или недоступен", show_alert=True)
+            show_admin_review_delete_list(call.message.chat.id, call.message.message_id, page)
+            return
+        bot.answer_callback_query(call.id)
+        show_admin_review_delete_confirmation(
+            call.message.chat.id, call.message.message_id, review_id, page
+        )
+    elif action.startswith("admin_review_delete_yes_"):
+        parts = action.split("_")
+        if len(parts) != 6:
+            bot.answer_callback_query(call.id, "Некорректный отзыв", show_alert=True)
+            return
+        try:
+            review_id, page = int(parts[4]), int(parts[5])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Некорректный отзыв", show_alert=True)
+            return
+        try:
+            deleted = delete_approved_review_entry(review_id)
+        except Exception:
+            debug_logger.exception(
+                "ADMIN_REVIEW_DELETE_FAILED admin_id=%s review_id=%s",
+                call.from_user.id, review_id,
+            )
+            bot.answer_callback_query(call.id, "Не удалось удалить отзыв", show_alert=True)
+            return
+        if not deleted:
+            bot.answer_callback_query(call.id, "Отзыв уже удалён или недоступен", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "Отзыв удалён")
+        show_admin_review_delete_list(call.message.chat.id, call.message.message_id, page)
     elif action == "admin_revoke_subscriptions":
         show_revoke_subscription_users(call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(call.message, process_revoke_subscription_user_id)
@@ -6509,8 +6658,7 @@ def admin_callbacks(call):
         try:
             bot.send_message(
                 target_user_id,
-                f"ℹ️ Доступ к MAX_Parser по тарифу «{plan_label}» отключён администратором. "
-                "Если это произошло по ошибке, напишите в поддержку через /help.",
+                f"ℹ️ Доступ к MAX_Parser по тарифу «{plan_label}» отключён администратором.",
                 **NO_PREVIEW,
             )
         except Exception:
@@ -6932,11 +7080,11 @@ def callback_handler(call):
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=(
-                    "Подключение MAX → Telegram\n\n"
+                    "<b>Подключение MAX → Telegram</b>\n\n"
                     "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
                     "<blockquote><b>1️⃣ Ваш аккаунт MAX\n</b>Бот будет пересылать сообщения из вашего аккаунта MAX в выбранную вами группу.</blockquote>\n"
                     "<blockquote><b>2️⃣ Через готовый аккаунт MAX\n</b>Здесь вам не понадобится подключать ваш аккаунт, вы уже используете подготовленный аккаунт MAX</blockquote>\n"
-                    "<blockquote><b>✨ Мульти-подписка\n</b>Мульти-подписка открывает оба способа: свой MAX-аккаунт и готовый аккаунт MAX.</blockquote>\n"
+                    "<blockquote><b>✨ Мульти-подписка\n</b>Мульти-подписка открывает оба способа: свой MAX-аккаунт и готовый аккаунт MAX.</blockquote>\n\n"
                     "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
                 ),
                 reply_markup=parser_keyboard(),

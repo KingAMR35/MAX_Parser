@@ -12,6 +12,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_NAME = os.getenv("PGDATABASE", "MAX_Parser")
 MAX_CUSTOMER_CHATS = 5
+MULTI_MAX_CUSTOMER_CHATS = 10
 STATS_TIMEZONE = ZoneInfo("Europe/Samara")
 
 
@@ -229,6 +230,41 @@ def init_db():
                 updated_at = CURRENT_TIMESTAMP
             WHERE (review_text IS NOT NULL OR status = 'approved')
               AND EXISTS (SELECT 1 FROM inserted)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS customer_review_entries (
+                review_id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                connection_key TEXT,
+                status TEXT NOT NULL CHECK (status IN (
+                    'eligible', 'invited', 'writing', 'pending', 'approved', 'rejected', 'skipped'
+                )),
+                review_text TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_review_entries_connection
+            ON customer_review_entries (user_id, connection_key)
+            WHERE connection_key IS NOT NULL
+        """)
+        conn.execute("""
+            WITH inserted AS (
+                INSERT INTO app_migrations (version)
+                VALUES ('2026-10-customer-review-entries')
+                ON CONFLICT (version) DO NOTHING
+                RETURNING version
+            )
+            INSERT INTO customer_review_entries
+                (user_id, status, review_text, created_at, updated_at)
+            SELECT old.user_id, old.status, old.review_text, old.created_at, old.updated_at
+            FROM customer_reviews AS old
+            CROSS JOIN inserted
+            WHERE old.status IN ('pending', 'approved')
+              AND old.review_text IS NOT NULL
+              AND LENGTH(BTRIM(old.review_text)) > 0
         """)
 
 #! ============ АДМИНЫ ============
@@ -507,6 +543,170 @@ def get_approved_reviews():
         """).fetchall())
 
 
+def create_review_entry(user_id: int, connection_key: str):
+    """Return the review invitation associated with one successful connection."""
+    connection_key = str(connection_key)
+    with get_connection() as conn:
+        row = conn.execute("""
+            INSERT INTO customer_review_entries (user_id, connection_key, status)
+            VALUES (%s, %s, 'eligible')
+            ON CONFLICT (user_id, connection_key) WHERE connection_key IS NOT NULL DO NOTHING
+            RETURNING review_id, user_id, status
+        """, (int(user_id), connection_key)).fetchone()
+        if row:
+            return row
+        return conn.execute("""
+            SELECT review_id, user_id, status
+            FROM customer_review_entries
+            WHERE user_id = %s AND connection_key = %s
+        """, (int(user_id), connection_key)).fetchone()
+
+
+def get_review_entry(review_id: int):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT r.review_id, r.user_id, r.connection_key, r.status, r.review_text,
+                   r.created_at, r.updated_at, u.username, u.first_name, u.last_name
+            FROM customer_review_entries AS r
+            LEFT JOIN users AS u ON u.user_id = r.user_id
+            WHERE r.review_id = %s
+        """, (int(review_id),)).fetchone()
+
+
+def get_review_entry_status(review_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM customer_review_entries WHERE review_id = %s",
+            (int(review_id),),
+        ).fetchone()
+        return row["status"] if row else None
+
+
+def get_review_entry_owner(review_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM customer_review_entries WHERE review_id = %s",
+            (int(review_id),),
+        ).fetchone()
+        return int(row["user_id"]) if row else None
+
+
+def claim_review_entry_invitation(review_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_review_entries
+            SET status = 'invited', updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = %s AND status = 'eligible'
+        """, (int(review_id),))
+        return cursor.rowcount == 1
+
+
+def release_review_entry_invitation(review_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_review_entries
+            SET status = 'eligible', updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = %s AND status = 'invited'
+        """, (int(review_id),))
+        return cursor.rowcount == 1
+
+
+def begin_review_entry(review_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (int(user_id),))
+            active = conn.execute("""
+                SELECT 1 AS writing
+                FROM customer_review_entries
+                WHERE user_id = %s AND status = 'writing'
+                LIMIT 1
+            """, (int(user_id),)).fetchone()
+            if active:
+                return False
+            cursor = conn.execute("""
+                UPDATE customer_review_entries
+                SET status = 'writing', updated_at = CURRENT_TIMESTAMP
+                WHERE review_id = %s AND user_id = %s AND status IN ('eligible', 'invited')
+            """, (int(review_id), int(user_id)))
+            return cursor.rowcount == 1
+
+
+def get_user_writing_review_id(user_id: int):
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT review_id FROM customer_review_entries
+            WHERE user_id = %s AND status = 'writing'
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """, (int(user_id),)).fetchone()
+        return int(row["review_id"]) if row else None
+
+
+def skip_review_entry(review_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_review_entries
+            SET status = 'skipped', updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = %s AND user_id = %s AND status IN ('eligible', 'invited')
+        """, (int(review_id), int(user_id)))
+        return cursor.rowcount == 1
+
+
+def cancel_review_entry(review_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_review_entries
+            SET status = 'skipped', updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = %s AND user_id = %s AND status = 'writing'
+        """, (int(review_id), int(user_id)))
+        return cursor.rowcount == 1
+
+
+def save_pending_review_entry(review_id: int, user_id: int, review_text: str) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE customer_review_entries
+            SET status = 'pending', review_text = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = %s AND user_id = %s AND status = 'writing'
+        """, (str(review_text), int(review_id), int(user_id)))
+        return cursor.rowcount == 1
+
+
+def moderate_review_entry(review_id: int, decision: str):
+    if decision not in ("approved", "rejected"):
+        raise ValueError("Некорректное решение по отзыву")
+    with get_connection() as conn:
+        return conn.execute("""
+            UPDATE customer_review_entries
+            SET status = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = %s AND status = 'pending'
+            RETURNING review_id, user_id, review_text, status, created_at, updated_at
+        """, (decision, int(review_id))).fetchone()
+
+
+def get_approved_review_entries():
+    with get_connection() as conn:
+        return list(conn.execute("""
+            SELECT r.review_id, r.user_id, r.review_text, r.created_at, u.username,
+                   u.first_name, u.last_name
+            FROM customer_review_entries AS r
+            LEFT JOIN users AS u ON u.user_id = r.user_id
+            WHERE r.status = 'approved'
+              AND r.review_text IS NOT NULL
+              AND LENGTH(BTRIM(r.review_text)) > 0
+            ORDER BY r.created_at DESC, r.review_id DESC
+        """).fetchall())
+
+
+def delete_approved_review_entry(review_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            DELETE FROM customer_review_entries
+            WHERE review_id = %s AND status = 'approved'
+        """, (int(review_id),))
+        return cursor.rowcount == 1
+
+
 #! ============ ЧАТЫ ============
 
 def add_chat(
@@ -553,7 +753,15 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
                     "SELECT COUNT(*) AS count FROM chats WHERE owner_id = %s",
                     (int(owner_id),),
                 ).fetchone()["count"]
-                if int(count) >= MAX_CUSTOMER_CHATS:
+                has_multi = conn.execute("""
+                    SELECT 1 AS active
+                    FROM telegram_subscription_entitlements
+                    WHERE user_id = %s AND plan_code = 'multi'
+                      AND active_until > CURRENT_TIMESTAMP
+                    LIMIT 1
+                """, (int(owner_id),)).fetchone() is not None
+                chat_limit = MULTI_MAX_CUSTOMER_CHATS if has_multi else MAX_CUSTOMER_CHATS
+                if int(count) >= chat_limit:
                     raise ChatLimitReached
             conn.execute("""
                 UPDATE chats
@@ -826,6 +1034,18 @@ def is_subscription_active(user_id: int, account_mode: str = None) -> bool:
                 LIMIT 1
             """, (int(user_id), account_mode)).fetchone()
         return row is not None
+
+
+def get_customer_chat_limit(user_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT 1 AS active
+            FROM telegram_subscription_entitlements
+            WHERE user_id = %s AND plan_code = 'multi'
+              AND active_until > CURRENT_TIMESTAMP
+            LIMIT 1
+        """, (int(user_id),)).fetchone()
+        return MULTI_MAX_CUSTOMER_CHATS if row else MAX_CUSTOMER_CHATS
 
 
 def get_active_subscription_user_ids():

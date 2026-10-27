@@ -35,7 +35,8 @@ main{max-width:1080px;margin:auto;padding:clamp(9px,2vw,18px)}h1{font-size:21px;
 <body><main>
 <h1>🔐 Вход в MAX</h1>
 <h2>Краткая инструкция</h2>
-<p class="notice"><strong>1.</strong> Нажмите НА ЭКРАНЕ <b>sign in with phone number</b></p>
+<p class="notice"><b>ВАЖНОЕ ПРИМЕЧАНИЕ! ЭКРАН ЗДЕСЬ НАЖИМАЕМЫЙ! ВСЯКИЕ КНОПКИ НА САМОМ ЭКРАНЕ НАЖИМАТЬ МОЖНО! ПРОСТО РАБОТАЕТ С ЗАДЕРЖКОЙ!</b></p>
+<p class="notice"><strong>1.</strong> Нажмите НА ЭКРАНЕ на синий ТЕКСТ <b>sign in with phone number!</b>, который расположен внизу экрана и немного подождите!</p>
 <p class="notice"><strong>2.</strong> Введите свой номер телефона <b>сразу с девятки</b> (<b>БЕЗ 7 или 8 в начале,</b> например: 9123456789). После ввода нажмите <b>Continue.</b></p>
 <p class="notice"><strong>3.</strong> Нажмите на пустой квадратик на экране для подтверждения, что вы человек</p>
 <p class="notice"><strong>4.</strong> Введите код</p>
