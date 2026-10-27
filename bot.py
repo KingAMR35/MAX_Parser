@@ -190,6 +190,7 @@ pending_setup_modes = {}
 customer_setup_state = {}
 project_access_message_ids = {}
 project_invite_pending = {}
+project_admin_source_prompts = {}
 awaiting_review_text = set()
 remote_auth_monitors = set()
 remote_auth_monitor_lock = threading.Lock()
@@ -3819,10 +3820,32 @@ def _show_my_chats(chat_id, owner_id, message_id=None):
         bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
 
 
+def _clear_project_invite_pending(chat_id, delete_admin_messages=False):
+    pending = project_invite_pending.pop(int(chat_id), None)
+    if not pending:
+        return None
+    prompt_id = pending.get("source_prompt_id")
+    if prompt_id:
+        project_admin_source_prompts.pop(int(prompt_id), None)
+        if delete_admin_messages:
+            try:
+                bot.delete_message(ADMIN_ID, int(prompt_id))
+            except Exception:
+                pass
+    if delete_admin_messages and pending.get("admin_message_id"):
+        try:
+            bot.edit_message_reply_markup(
+                ADMIN_ID, int(pending["admin_message_id"]), reply_markup=None
+            )
+        except Exception:
+            pass
+    return pending
+
+
 def _delete_chat_everywhere(chat_id):
     chat_id = int(chat_id)
     with CHAT_LIFECYCLE_LOCK:
-        project_invite_pending.pop(chat_id, None)
+        _clear_project_invite_pending(chat_id, delete_admin_messages=True)
         chat = get_chat_by_id(chat_id)
         if not chat:
             return False
@@ -3871,7 +3894,7 @@ def _project_access_help():
         "Чтобы читать закрытую группу, аккаунту проекта <code>"
         f"{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> нужен доступ: добавьте его сами или отправьте ссылку-приглашение. "
         "Приглашение бот передаст администратору проекта: он вручную откроет ссылку и вступит. "
-        "Затем отправьте обычную ссылку на чат, чтобы бот проверил доступ. "
+        "После вступления администратор отправит боту обычную ссылку на чат для проверки. "
         "Если MAX попросит одобрить заявку, это должен сделать владелец или администратор. "
         "Для канала аккаунту достаточно доступа к публикациям — права администратора не нужны. "
         "Если добавить аккаунт или вступить по приглашению нельзя, этот способ не подойдёт: выберите подключение через свой аккаунт MAX."
@@ -3990,7 +4013,7 @@ def _project_invite_prompt(owner_id, chat_id):
         f"Отправьте ссылку-приглашение в закрытую {('группу' if source_type == 'group' else 'канал')} MAX. "
         "Я передам её администратору проекта: он сам откроет ссылку и вручную вступит с аккаунта проекта. "
         "Если MAX отправит заявку, владелец или администратор должен её одобрить.\n\n"
-        "После вступления администратор подтвердит это боту, и я попрошу вас отправить обычную ссылку на сам чат или канал.",
+        "После вступления администратор нажмёт кнопку и сам отправит боту обычную ссылку на чат или канал.",
         keyboard,
     )
 
@@ -4024,7 +4047,7 @@ def _forward_project_invite_to_admin(owner_id, chat_id, invite_url):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("🔗 Открыть приглашение", url=invite_url))
     keyboard.add(types.InlineKeyboardButton(
-        "✅ Вступил — запросить ссылку на чат",
+        "✅ Вступил — отправить ссылку MAX",
         callback_data=f"project_invite_admin_joined_{chat_id}_{request_id}",
     ))
     keyboard.add(types.InlineKeyboardButton(
@@ -4061,6 +4084,7 @@ def _forward_project_invite_to_admin(owner_id, chat_id, invite_url):
         "request_id": request_id,
         "invite_url": invite_url,
         "admin_message_id": admin_message.message_id,
+        "awaiting_source_url": False,
     }
     try:
         # Do not allow the scheduler or post-login checks to reuse an older
@@ -4094,7 +4118,7 @@ def _forward_project_invite_to_admin(owner_id, chat_id, invite_url):
         sent = bot.send_message(
             owner_id,
             "✅ Ссылка-приглашение передана администратору проекта. "
-            f"Когда он вручную вступит в {source_label} и подтвердит это, я попрошу вас прислать обычную ссылку.",
+            f"Когда он вручную вступит в {source_label}, он сам отправит мне обычную ссылку. Вам больше ничего присылать не нужно.",
             reply_markup=status_keyboard,
             **NO_PREVIEW,
         )
@@ -4105,6 +4129,60 @@ def _forward_project_invite_to_admin(owner_id, chat_id, invite_url):
             owner_id, chat_id, type(error).__name__,
         )
     return True
+
+
+def _send_project_admin_source_prompt(chat_id, pending):
+    """Ask the admin for the ordinary MAX URL, tied to this customer's request."""
+    chat_id = int(chat_id)
+    owner_id = int(pending.get("owner_id") or 0)
+    chat = get_chat_by_id(chat_id) or {}
+    old_prompt_id = pending.get("source_prompt_id")
+    if old_prompt_id:
+        project_admin_source_prompts.pop(int(old_prompt_id), None)
+    source_label = "канала" if (customer_setup_state.get(owner_id) or {}).get("source_type") == "channel" else "группы или чата"
+    text = (
+        "✅ После ручного вступления отправьте обычную ссылку MAX ответом на это сообщение.\n\n"
+        f"Источник: {source_label} · запрос пользователя <code>{owner_id}</code>.\n"
+        f"Группа получения: <b>{escape_html(chat.get('title') or str(chat_id))}</b>.\n"
+        f"ID подключения: <code>{chat_id}</code> · запрос: <code>{pending.get('request_id') or '—'}</code>.\n\n"
+        "Нужна ссылка на сам чат/канал (например, https://web.max.ru/…). "
+        "Ссылку-приглашение повторно не отправляйте."
+    )
+    prompt = bot.send_message(
+        ADMIN_ID,
+        text,
+        reply_markup=types.ForceReply(),
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+    pending["source_prompt_id"] = int(prompt.message_id)
+    pending["awaiting_source_url"] = True
+    project_admin_source_prompts[int(prompt.message_id)] = {
+        "chat_id": chat_id,
+        "request_id": pending.get("request_id"),
+        "owner_id": owner_id,
+    }
+    return prompt
+
+
+def _is_project_admin_source_message(message):
+    if (
+        message.chat.type != "private"
+        or not is_admin(message.from_user.id)
+        or not message.text
+        or message.text.startswith("/")
+    ):
+        return False
+    reply = getattr(message, "reply_to_message", None)
+    if reply and int(reply.message_id) in project_admin_source_prompts:
+        return True
+    if message.from_user.id in customer_setup_state or not _is_max_source_url(message.text.strip()):
+        return False
+    waiting = [
+        pending for pending in project_invite_pending.values()
+        if pending.get("awaiting_source_url")
+    ]
+    return len(waiting) == 1
 
 
 def _project_access_retry_keyboard(chat_id, allow_edit=True):
@@ -4395,7 +4473,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
             **NO_PREVIEW,
         )
         return False
-    project_invite_pending.pop(int(chat_id), None)
+    _clear_project_invite_pending(int(chat_id), delete_admin_messages=True)
     pending_setup_modes.pop(owner_id, None)
     customer_setup_state[owner_id] = {
         "chat_id": chat_id,
@@ -4424,7 +4502,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         + (f"Для закрытого источника отправьте ссылку-приглашение — бот перешлёт её администратору проекта, "
            f"который вручную вступит с аккаунта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
            "Если MAX отправит заявку, владелец/администратор должен её одобрить. "
-           "После вступления пришлите обычную ссылку на источник для проверки.\n\n"
+           "После вступления администратор отправит боту обычную ссылку на источник для проверки.\n\n"
            if account_mode == "project" else "")
         + "Чтобы остановить настройку, нажмите «❌ Отмена».",
         parse_mode="HTML",
@@ -4452,6 +4530,119 @@ def bind_customer_group(message):
     bot.reply_to(message, "Настройку продолжим в личном чате с ботом.")
 
 
+@bot.message_handler(func=_is_project_admin_source_message, content_types=["text"])
+def project_admin_source_url(message):
+    reply = getattr(message, "reply_to_message", None)
+    prompt_id = int(reply.message_id) if reply else 0
+    route = project_admin_source_prompts.get(prompt_id) if prompt_id else None
+    if route:
+        chat_id = int(route.get("chat_id") or 0)
+        pending = project_invite_pending.get(chat_id) or {}
+        if (
+            pending.get("request_id") != route.get("request_id")
+            or not pending.get("awaiting_source_url")
+        ):
+            project_admin_source_prompts.pop(prompt_id, None)
+            bot.send_message(message.chat.id, "Этот запрос уже завершён. Используйте актуальное сообщение с просьбой о ссылке.", **NO_PREVIEW)
+            return
+    else:
+        waiting = [
+            (int(chat_id), pending)
+            for chat_id, pending in project_invite_pending.items()
+            if pending.get("awaiting_source_url")
+        ]
+        if len(waiting) != 1 or message.from_user.id in customer_setup_state:
+            bot.send_message(
+                message.chat.id,
+                "Чтобы не перепутать подключения, отправьте ссылку ответом на сообщение с данными нужного запроса.",
+                **NO_PREVIEW,
+            )
+            return
+        chat_id, pending = waiting[0]
+        prompt_id = int(pending.get("source_prompt_id") or 0)
+
+    owner_id = int(pending.get("owner_id") or 0)
+    state = customer_setup_state.get(owner_id) or {}
+    chat = get_chat_by_id(chat_id)
+    if (
+        not chat
+        or chat.get("account_mode") != "project"
+        or int(chat.get("owner_id") or 0) != owner_id
+        or int(state.get("chat_id") or 0) != chat_id
+        or state.get("screen") != "awaiting_admin_source_url"
+    ):
+        _clear_project_invite_pending(chat_id, delete_admin_messages=True)
+        bot.send_message(message.chat.id, "Настройка уже завершена или отменена. Новая ссылка не сохранена.", **NO_PREVIEW)
+        return
+    if _user_needs_subscription(owner_id):
+        _clear_project_invite_pending(chat_id, delete_admin_messages=True)
+        customer_setup_state.pop(owner_id, None)
+        bot.send_message(
+            owner_id,
+            "Срок подписки истёк до завершения настройки. Продлите её командой /subscription, затем повторите подключение.",
+            reply_markup=subscription_renewal_keyboard(),
+            **NO_PREVIEW,
+        )
+        return
+
+    url = (message.text or "").strip()
+    if not _is_max_source_url(url) or _max_source_link_kind(url) == "invite":
+        if prompt_id:
+            project_admin_source_prompts.pop(prompt_id, None)
+        bot.send_message(
+            message.chat.id,
+            "Нужна обычная ссылка на сам чат или канал MAX, а не ссылка-приглашение. Отправьте её ответом на новое сообщение ниже.",
+            **NO_PREVIEW,
+        )
+        try:
+            _send_project_admin_source_prompt(chat_id, pending)
+        except Exception as error:
+            debug_logger.warning("PROJECT_ADMIN_SOURCE_PROMPT_FAILED chat_id=%s error_type=%s", chat_id, type(error).__name__)
+        return
+
+    try:
+        update_chat_url(chat_id, url)
+    except Exception as error:
+        debug_logger.exception("PROJECT_ADMIN_SOURCE_SAVE_FAILED chat_id=%s error=%s", chat_id, log_preview(error, 220))
+        bot.send_message(message.chat.id, "Не удалось сохранить ссылку. Попробуйте отправить её ещё раз ответом на сообщение ниже.", **NO_PREVIEW)
+        if prompt_id:
+            project_admin_source_prompts.pop(prompt_id, None)
+        try:
+            _send_project_admin_source_prompt(chat_id, pending)
+        except Exception:
+            pass
+        return
+
+    if prompt_id:
+        project_admin_source_prompts.pop(prompt_id, None)
+    project_invite_pending.pop(chat_id, None)
+    state["screen"] = "verifying"
+    status_id = state.get("status_message_id")
+    progress_text = "⏳ Администратор отправил обычную ссылку MAX. Проверяю, что аккаунт проекта видит сообщения этого источника."
+    progress_message_id = None
+    if status_id:
+        try:
+            bot.edit_message_text(
+                progress_text,
+                owner_id,
+                int(status_id),
+                reply_markup=None,
+                **NO_PREVIEW,
+            )
+            progress_message_id = int(status_id)
+        except Exception:
+            pass
+    if progress_message_id is None:
+        progress_message_id = bot.send_message(owner_id, progress_text, **NO_PREVIEW).message_id
+    state["status_message_id"] = progress_message_id
+    bot.send_message(message.chat.id, "✅ Обычная ссылка сохранена. Бот проверяет доступ; результат придёт пользователю.", **NO_PREVIEW)
+    threading.Thread(
+        target=_verify_project_chat_access,
+        args=(chat_id, owner_id, progress_message_id),
+        daemon=True,
+    ).start()
+
+
 @bot.message_handler(
     func=lambda m: m.chat.type == "private"
     and m.from_user.id in customer_setup_state
@@ -4463,7 +4654,7 @@ def customer_source_url(message):
     if not state:
         return
     if _user_needs_subscription(message.from_user.id):
-        project_invite_pending.pop(int(state.get("chat_id") or 0), None)
+        _clear_project_invite_pending(int(state.get("chat_id") or 0), delete_admin_messages=True)
         customer_setup_state.pop(message.from_user.id, None)
         bot.send_message(
             message.chat.id,
@@ -4474,6 +4665,13 @@ def customer_source_url(message):
         return
     url = (message.text or "").strip()
     mode = state.get("mode")
+    if mode == "project" and state.get("screen") == "awaiting_admin_source_url":
+        bot.send_message(
+            message.chat.id,
+            "Администратор уже вручную вступил. Теперь он сам отправляет обычную ссылку MAX боту. Вам ничего присылать не нужно.",
+            **NO_PREVIEW,
+        )
+        return
     if mode == "project" and state.get("source_type") not in {"channel", "group"}:
         _edit_setup_prompt(
             message.chat.id,
@@ -4505,27 +4703,26 @@ def customer_source_url(message):
     chat_id = state["chat_id"]
     link_kind = _max_source_link_kind(url)
     if mode == "project":
+        if state.get("screen") == "verifying":
+            bot.send_message(
+                message.chat.id,
+                "Ссылка уже получена, бот проверяет доступ. Дождитесь результата проверки.",
+                **NO_PREVIEW,
+            )
+            return
         if state.get("screen") == "invite_forwarded":
             bot.send_message(
                 message.chat.id,
                 "Ссылка уже передана администратору проекта. Дождитесь, пока он вручную вступит "
-                "и подтвердит это кнопкой — затем пришлите обычную ссылку на чат.",
-                **NO_PREVIEW,
-            )
-            return
-        if state.get("screen") == "source_url_after_admin_join" and link_kind == "invite":
-            bot.send_message(
-                message.chat.id,
-                "Администратор уже вступил. Теперь отправьте обычную ссылку на сам чат или канал, "
-                "а не ссылку-приглашение.",
+                "и отправит боту обычную ссылку на чат.",
                 **NO_PREVIEW,
             )
             return
         if state.get("screen") == "invite" and link_kind != "invite":
             bot.send_message(
                 message.chat.id,
-                "На этом шаге нужна именно ссылка-приглашение. После ручного вступления администратора "
-                "бот отдельно попросит обычную ссылку на чат.",
+                "На этом шаге нужна именно ссылка-приглашение. После ручного вступления администратор "
+                "сам отправит боту обычную ссылку на чат.",
                 **NO_PREVIEW,
             )
             return
@@ -4992,14 +5189,18 @@ def admin_callbacks(call):
         owner_id = int(pending.get("owner_id") or 0)
         invite_state = customer_setup_state.get(owner_id) or {}
         if int(invite_state.get("chat_id") or 0) != invite_chat_id:
-            project_invite_pending.pop(invite_chat_id, None)
+            _clear_project_invite_pending(invite_chat_id, delete_admin_messages=True)
             bot.answer_callback_query(call.id, "Настройка пользователя уже завершена")
             try:
                 bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
             except Exception:
                 pass
             return
-        project_invite_pending.pop(invite_chat_id, None)
+        if action.startswith(joined_prefix) and pending.get("awaiting_source_url"):
+            bot.answer_callback_query(call.id, "Ожидается обычная ссылка от администратора")
+            return
+        if action.startswith(failed_prefix):
+            _clear_project_invite_pending(invite_chat_id, delete_admin_messages=False)
         bot.answer_callback_query(call.id)
         try:
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
@@ -5013,7 +5214,7 @@ def admin_callbacks(call):
                 pass
             invite_state["status_message_id"] = None
         if action.startswith(joined_prefix):
-            invite_state["screen"] = "source_url_after_admin_join"
+            invite_state["screen"] = "awaiting_admin_source_url"
             prompt_id = invite_state.get("prompt_message_id")
             if prompt_id:
                 try:
@@ -5027,13 +5228,23 @@ def admin_callbacks(call):
             sent = bot.send_message(
                 owner_id,
                 "✅ Администратор подтвердил, что аккаунт проекта вступил в MAX.\n\n"
-                f"Теперь отправьте обычную ссылку на {source_label} «{escape_html(chat.get('title') or 'MAX')}». "
-                "Не отправляйте ссылку-приглашение повторно: бот проверит доступ по обычной ссылке и включит пересылку.",
+                f"Теперь администратор сам отправит боту обычную ссылку на {source_label}. "
+                "Я проверю доступ и сообщу вам результат. От вас больше ничего присылать не нужно.",
                 reply_markup=keyboard,
                 **NO_PREVIEW,
             )
-            invite_state["prompt_message_id"] = sent.message_id
+            invite_state["status_message_id"] = sent.message_id
+            try:
+                _send_project_admin_source_prompt(invite_chat_id, pending)
+            except Exception as error:
+                debug_logger.exception("PROJECT_ADMIN_SOURCE_PROMPT_FAILED chat_id=%s error=%s", invite_chat_id, log_preview(error, 220))
+                bot.send_message(
+                    call.message.chat.id,
+                    "Не удалось запросить ссылку MAX. Повторите нажатие «Вступил» после проверки подключения бота.",
+                    **NO_PREVIEW,
+                )
         else:
+            invite_state["screen"] = "invite"
             _, invite_keyboard = _project_invite_prompt(owner_id, invite_chat_id)
             prompt_id = invite_state.get("prompt_message_id")
             if prompt_id:
@@ -5173,16 +5384,7 @@ def admin_callbacks(call):
             return
         customer_setup_state.pop(int(call.from_user.id), None)
         pending_setup_modes.pop(int(call.from_user.id), None)
-        invite_pending = project_invite_pending.pop(cancel_chat_id, None)
-        if invite_pending and invite_pending.get("admin_message_id"):
-            try:
-                bot.edit_message_reply_markup(
-                    ADMIN_ID,
-                    int(invite_pending["admin_message_id"]),
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
+        _clear_project_invite_pending(cancel_chat_id, delete_admin_messages=True)
         bot.answer_callback_query(call.id, "Настройка отменена")
         try:
             bot.edit_message_text(
@@ -5231,7 +5433,7 @@ def admin_callbacks(call):
                 notice = "Отзыв отменён. Спасибо, что подключились!"
             elif user_id in customer_setup_state or user_id in pending_setup_modes:
                 setup_state = customer_setup_state.get(user_id) or {}
-                project_invite_pending.pop(int(setup_state.get("chat_id") or 0), None)
+                _clear_project_invite_pending(int(setup_state.get("chat_id") or 0), delete_admin_messages=True)
                 customer_setup_state.pop(user_id, None)
                 pending_setup_modes.pop(user_id, None)
                 notice = "Настройка отменена. Её можно начать заново через /connect."

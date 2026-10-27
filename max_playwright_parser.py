@@ -21,9 +21,9 @@ from debug_log import logger as debug_logger, preview as log_preview
 SESSIONS_DIR = "sessions"
 SEEN_MESSAGES_FILE = "seen_messages.json"
 PHOTO_CACHE_FILE = "seen_images.json"
-# Keep the scan close to the previous safe window. A larger window can pull
-# messages that were never cached by older versions and replay old history.
-MAX_MESSAGES_TO_PARSE = 10
+# Scan a bounded catch-up window so bursts are not silently truncated. The
+# per-chat cache and age checks below suppress already-sent and stale history.
+MAX_MESSAGES_TO_PARSE = 100
 MAX_FIRST_CONNECTION_MESSAGES = 3
 MAX_UNCACHED_MESSAGE_AGE = timedelta(hours=36)
 MAX_MEDIA_DOWNLOAD_BYTES = 47 * 1024 * 1024
