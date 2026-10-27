@@ -1487,7 +1487,9 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
     is_invite_link = bool(re.match(r"^/join(?:/|$)", source_parts.path, re.I))
 
     invite_actions = re.compile(
-        r"^(?:вступить(?: в (?:чат|группу|канал))?|присоединиться|подписаться|"
+        r"^(?:вступить(?: в (?:чат|группу|канал))?|"
+        r"присоединиться(?: к (?:чату|группе|каналу))?|"
+        r"подписаться(?: на канал)?|"
         r"принять(?: приглашение)?|отправить заявку|запросить вступление|"
         r"join(?: chat| group| channel)?|subscribe|request to join)$",
         re.I,
@@ -1534,37 +1536,37 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
         raise Exception("MAX_INVITE_APPROVAL_PENDING")
     current_path = urlparse(page.url).path
     if is_invite_link and re.match(r"^/join(?:/|$)", current_path, re.I):
-        if clicked:
-            try:
-                body_text = page.locator("body").inner_text(timeout=500).casefold()
-            except Exception:
-                body_text = ""
-            if re.search(
-                r"(?:заявка.{0,30}(?:отправлена|ожидает|рассматривается)|"
-                r"ожидайте.{0,20}(?:одобрения|подтверждения)|"
-                r"request.{0,30}(?:sent|pending)|waiting for (?:approval|review))",
-                body_text,
-                re.I,
-            ):
-                raise Exception("MAX_INVITE_APPROVAL_PENDING")
-        remaining_action = False
         try:
-            for index in range(min(buttons.count(), 40)):
-                button = buttons.nth(index)
-                if not button.is_visible(timeout=100):
-                    continue
-                label = " ".join((button.inner_text(timeout=250) or "").split())
-                if not label:
-                    label = " ".join((button.get_attribute("aria-label") or "").split())
-                if invite_actions.fullmatch(label):
-                    remaining_action = True
-                    break
+            body_text = page.locator("body").inner_text(timeout=500).casefold()
         except Exception:
-            remaining_action = True
-        if remaining_action:
-            raise Exception("MAX_INVITE_JOIN_REQUIRED")
-        if not clicked:
-            raise Exception("MAX_INVITE_JOIN_REQUIRED")
+            body_text = ""
+        if re.search(
+            r"(?:заявка.{0,30}(?:отправлена|ожидает|рассматривается)|"
+            r"ожидайте.{0,20}(?:одобрения|подтверждения)|"
+            r"request.{0,30}(?:sent|pending)|waiting for (?:approval|review))",
+            body_text,
+            re.I,
+        ):
+            raise Exception("MAX_INVITE_APPROVAL_PENDING")
+
+    # A chat URL can display a preview even when this account has not joined.
+    # Do not report a successful invite/access check while MAX still shows Join.
+    remaining_action = False
+    try:
+        for index in range(min(buttons.count(), 40)):
+            button = buttons.nth(index)
+            if not button.is_visible(timeout=100):
+                continue
+            label = " ".join((button.inner_text(timeout=250) or "").split())
+            if not label:
+                label = " ".join((button.get_attribute("aria-label") or "").split())
+            if invite_actions.fullmatch(label):
+                remaining_action = True
+                break
+    except Exception:
+        remaining_action = True
+    if remaining_action or (is_invite_link and re.match(r"^/join(?:/|$)", current_path, re.I) and not clicked):
+        raise Exception("MAX_INVITE_JOIN_REQUIRED")
     if clicked:
         debug_logger.info("MAX_INVITE_ACCEPTED chat_id=%s route=%s", chat_id, current_path)
 
@@ -4266,6 +4268,24 @@ def parse_max_group_media(
             raise Exception(f"EMPTY_PAGE|{debug_path}")
         debug_logger.info("MAX_CHAT_OPENED chat_id=%s route=%s verify_only=%s", chat_id, urlparse(current_url).path, verify_only)
         if verify_only:
+            message_cards = page.locator(".item")
+            card_count = 0
+            for _ in range(10):
+                try:
+                    card_count = message_cards.count()
+                except Exception:
+                    card_count = 0
+                if card_count:
+                    break
+                page.wait_for_timeout(500)
+            if not card_count:
+                debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
+                page.screenshot(path=debug_path, full_page=True)
+                raise Exception(f"MAX_CHAT_NO_MESSAGES|{debug_path}")
+            debug_logger.info(
+                "MAX_CHAT_ACCESS_VERIFIED chat_id=%s visible_message_cards=%s",
+                chat_id, card_count,
+            )
             return []
         print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
         try:

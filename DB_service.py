@@ -1,5 +1,7 @@
 import os
 import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import psycopg
 from dotenv import load_dotenv
@@ -10,6 +12,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_NAME = os.getenv("PGDATABASE", "MAX_Parser")
 MAX_CUSTOMER_CHATS = 5
+STATS_TIMEZONE = ZoneInfo("Europe/Samara")
 
 
 class ChatLimitReached(Exception):
@@ -66,6 +69,15 @@ def init_db():
                 owner_id BIGINT,
                 account_mode TEXT NOT NULL DEFAULT 'self',
                 added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_message_daily_stats (
+                chat_id BIGINT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+                sent_date DATE NOT NULL,
+                sent_count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, sent_date)
             )
         """)
 
@@ -476,20 +488,39 @@ def delete_chat(chat_id: int):
 #! ============ СЧЕТЧИКИ СООБЩЕНИЙ ============
 
 def increment_message_count(chat_id: int):
+    sent_date = datetime.now(STATS_TIMEZONE).date()
     with get_connection() as conn:
-        conn.execute("UPDATE chats SET message_count = message_count + 1 WHERE chat_id = %s", (chat_id,))
+        updated = conn.execute(
+            "UPDATE chats SET message_count = message_count + 1 WHERE chat_id = %s RETURNING chat_id",
+            (chat_id,),
+        ).fetchone()
+        if not updated:
+            return
+        conn.execute("""
+            INSERT INTO chat_message_daily_stats (chat_id, sent_date, sent_count)
+            VALUES (%s, %s, 1)
+            ON CONFLICT (chat_id, sent_date)
+            DO UPDATE SET sent_count = chat_message_daily_stats.sent_count + 1
+        """, (chat_id, sent_date))
 
 
 def get_chat_stats(chat_id: int):
+    today = datetime.now(STATS_TIMEZONE).date()
     with get_connection() as conn:
         row = conn.execute(
             "SELECT message_count FROM chats WHERE chat_id = %s", (chat_id,)
         ).fetchone()
+        daily_row = conn.execute(
+            "SELECT sent_count FROM chat_message_daily_stats WHERE chat_id = %s AND sent_date = %s",
+            (chat_id, today),
+        ).fetchone()
     count = row["message_count"] if row else 0
-    return {"total": count, "today": count}
+    today_count = daily_row["sent_count"] if daily_row else 0
+    return {"total": count, "today": today_count}
 
 
 def get_global_stats():
+    today = datetime.now(STATS_TIMEZONE).date()
     with get_connection() as conn:
         total_chats = conn.execute("SELECT COUNT(*) AS count FROM chats").fetchone()["count"]
         active_chats = conn.execute(
@@ -498,11 +529,15 @@ def get_global_stats():
         total_msgs = conn.execute(
             "SELECT COALESCE(SUM(message_count), 0) AS count FROM chats"
         ).fetchone()["count"]
+        today_msgs = conn.execute(
+            "SELECT COALESCE(SUM(sent_count), 0) AS count FROM chat_message_daily_stats WHERE sent_date = %s",
+            (today,),
+        ).fetchone()["count"]
     return {
         "total_chats": total_chats,
         "active_chats": active_chats,
         "total_msgs": total_msgs,
-        "today_msgs": total_msgs,
+        "today_msgs": today_msgs,
     }
 
 
