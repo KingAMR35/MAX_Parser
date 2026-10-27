@@ -8,13 +8,13 @@ import shutil
 import io
 import base64
 import subprocess
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunsplit
 import queue
 import threading
 import traceback
 import tempfile
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Union
 from playwright.sync_api import sync_playwright
 from debug_log import logger as debug_logger, preview as log_preview
 
@@ -1478,13 +1478,26 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
     return True
 
 
+def _is_max_invite_url(source_url: str) -> bool:
+    """Recognize MAX invitation routes separately from direct chat routes."""
+    try:
+        parsed = urlparse(str(source_url or ""))
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return (
+            (host == "max.ru" or host.endswith(".max.ru"))
+            and bool(re.match(r"^/(?:join|invite|invitation)(?:/|$)", parsed.path, re.I))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
     """Join a user-selected MAX source when MAX shows a clear join/subscribe button."""
     source_parts = urlparse(source_url)
     source_host = (source_parts.hostname or "").lower().rstrip(".")
     if source_host != "max.ru" and not source_host.endswith(".max.ru"):
-        return
-    is_invite_link = bool(re.match(r"^/join(?:/|$)", source_parts.path, re.I))
+        return False
+    is_invite_link = _is_max_invite_url(source_url)
 
     invite_actions = re.compile(
         r"^(?:вступить(?: в (?:чат|группу|канал))?|"
@@ -1535,7 +1548,7 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
     if requested_approval:
         raise Exception("MAX_INVITE_APPROVAL_PENDING")
     current_path = urlparse(page.url).path
-    if is_invite_link and re.match(r"^/join(?:/|$)", current_path, re.I):
+    if is_invite_link and _is_max_invite_url(page.url):
         try:
             body_text = page.locator("body").inner_text(timeout=500).casefold()
         except Exception:
@@ -1565,10 +1578,11 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
                 break
     except Exception:
         remaining_action = True
-    if remaining_action or (is_invite_link and re.match(r"^/join(?:/|$)", current_path, re.I) and not clicked):
+    if remaining_action or (is_invite_link and _is_max_invite_url(page.url) and not clicked):
         raise Exception("MAX_INVITE_JOIN_REQUIRED")
     if clicked:
         debug_logger.info("MAX_INVITE_ACCEPTED chat_id=%s route=%s", chat_id, current_path)
+    return clicked
 
 def mark_message_seen(post: dict, chat_id: int = 0) -> None:
     if chat_id not in message_cache_by_chat:
@@ -4207,7 +4221,7 @@ def parse_max_group_media(
     navigation_timeout_ms: int = 60000,
     navigation_attempts: int = 4,
     post_callback=None,
-) -> List[Dict]:
+) -> Union[List[Dict], Dict[str, object]]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
     debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
     if not isinstance(chat_id, int):
@@ -4247,7 +4261,7 @@ def parse_max_group_media(
             timeout=navigation_timeout_ms, max_attempts=navigation_attempts,
         )
         page.wait_for_timeout(1200 if verify_only else 4000)
-        _accept_max_invite_if_available(page, group_url, chat_id)
+        invite_action_clicked = _accept_max_invite_if_available(page, group_url, chat_id)
         current_url = page.url
         requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
         current_parts = urlparse(current_url)
@@ -4286,7 +4300,28 @@ def parse_max_group_media(
                 "MAX_CHAT_ACCESS_VERIFIED chat_id=%s visible_message_cards=%s",
                 chat_id, card_count,
             )
-            return []
+            canonical_url = None
+            resolved_parts = urlparse(current_url)
+            resolved_host = (resolved_parts.hostname or "").lower().rstrip(".")
+            resolved_path = resolved_parts.path.rstrip("/")
+            if (
+                (resolved_host == "max.ru" or resolved_host.endswith(".max.ru"))
+                and resolved_path
+                and not _is_max_invite_url(current_url)
+                and resolved_path.lower() not in {"/", "/auth", "/login", "/signin", "/sign-in"}
+                and (invite_action_clicked or _is_max_invite_url(group_url))
+            ):
+                # Store the resolved chat route after an invitation succeeds so
+                # later polling cycles go straight to the chat instead of reopening
+                # the invitation landing page.
+                canonical_url = urlunsplit((
+                    resolved_parts.scheme or "https",
+                    resolved_parts.netloc,
+                    resolved_parts.path,
+                    "",
+                    "",
+                ))
+            return {"message_cards": card_count, "canonical_url": canonical_url}
         print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
         try:
             page.keyboard.press("End")
