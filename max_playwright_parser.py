@@ -8,7 +8,7 @@ import shutil
 import io
 import base64
 import subprocess
-from urllib.parse import unquote, urlparse, urlunsplit
+from urllib.parse import unquote, urlparse
 import queue
 import threading
 import traceback
@@ -1492,7 +1492,7 @@ def _is_max_invite_url(source_url: str) -> bool:
 
 
 def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
-    """Join a user-selected MAX source when MAX shows a clear join/subscribe button."""
+    """Never join MAX sources automatically; require a manually joined account."""
     source_parts = urlparse(source_url)
     source_host = (source_parts.hostname or "").lower().rstrip(".")
     if source_host != "max.ru" and not source_host.endswith(".max.ru"):
@@ -1507,64 +1507,12 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
         r"join(?: chat| group| channel)?|subscribe|request to join)$",
         re.I,
     )
+    if is_invite_link:
+        raise Exception("MAX_INVITE_MANUAL_REQUIRED")
+
+    # A direct chat URL can still show a preview with a Join/Subscribe action.
+    # Never click it here; the account owner/admin must join it manually first.
     buttons = page.locator("button, [role='button']")
-    clicked = False
-    requested_approval = False
-    for _ in range(2):
-        matched = None
-        matched_requests_approval = False
-        try:
-            for index in range(min(buttons.count(), 40)):
-                button = buttons.nth(index)
-                try:
-                    if not button.is_visible(timeout=100):
-                        continue
-                    label = " ".join((button.inner_text(timeout=250) or "").split())
-                    if not label:
-                        label = " ".join((button.get_attribute("aria-label") or "").split())
-                    if invite_actions.fullmatch(label):
-                        matched = button
-                        if re.fullmatch(r"отправить заявку|запросить вступление|request to join", label, re.I):
-                            matched_requests_approval = True
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            matched = None
-        if matched is None:
-            break
-        try:
-            matched.click(timeout=2000)
-            page.wait_for_timeout(1200)
-            clicked = True
-            requested_approval = requested_approval or matched_requests_approval
-        except Exception as error:
-            debug_logger.warning(
-                "MAX_INVITE_ACTION_FAILED chat_id=%s error=%s",
-                chat_id, log_preview(error, 180),
-            )
-            break
-
-    if requested_approval:
-        raise Exception("MAX_INVITE_APPROVAL_PENDING")
-    current_path = urlparse(page.url).path
-    if is_invite_link and _is_max_invite_url(page.url):
-        try:
-            body_text = page.locator("body").inner_text(timeout=500).casefold()
-        except Exception:
-            body_text = ""
-        if re.search(
-            r"(?:заявка.{0,30}(?:отправлена|ожидает|рассматривается)|"
-            r"ожидайте.{0,20}(?:одобрения|подтверждения)|"
-            r"request.{0,30}(?:sent|pending)|waiting for (?:approval|review))",
-            body_text,
-            re.I,
-        ):
-            raise Exception("MAX_INVITE_APPROVAL_PENDING")
-
-    # A chat URL can display a preview even when this account has not joined.
-    # Do not report a successful invite/access check while MAX still shows Join.
-    remaining_action = False
     try:
         for index in range(min(buttons.count(), 40)):
             button = buttons.nth(index)
@@ -1574,15 +1522,10 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
             if not label:
                 label = " ".join((button.get_attribute("aria-label") or "").split())
             if invite_actions.fullmatch(label):
-                remaining_action = True
-                break
+                raise Exception("MAX_INVITE_MANUAL_REQUIRED")
     except Exception:
-        remaining_action = True
-    if remaining_action or (is_invite_link and _is_max_invite_url(page.url) and not clicked):
-        raise Exception("MAX_INVITE_JOIN_REQUIRED")
-    if clicked:
-        debug_logger.info("MAX_INVITE_ACCEPTED chat_id=%s route=%s", chat_id, current_path)
-    return clicked
+        raise
+    return False
 
 def mark_message_seen(post: dict, chat_id: int = 0) -> None:
     if chat_id not in message_cache_by_chat:
@@ -4261,7 +4204,7 @@ def parse_max_group_media(
             timeout=navigation_timeout_ms, max_attempts=navigation_attempts,
         )
         page.wait_for_timeout(1200 if verify_only else 4000)
-        invite_action_clicked = _accept_max_invite_if_available(page, group_url, chat_id)
+        _accept_max_invite_if_available(page, group_url, chat_id)
         current_url = page.url
         requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
         current_parts = urlparse(current_url)
@@ -4300,28 +4243,7 @@ def parse_max_group_media(
                 "MAX_CHAT_ACCESS_VERIFIED chat_id=%s visible_message_cards=%s",
                 chat_id, card_count,
             )
-            canonical_url = None
-            resolved_parts = urlparse(current_url)
-            resolved_host = (resolved_parts.hostname or "").lower().rstrip(".")
-            resolved_path = resolved_parts.path.rstrip("/")
-            if (
-                (resolved_host == "max.ru" or resolved_host.endswith(".max.ru"))
-                and resolved_path
-                and not _is_max_invite_url(current_url)
-                and resolved_path.lower() not in {"/", "/auth", "/login", "/signin", "/sign-in"}
-                and (invite_action_clicked or _is_max_invite_url(group_url))
-            ):
-                # Store the resolved chat route after an invitation succeeds so
-                # later polling cycles go straight to the chat instead of reopening
-                # the invitation landing page.
-                canonical_url = urlunsplit((
-                    resolved_parts.scheme or "https",
-                    resolved_parts.netloc,
-                    resolved_parts.path,
-                    "",
-                    "",
-                ))
-            return {"message_cards": card_count, "canonical_url": canonical_url}
+            return {"message_cards": card_count}
         print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
         try:
             page.keyboard.press("End")
