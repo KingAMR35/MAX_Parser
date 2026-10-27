@@ -285,6 +285,33 @@ def grant_subscription(user_id: int, plan_code: str, months: int):
         """, (int(user_id), plan_code, months, months)).fetchone()
 
 
+def get_user_subscriptions(user_id: int):
+    """Return all currently active subscription products for one user."""
+    with get_connection() as conn:
+        return list(conn.execute("""
+            SELECT user_id, plan_code, active_until
+            FROM telegram_subscription_entitlements
+            WHERE user_id = %s AND active_until > CURRENT_TIMESTAMP
+            ORDER BY active_until DESC, plan_code
+        """, (int(user_id),)).fetchall())
+
+
+def revoke_subscription(user_id: int, plan_code: str) -> bool:
+    """Revoke one product entitlement and its legacy row, if present."""
+    if plan_code not in {"self", "project", "multi"}:
+        raise ValueError("Некорректный тариф подписки")
+    with get_connection() as conn:
+        entitlement = conn.execute("""
+            DELETE FROM telegram_subscription_entitlements
+            WHERE user_id = %s AND plan_code = %s
+        """, (int(user_id), plan_code))
+        legacy = conn.execute("""
+            DELETE FROM telegram_subscriptions
+            WHERE user_id = %s AND plan_code = %s
+        """, (int(user_id), plan_code))
+        return entitlement.rowcount > 0 or legacy.rowcount > 0
+
+
 #! ============ ПОЛЬЗОВАТЕЛИ ============
 
 def add_or_update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
@@ -367,6 +394,28 @@ def offer_review(user_id: int) -> bool:
             RETURNING user_id
         """, (int(user_id),)).fetchone()
         return row is not None
+
+
+def prepare_review_after_connection(user_id: int):
+    """Rearm a skipped review offer after a new successful connection."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO customer_reviews (user_id, status)
+            VALUES (%s, 'eligible')
+            ON CONFLICT (user_id) DO UPDATE SET
+                status = CASE
+                    WHEN customer_reviews.status IN ('skipped', 'rejected') THEN 'eligible'
+                    ELSE customer_reviews.status
+                END,
+                review_text = CASE
+                    WHEN customer_reviews.status IN ('skipped', 'rejected') THEN NULL
+                    ELSE customer_reviews.review_text
+                END,
+                updated_at = CASE
+                    WHEN customer_reviews.status IN ('skipped', 'rejected') THEN CURRENT_TIMESTAMP
+                    ELSE customer_reviews.updated_at
+                END
+        """, (int(user_id),))
 
 
 def begin_review(user_id: int) -> bool:
