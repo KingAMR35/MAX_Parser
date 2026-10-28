@@ -1989,7 +1989,7 @@ def _build_qr_keyboard(target_chat_id):
     kb.add(types.InlineKeyboardButton("✅ Готово, я отсканировал", callback_data=f"qr_ready_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("📱 Войти по номеру телефона", callback_data=f"qr_phone_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🔄 Обновить QR", callback_data=f"qr_refresh_{target_chat_id}"))
-    kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data=f"qr_cancel_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
 
 
@@ -1999,14 +1999,14 @@ def _qr_target_from_action(action):
 
 def _build_password_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
 
 
 def _build_auth_check_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("🔄 Проверить вход MAX", callback_data=f"qr_ready_{target_chat_id}"))
-    kb.add(types.InlineKeyboardButton("❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
     return kb
 
 
@@ -2039,6 +2039,13 @@ def _clear_auth_qr_controls(target_chat_id):
             bot.edit_message_reply_markup(output_chat_id, message_id, reply_markup=None)
         except Exception:
             pass
+
+
+def _track_auth_message(target_chat_id, message):
+    if message:
+        auth_qr_message_ids.setdefault(target_chat_id, set()).add(
+            (int(message.chat.id), int(message.message_id))
+        )
 
 
 def _complete_login(target_chat_id, output_chat_id):
@@ -2096,6 +2103,9 @@ def _monitor_remote_login(target_chat_id, session, output_chat_id):
                 status, data = session.check()
             except Exception as error:
                 status, data = "error", error
+            if active_logins.get(target_chat_id) is not session:
+                remote_auth_service.revoke_session(session)
+                return
             if status == "success":
                 remote_auth_service.revoke_session(session, completed=True)
                 _complete_login(target_chat_id, output_chat_id)
@@ -4266,6 +4276,88 @@ def _setup_cancel_button(chat_id):
     return types.InlineKeyboardButton("❌ Отмена", callback_data=f"setup_cancel_{int(chat_id)}")
 
 
+SETUP_CANCEL_NOTICE = "Настройка отменена. Её можно начать заново через /connect."
+
+
+def _cancel_customer_connection(user_id, chat_id=None, callback_message=None):
+    user_id = int(user_id)
+    state = customer_setup_state.get(user_id) or {}
+    try:
+        state_chat_id = int(state.get("chat_id")) if state.get("chat_id") is not None else None
+    except (TypeError, ValueError):
+        state_chat_id = None
+    if chat_id is None:
+        matches_state = True
+    else:
+        try:
+            matches_state = state_chat_id == int(chat_id)
+        except (TypeError, ValueError):
+            matches_state = False
+
+    if matches_state:
+        state = customer_setup_state.pop(user_id, {})
+        pending_setup_modes.pop(user_id, None)
+    else:
+        state = {}
+
+    session = active_logins.pop(chat_id, None) if chat_id is not None else None
+    if chat_id is not None:
+        _clear_auth_waiters(chat_id)
+
+    output_chat_id = callback_message.chat.id if callback_message else user_id
+    messages_to_delete = set(auth_qr_message_ids.pop(chat_id, set())) if chat_id is not None else set()
+    for key in ("prompt_message_id", "status_message_id"):
+        try:
+            message_id = int(state.get(key) or 0)
+        except (TypeError, ValueError):
+            message_id = 0
+        if message_id:
+            messages_to_delete.add((output_chat_id, message_id))
+    clicked_message = None
+    if callback_message:
+        clicked_message = (callback_message.chat.id, callback_message.message_id)
+        messages_to_delete.discard(clicked_message)
+        try:
+            bot.delete_message(*clicked_message)
+        except Exception:
+            pass
+    try:
+        bot.send_message(output_chat_id, SETUP_CANCEL_NOTICE, **NO_PREVIEW)
+    except Exception as error:
+        debug_logger.info(
+            "SETUP_CANCEL_NOTICE_FAILED user_id=%s error_type=%s",
+            user_id, type(error).__name__,
+        )
+    for target_chat_id, message_id in messages_to_delete:
+        try:
+            bot.delete_message(target_chat_id, message_id)
+        except Exception:
+            pass
+
+    if chat_id is not None:
+        try:
+            invite_chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            invite_chat_id = None
+        if invite_chat_id is not None:
+            try:
+                _clear_project_invite_pending(invite_chat_id, delete_admin_messages=True)
+            except Exception as error:
+                debug_logger.info(
+                    "SETUP_CANCEL_INVITE_CLEANUP_FAILED chat_id=%s error_type=%s",
+                    chat_id, type(error).__name__,
+                )
+    if session:
+        try:
+            remote_auth_service.revoke_session(session)
+        except Exception:
+            pass
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
 @bot.message_handler(commands=['mychats'])
 def my_chats_command(message):
     track_user(message)
@@ -4427,17 +4519,13 @@ def _project_source_instructions(owner_id, source_type, chat_id):
             "🔗 Ссылка приглашения",
             callback_data=f"project_help_invite_{chat_id}",
         ))
-        keyboard.add(types.InlineKeyboardButton(
-            "Не могу добавить в чат",
-            callback_data=f"project_add_help_{chat_id}",
-        ))
         text = (
             "<b>Шаг 2 из 2 · Группа или чат</b>\n\n"
-            f"Сначала добавьте в группу готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
-            "Затем отправьте сюда обычную ссылку на чат MAX. Если у вас есть ссылка-приглашение, нажмите «Ссылка приглашения». "
-            "Если аккаунт добавить не получается, нажмите «Не могу добавить в чат».\n\n"
-            "Если MAX отправит запрос на вступление, администратор должен его одобрить. "
-            "После ссылки бот проверит, что аккаунт действительно видит сообщения, и только потом включит пересылку."
+            f"1) Добавьте в вашу MAX группу готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
+            "2) Затем перейдите по ссылке https://web.max.ru/, войдите в свой аккаунт, нажмите на свою группу, "
+            "скопируйе ссылку на группу и отправте сюда в чат"
+            "После этого бот проверит доступность бота и сообщит вам после проверки. "
+            "Если у вас будут какие-то вопросы или проблемы, то пишите /help"
         )
     else:
         keyboard.add(types.InlineKeyboardButton(
@@ -4446,9 +4534,10 @@ def _project_source_instructions(owner_id, source_type, chat_id):
         ))
         text = (
             "<b>Шаг 2 из 2 · Канал</b>\n\n"
-            "Отправьте сюда обычную ссылку на канал MAX. Если канал закрытый и готовый аккаунт ещё не подписан на него, "
-            "нажмите «Канал закрытый» и передайте приглашение администратору для ручного вступления. "
-            "После этого бот проверит, доступны ли публикации для пересылки."
+            "1) Перейдите по ссылке https://web.max.ru/ и войдите в свой аккаунт"
+            "2) Нажмите на канал, который вы хотите подключить и скопируйте ссылку."
+            "3) Пришлите ссылку сюда в чат. После этого бот проверить доступность этого канала."
+            "<b>Если возникли вопросы или что-то не получилось, то пишите</b> /help"
         )
     keyboard.add(types.InlineKeyboardButton(
         "🔙 Назад к выбору чата",
@@ -4499,10 +4588,8 @@ def _project_invite_prompt(owner_id, chat_id):
     keyboard.add(types.InlineKeyboardButton(back_label, callback_data=f"{back_action}_{chat_id}"))
     keyboard.add(_setup_cancel_button(chat_id))
     return (
-        f"Отправьте ссылку-приглашение в закрытую {('группу' if source_type == 'group' else 'канал')} MAX. "
-        "Я передам её администратору: он сам откроет ссылку и вручную вступит через готовый аккаунт. "
-        "Если MAX отправит заявку, или администратор должен её одобрить.\n\n"
-        "После вступления администратор нажмёт кнопку и сам отправит боту обычную ссылку на чат или канал.",
+        f"Отправьте ссылку-приглашение на MAX {('группу' if source_type == 'group' else 'канал')}. "
+        "После этого администратор сам все настроит, если будут проблемы, то напишет вам.",
         keyboard,
     )
 
@@ -5900,20 +5987,12 @@ def admin_callbacks(call):
             except Exception:
                 pass
             return
-        customer_setup_state.pop(int(call.from_user.id), None)
-        pending_setup_modes.pop(int(call.from_user.id), None)
-        _clear_project_invite_pending(cancel_chat_id, delete_admin_messages=True)
         bot.answer_callback_query(call.id, "Настройка отменена")
-        try:
-            bot.edit_message_text(
-                "Настройка отменена. Её можно начать заново через /connect.",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=None,
-                **NO_PREVIEW,
-            )
-        except Exception:
-            pass
+        _cancel_customer_connection(
+            call.from_user.id,
+            cancel_chat_id,
+            callback_message=call.message,
+        )
         return
     if action.startswith("support_close_"):
         try:
@@ -5953,10 +6032,19 @@ def admin_callbacks(call):
                 notice = "Отзыв отменён. Спасибо, что подключились!"
             elif user_id in customer_setup_state or user_id in pending_setup_modes:
                 setup_state = customer_setup_state.get(user_id) or {}
-                _clear_project_invite_pending(int(setup_state.get("chat_id") or 0), delete_admin_messages=True)
-                customer_setup_state.pop(user_id, None)
-                pending_setup_modes.pop(user_id, None)
-                notice = "Настройка отменена. Её можно начать заново через /connect."
+                setup_chat_id = setup_state.get("chat_id")
+                if setup_chat_id is not None:
+                    try:
+                        setup_chat_id = int(setup_chat_id)
+                    except (TypeError, ValueError):
+                        setup_chat_id = None
+                bot.answer_callback_query(call.id, "Настройка отменена")
+                _cancel_customer_connection(
+                    user_id,
+                    setup_chat_id,
+                    callback_message=call.message,
+                )
+                return
             elif is_admin(call.from_user.id):
                 pending_chats = getattr(process_add_chat_step1, "pending_chats", None)
                 if isinstance(pending_chats, dict):
@@ -6359,7 +6447,7 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "Защищённая страница готова")
         cancel_keyboard = types.InlineKeyboardMarkup(row_width=1)
         cancel_keyboard.add(types.InlineKeyboardButton(
-            "❌ Отменить авторизацию", callback_data=f"qr_cancel_{target_id}"
+            "❌ Отмена", callback_data=f"qr_cancel_{target_id}"
         ))
         try:
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=cancel_keyboard)
@@ -6367,7 +6455,7 @@ def admin_callbacks(call):
             pass
         link_keyboard = types.InlineKeyboardMarkup(row_width=1)
         link_keyboard.add(types.InlineKeyboardButton("🔐 Открыть MAX и войти", url=link))
-        bot.send_message(
+        link_message = bot.send_message(
             call.message.chat.id,
             "📱 <b>Вход в MAX по номеру</b>\n\n"
             "Откройте защищённую страницу и проходите вход прямо в окне MAX: выберите вход по номеру, "
@@ -6379,6 +6467,7 @@ def admin_callbacks(call):
             reply_markup=link_keyboard,
             **NO_PREVIEW,
         )
+        _track_auth_message(target_id, link_message)
         _start_remote_login_monitor(target_id, session, call.message.chat.id)
     elif action.startswith("qr_ready_"):
         target_id = _qr_target_from_action(action)
@@ -6390,6 +6479,8 @@ def admin_callbacks(call):
         chat = get_chat_by_id(target_id) if target_id != "project_account" else None
         title = "готового аккаунта" if target_id == "project_account" else chat["title"]
         status, data = session.check()
+        if active_logins.get(target_id) is not session:
+            return
         if status == "success":
             _complete_login(target_id, call.message.chat.id)
         elif status == "awaiting_password":
@@ -6397,7 +6488,7 @@ def admin_callbacks(call):
             try:
                 photo_obj = io.BytesIO(data)
                 kb = _build_password_keyboard(target_id)
-                bot.send_photo(
+                auth_message = bot.send_photo(
                     call.message.chat.id,
                     photo_obj,
                     caption=(
@@ -6409,40 +6500,45 @@ def admin_callbacks(call):
                     parse_mode='HTML',
                     reply_markup=kb
                 )
+                _track_auth_message(target_id, auth_message)
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}", **NO_PREVIEW)
         elif status == "awaiting_code":
             _set_auth_waiter(awaiting_code_from, target_id, call.from_user.id)
-            bot.send_message(
+            auth_message = bot.send_message(
                 call.message.chat.id,
                 "📩 MAX перешёл к вводу кода. Проверьте SMS и чат «Коды авторизации» в MAX. "
                 "Когда код придёт, отправьте его следующим сообщением; после обработки оно будет удалено.",
                 reply_markup=_build_password_keyboard(target_id),
                 **NO_PREVIEW,
             )
+            _track_auth_message(target_id, auth_message)
         elif status == "awaiting_human":
-            bot.send_message(
+            auth_message = bot.send_message(
                 call.message.chat.id,
                 _auth_human_check_text(session, data),
                 reply_markup=_build_auth_check_keyboard(target_id),
                 **NO_PREVIEW,
             )
+            _track_auth_message(target_id, auth_message)
         elif status == "awaiting_phone":
-            bot.send_message(
+            auth_message = bot.send_message(
                 call.message.chat.id,
                 "MAX показывает форму ввода номера. Чтобы пройти вход самостоятельно, выберите «Войти по номеру телефона» "
                 "и откройте защищённую страницу. Номер и код вводите только там, не в Telegram.",
                 reply_markup=_build_qr_keyboard(target_id),
                 **NO_PREVIEW,
             )
+            _track_auth_message(target_id, auth_message)
         elif status == "waiting":
-            bot.send_message(
+            auth_message = bot.send_message(
                 call.message.chat.id,
                 "⚠️ MAX пока не подтвердил вход. Убедитесь, что QR-код отсканирован в приложении MAX, "
                 "и нажмите кнопку ещё раз. Либо откройте защищённую страницу для входа по номеру телефона.",
                 reply_markup=_build_qr_keyboard(target_id),
                 **NO_PREVIEW,
             )
+            _track_auth_message(target_id, auth_message)
         else:
             bot.send_message(
                 call.message.chat.id,
@@ -6460,6 +6556,8 @@ def admin_callbacks(call):
         chat = get_chat_by_id(target_id) if target_id != "project_account" else None
         title = "готового аккаунта" if target_id == "project_account" else chat["title"]
         status, data = session.refresh()
+        if active_logins.get(target_id) is not session:
+            return
         if status == "success":
             _complete_login(target_id, call.message.chat.id)
             return
@@ -6489,16 +6587,12 @@ def admin_callbacks(call):
             bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}", **NO_PREVIEW)
     elif action.startswith("qr_cancel_"):
         target_id = _qr_target_from_action(action)
-        session = active_logins.pop(target_id, None)
-        if session:
-            remote_auth_service.revoke_session(session)
-            try:
-                session.close()
-            except:
-                pass
-        _clear_auth_waiters(target_id)
-        bot.answer_callback_query(call.id, "❌ Авторизация отменена", show_alert=True)
-        bot.send_message(call.message.chat.id, "❌ Процесс авторизации отменён.", **NO_PREVIEW)
+        bot.answer_callback_query(call.id, "Настройка отменена")
+        _cancel_customer_connection(
+            call.from_user.id,
+            target_id,
+            callback_message=call.message,
+        )
     elif action == "admin_sent_messages":
         _show_sent_parser_chats(call.message.chat.id, call.message.message_id)
     elif action.startswith("admin_sent_chat_"):
