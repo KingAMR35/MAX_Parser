@@ -5029,7 +5029,7 @@ def _verify_project_chat_access(
         try:
             bot.send_message(
                 owner_id,
-                "🎉 Подключение завершено!\n\n"
+                "<b>🎉 Подключение завершено!</b>\n\n"
                 "MAX открыл чат, и пересылка включена. Бот будет отправлять сообщения "
                 "в выбранную Telegram-группу.",
                 **NO_PREVIEW,
@@ -7523,6 +7523,39 @@ def callback_handler(call):
             video_keyboard.add(types.InlineKeyboardButton(
                 "🔙 К выбору способа", callback_data="video_instruction"
             ))
+            if call.data == "video_instruction_phone":
+                video_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "media",
+                    "phone_login_instruction.mp4",
+                )
+                try:
+                    with open(video_path, "rb") as phone_video:
+                        bot.send_video(
+                            call.message.chat.id,
+                            phone_video,
+                            caption="🎬 <b>Видеоинструкция · вход по номеру телефона</b>",
+                            reply_markup=video_keyboard,
+                            supports_streaming=True,
+                        )
+                    try:
+                        bot.delete_message(
+                            call.message.chat.id, call.message.message_id
+                        )
+                    except Exception:
+                        pass
+                except Exception as error:
+                    debug_logger.warning(
+                        "PHONE_LOGIN_INSTRUCTION_VIDEO_SEND_FAILED error_type=%s",
+                        type(error).__name__,
+                    )
+                    bot.send_message(
+                        call.message.chat.id,
+                        "Не удалось отправить видеоинструкцию. Попробуйте ещё раз позже.",
+                        reply_markup=video_keyboard,
+                        **NO_PREVIEW,
+                    )
+                return
             bot.edit_message_text(
                 "🎬 <b>Видео инструкция</b>\n\nВидео для этого способа пока не добавлено.",
                 call.message.chat.id,
