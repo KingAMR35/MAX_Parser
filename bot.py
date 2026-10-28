@@ -43,6 +43,7 @@ PAYMENT_ADMIN_BYPASS = os.getenv("PAYMENT_ADMIN_BYPASS", "true").strip().lower()
 _current_cycle_hashes = {}
 NO_PREVIEW = {"disable_web_page_preview": True}
 active_logins = {}
+auth_login_review_events = {}
 auth_qr_message_ids = {}
 awaiting_password_from = {}
 awaiting_phone_from = {}
@@ -1687,17 +1688,6 @@ def process_single_chat(chat):
                 sum(item.get("status") == "failed" for item in parse_diagnostics),
                 parse_diagnostics,
             )
-        if chat.get("is_active") and owner_id > 0:
-            try:
-                _maybe_offer_review(
-                    owner_id,
-                    f"{chat_id}:{chat.get('account_mode') or 'self'}",
-                )
-            except Exception as notify_error:
-                debug_logger.warning(
-                    "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
-                    owner_id, type(notify_error).__name__,
-                )
         return True
     except Exception as error:
         _store_parse_diagnostic(
@@ -2049,6 +2039,7 @@ def _track_auth_message(target_chat_id, message):
 
 
 def _complete_login(target_chat_id, output_chat_id):
+    review_event_id = auth_login_review_events.pop(target_chat_id, None)
     active_logins.pop(target_chat_id, None)
     _clear_auth_waiters(target_chat_id)
     _clear_auth_qr_controls(target_chat_id)
@@ -2079,16 +2070,17 @@ def _complete_login(target_chat_id, output_chat_id):
         ).start()
     elif chat and chat.get("owner_id"):
         owner_id = int(chat["owner_id"])
-        try:
-            _offer_review_after_connection(
-                owner_id,
-                f"{target_chat_id}:{chat.get('account_mode') or 'self'}",
-            )
-        except Exception as error:
-            debug_logger.warning(
-                "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
-                owner_id, type(error).__name__,
-            )
+        if review_event_id:
+            try:
+                _offer_review_after_connection(
+                    owner_id,
+                    f"{target_chat_id}:{chat.get('account_mode') or 'self'}:{review_event_id}",
+                )
+            except Exception as error:
+                debug_logger.warning(
+                    "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
+                    owner_id, type(error).__name__,
+                )
 
 
 def _monitor_remote_login(target_chat_id, session, output_chat_id):
@@ -2113,6 +2105,7 @@ def _monitor_remote_login(target_chat_id, session, output_chat_id):
             if status == "error":
                 if active_logins.get(target_chat_id) is session:
                     active_logins.pop(target_chat_id, None)
+                    auth_login_review_events.pop(target_chat_id, None)
                 remote_auth_service.revoke_session(session)
                 try:
                     session.close()
@@ -2131,6 +2124,7 @@ def _monitor_remote_login(target_chat_id, session, output_chat_id):
             time.sleep(1.5)
         if active_logins.get(target_chat_id) is session:
             active_logins.pop(target_chat_id, None)
+            auth_login_review_events.pop(target_chat_id, None)
         remote_auth_service.revoke_session(session)
         try:
             session.close()
@@ -2175,6 +2169,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
         return
     title = "готового аккаунта" if is_project_account else chat["title"]
     _clear_auth_qr_controls(target_chat_id)
+    auth_login_review_events.pop(target_chat_id, None)
     session = active_logins.pop(target_chat_id, None)
     if session:
         remote_auth_service.revoke_session(session)
@@ -2208,7 +2203,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
             owner_id = int(chat["owner_id"])
             _offer_review_after_connection(
                 owner_id,
-                f"{target_chat_id}:{chat.get('account_mode') or 'self'}",
+                f"{target_chat_id}:{chat.get('account_mode') or 'self'}:{uuid.uuid4().hex}",
             )
         return
     if status == "error":
@@ -2219,6 +2214,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
         )
         return
     active_logins[target_chat_id] = session
+    auth_login_review_events[target_chat_id] = uuid.uuid4().hex
     try:
         qr_message = bot.send_photo(
             admin_chat_id,
@@ -2239,6 +2235,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
         bot.send_message(admin_chat_id, f"❌ Ошибка отправки QR-кода: {error}", **NO_PREVIEW)
         session.close()
         active_logins.pop(target_chat_id, None)
+        auth_login_review_events.pop(target_chat_id, None)
 
 def show_admin_menu(chat_id):
     stats = get_global_stats()
@@ -3309,6 +3306,7 @@ def start_keyboard():
     keyboard.add(types.InlineKeyboardButton("🔎 О парсинге", callback_data="about_bot"))
     keyboard.add(types.InlineKeyboardButton("💬 Тех поддержка", callback_data="support_start"))
     keyboard.add(types.InlineKeyboardButton("⭐ Отзывы", callback_data="reviews_show"))
+    keyboard.add(types.InlineKeyboardButton("💛 Благодарности", callback_data="thanks_project"))
     return keyboard
 
 def return_start():
@@ -4302,6 +4300,7 @@ def _cancel_customer_connection(user_id, chat_id=None, callback_message=None):
 
     session = active_logins.pop(chat_id, None) if chat_id is not None else None
     if chat_id is not None:
+        auth_login_review_events.pop(chat_id, None)
         _clear_auth_waiters(chat_id)
 
     output_chat_id = callback_message.chat.id if callback_message else user_id
@@ -7190,7 +7189,30 @@ def my_chat_delete_callbacks(call):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     if call.message:
-        if call.data == "about_bot":
+        if call.data == "thanks_project":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    '''📜 <b>История MAX_Parser</b>
+
+Каждый проект начинается с идеи, но становится настоящим благодаря людям, которые поддерживают её.
+
+<b>MAX_Parser</b> благодарит:
+
+@novelly1338
+@voidknight009  
+@T1M1Ktg  
+
+Спасибо за поддержку, доверие и участие в развитии проекта.  
+Ваш вклад навсегда останется частью его истории. ✨'''
+                ),
+                reply_markup=return_start(),
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        elif call.data == "about_bot":
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
