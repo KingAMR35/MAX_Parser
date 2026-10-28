@@ -7502,14 +7502,32 @@ def callback_handler(call):
             video_keyboard.add(types.InlineKeyboardButton(
                 "🔙 Назад к подключению", callback_data="parse_setup"
             ))
-            bot.edit_message_text(
-                "🎬 <b>Видео инструкция</b>\n\nВыберите способ подключения:",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=video_keyboard,
-                parse_mode="HTML",
-                **NO_PREVIEW,
-            )
+            menu_text = "🎬 <b>Видео инструкция</b>\n\nВыберите способ подключения:"
+            if getattr(call.message, "video", None):
+                # Telegram cannot edit a video message's text; replace it with
+                # the method menu when the user returns from the phone video.
+                bot.send_message(
+                    call.message.chat.id,
+                    menu_text,
+                    reply_markup=video_keyboard,
+                    parse_mode="HTML",
+                    **NO_PREVIEW,
+                )
+                try:
+                    bot.delete_message(
+                        call.message.chat.id, call.message.message_id
+                    )
+                except Exception:
+                    pass
+            else:
+                bot.edit_message_text(
+                    menu_text,
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=video_keyboard,
+                    parse_mode="HTML",
+                    **NO_PREVIEW,
+                )
         elif call.data.startswith("video_instruction_"):
             if call.data not in {
                 "video_instruction_qr",
