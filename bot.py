@@ -3839,13 +3839,14 @@ def _notify_support_admin(user, body_message=None):
     support_keyboard = _support_admin_keyboard(user.id)
     body_text = body_message.text or body_message.caption or ""
     escaped_body_text = escape_html(body_text)
+    quoted_body_text = f"<blockquote>{escaped_body_text}</blockquote>" if body_text else ""
     content_type = getattr(body_message, "content_type", "")
-    card_prefix = header_text + "\n💬 <b>Сообщение:</b>\n\n"
+    card_prefix = header_text + "\n💬 <b>Сообщение:</b>\n"
 
     if content_type == "text" and len(card_prefix) + len(escaped_body_text) <= 4096:
         card = bot.send_message(
             ADMIN_ID,
-            card_prefix + escaped_body_text,
+            card_prefix + quoted_body_text,
             parse_mode="HTML",
             reply_markup=support_keyboard,
             **NO_PREVIEW,
@@ -3855,7 +3856,9 @@ def _notify_support_admin(user, body_message=None):
 
     caption_media_types = {"photo", "video", "document", "audio", "voice", "animation"}
     if content_type in caption_media_types:
-        caption = card_prefix + escape_html(body_text or "[без подписи]")
+        caption = card_prefix + (
+            quoted_body_text or "<blockquote>[без подписи]</blockquote>"
+        )
         if len(caption) <= 1024:
             try:
                 copied = bot.copy_message(
@@ -3882,18 +3885,50 @@ def _notify_support_admin(user, body_message=None):
         **NO_PREVIEW,
     )
     _map_support_message(header.message_id, user.id)
+    if content_type == "text":
+        try:
+            quoted_message = bot.send_message(
+                ADMIN_ID,
+                quoted_body_text or "<blockquote>[без текста]</blockquote>",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            _map_support_message(quoted_message.message_id, user.id)
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_TEXT_CARD_SEND_FAILED user_id=%s error_type=%s",
+                user.id, type(error).__name__,
+            )
+        return
     try:
-        copied = bot.copy_message(
-            ADMIN_ID,
-            body_message.chat.id,
-            body_message.message_id,
-        )
+        if content_type in caption_media_types and body_text:
+            quoted_message = bot.send_message(
+                ADMIN_ID,
+                quoted_body_text,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            _map_support_message(quoted_message.message_id, user.id)
+            copied = bot.copy_message(
+                ADMIN_ID,
+                body_message.chat.id,
+                body_message.message_id,
+                caption="",
+                parse_mode="HTML",
+            )
+        else:
+            copied = bot.copy_message(
+                ADMIN_ID,
+                body_message.chat.id,
+                body_message.message_id,
+            )
         _map_support_message(copied.message_id, user.id)
     except Exception as error:
         fallback = body_message.text or body_message.caption or "[Вложение не удалось скопировать]"
         copied = bot.send_message(
             ADMIN_ID,
-            f"⚠️ <b>Сообщение не удалось скопировать</b>\n{escape_html(fallback[:3000])}\n\n"
+            f"⚠️ <b>Сообщение не удалось скопировать</b>\n"
+            f"<blockquote>{escape_html(fallback[:3000])}</blockquote>\n\n"
             f"Причина: <code>{escape_html(str(error)[:500])}</code>",
             parse_mode="HTML",
             **NO_PREVIEW,
@@ -6949,7 +6984,9 @@ def admin_callbacks(call):
 
         prompt = bot.send_message(
             call.message.chat.id,
-            "💬 Введите текст рассылки:"
+            "💬 Введите текст рассылки:",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
         )
 
         bot.register_next_step_handler(prompt, process_broadcast_message)
