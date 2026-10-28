@@ -4596,10 +4596,10 @@ def _project_source_instructions(owner_id, source_type, chat_id):
         ))
         text = (
             "<b>Шаг 2 из 2 · Группа или чат</b>\n\n"
-            f"1) Добавьте в вашу MAX группу готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
+            f"1) Добавьте в вашу MAX группу готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>.\n "
             "2) Затем перейдите по ссылке https://web.max.ru/, войдите в свой аккаунт, нажмите на свою группу, "
-            "скопируйе ссылку на группу и отправте сюда в чат"
-            "После этого бот проверит доступность бота и сообщит вам после проверки. "
+            "скопируйе ссылку на группу и отправте сюда в чат\n"
+            "После этого бот проверит доступность бота и сообщит вам после проверки.\n\n "
             "Если у вас будут какие-то вопросы или проблемы, то пишите /help"
         )
     else:
@@ -4609,9 +4609,9 @@ def _project_source_instructions(owner_id, source_type, chat_id):
         ))
         text = (
             "<b>Шаг 2 из 2 · Канал</b>\n\n"
-            "1) Перейдите по ссылке https://web.max.ru/ и войдите в свой аккаунт"
-            "2) Нажмите на канал, который вы хотите подключить и скопируйте ссылку."
-            "3) Пришлите ссылку сюда в чат. После этого бот проверить доступность этого канала."
+            "1) Перейдите по ссылке https://web.max.ru/ и войдите в свой аккаунт.\n"
+            "2) Нажмите на канал, который вы хотите подключить и скопируйте ссылку.\n"
+            "3) Пришлите ссылку сюда в чат. После этого бот проверить доступность этого канала.\n\n"
             "<b>Если возникли вопросы или что-то не получилось, то пишите</b> /help"
         )
     keyboard.add(types.InlineKeyboardButton(
@@ -5399,7 +5399,7 @@ def customer_source_url(message):
                 **NO_PREVIEW,
             )
             return
-        if link_kind == "invite":
+        if link_kind == "invite" or state.get("screen") == "invite":
             if _forward_project_invite_to_admin(message.from_user.id, chat_id, url):
                 return
             bot.send_message(
