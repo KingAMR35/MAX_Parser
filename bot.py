@@ -3305,8 +3305,8 @@ def start_keyboard():
     keyboard.add(types.InlineKeyboardButton("✔ Подключить MAX_Parser", callback_data="parse_setup"))
     keyboard.add(types.InlineKeyboardButton("🔎 О парсинге", callback_data="about_bot"))
     keyboard.add(types.InlineKeyboardButton("💬 Тех поддержка", callback_data="support_start"))
+    keyboard.add(types.InlineKeyboardButton("🫡 Благодарности", callback_data="thanks_project"))
     keyboard.add(types.InlineKeyboardButton("⭐ Отзывы", callback_data="reviews_show"))
-    keyboard.add(types.InlineKeyboardButton("💛 Благодарности", callback_data="thanks_project"))
     return keyboard
 
 def return_start():
@@ -7205,8 +7205,8 @@ def callback_handler(call):
 @voidknight009  
 @T1M1Ktg  
 
-Спасибо за поддержку, доверие и участие в развитии проекта.  
-Ваш вклад навсегда останется частью его истории. ✨'''
+<b>Спасибо за поддержку, доверие и участие в развитии проекта.  
+Ваш вклад навсегда останется частью его истории. ✨</b>'''
                 ),
                 reply_markup=return_start(),
                 parse_mode="HTML",
