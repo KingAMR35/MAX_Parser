@@ -2907,7 +2907,7 @@ def show_user_send_selector(chat_id, message_id, page=0):
     shown = users[first:first + ADMIN_LIST_PAGE_SIZE]
     text = f"👤 <b>Пользователи</b> · {len(users)} всего"
     if users:
-        text += "\nНажмите на ID, чтобы скопировать. Затем нажмите «Отправить по ID»."
+        text += "\nСкопируйте ID пользователя из списка и отправьте его боту."
         for user in shown:
             name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
             name = escape_html(name or "Имя не указано")
@@ -2917,7 +2917,6 @@ def show_user_send_selector(chat_id, message_id, page=0):
         text += "\n\nСписок пользователей пока пуст."
     kb = types.InlineKeyboardMarkup(row_width=1)
     _page_buttons(kb, page, page_count, "admin_send_users_page")
-    kb.add(types.InlineKeyboardButton("✉️ Отправить по ID", callback_data="admin_send_user_manual"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
@@ -2930,7 +2929,7 @@ def show_chat_send_selector(chat_id, message_id, page=0):
     shown = chats[first:first + ADMIN_LIST_PAGE_SIZE]
     text = f"💬 <b>Чаты</b> · {len(chats)} всего"
     if chats:
-        text += "\nНажмите на ID, чтобы скопировать. Затем нажмите «Отправить по ID»."
+        text += "\nСкопируйте ID чата из списка и отправьте его боту."
         for chat in shown:
             title = escape_html(chat.get("title") or "Без названия")
             text += f"\n\n<b>{title}</b>\n🆔 ID: <code>{chat['chat_id']}</code>"
@@ -2938,7 +2937,6 @@ def show_chat_send_selector(chat_id, message_id, page=0):
         text += "\n\nЧатов пока нет."
     kb = types.InlineKeyboardMarkup(row_width=1)
     _page_buttons(kb, page, page_count, "admin_send_chats_page")
-    kb.add(types.InlineKeyboardButton("✉️ Отправить по ID", callback_data="admin_send_chat_manual"))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
 
@@ -3316,6 +3314,7 @@ def parser_keyboard():
     keyboard.add(types.InlineKeyboardButton("✨ Мульти-подписка · от 599 ₽", callback_data="connect_multi"))
     keyboard.add(types.InlineKeyboardButton("ℹ️ Разница способов", callback_data="compare_modes"))
     keyboard.add(types.InlineKeyboardButton("📖 Инструкция", callback_data="instruction"))
+    keyboard.add(types.InlineKeyboardButton("🎬 Видео инструкция", callback_data="video_instruction"))
     keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
     return keyboard
 
@@ -3410,6 +3409,7 @@ def show_connection_method_picker(chat_id, message_id=None):
     keyboard.add(types.InlineKeyboardButton(
         "2️⃣ Подключить через готовый аккаунт", callback_data="setup_mode_project"
     ))
+    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="parse_setup"))
     text = (
         "✨ <b>Мульти-подписка активна</b>\n\n"
         "Вам доступны оба способа подключения. Выберите, какой использовать для этого чата."
@@ -3811,19 +3811,69 @@ def _map_support_message(message_id, user_id):
 
 def _notify_support_admin(user, body_message=None):
     full_name, username = _support_user_label(user)
-    header = bot.send_message(
-        ADMIN_ID,
+    header_text = (
         "🆘 <b>Обращение в тех поддержку</b>\n"
         f"👤 {full_name}\n"
         f"🔎 Никнейм: {username}\n"
-        f"🆔 ID: <code>{user.id}</code>",
+        f"🆔 ID: <code>{user.id}</code>"
+    )
+    if body_message is None:
+        header = bot.send_message(
+            ADMIN_ID,
+            header_text,
+            parse_mode="HTML",
+            reply_markup=_support_admin_keyboard(user.id),
+            **NO_PREVIEW,
+        )
+        _map_support_message(header.message_id, user.id)
+        return
+
+    support_keyboard = _support_admin_keyboard(user.id)
+    body_text = body_message.text or body_message.caption or ""
+    escaped_body_text = escape_html(body_text)
+    content_type = getattr(body_message, "content_type", "")
+    card_prefix = header_text + "\n💬 <b>Сообщение:</b>\n\n"
+
+    if content_type == "text" and len(card_prefix) + len(escaped_body_text) <= 4096:
+        card = bot.send_message(
+            ADMIN_ID,
+            card_prefix + escaped_body_text,
+            parse_mode="HTML",
+            reply_markup=support_keyboard,
+            **NO_PREVIEW,
+        )
+        _map_support_message(card.message_id, user.id)
+        return
+
+    caption_media_types = {"photo", "video", "document", "audio", "voice", "animation"}
+    if content_type in caption_media_types:
+        caption = card_prefix + escape_html(body_text or "[без подписи]")
+        if len(caption) <= 1024:
+            try:
+                copied = bot.copy_message(
+                    ADMIN_ID,
+                    body_message.chat.id,
+                    body_message.message_id,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=support_keyboard,
+                )
+                _map_support_message(copied.message_id, user.id)
+                return
+            except Exception as error:
+                debug_logger.info(
+                    "SUPPORT_MEDIA_CARD_COPY_FAILED user_id=%s error_type=%s",
+                    user.id, type(error).__name__,
+                )
+
+    header = bot.send_message(
+        ADMIN_ID,
+        card_prefix.rstrip(),
         parse_mode="HTML",
-        reply_markup=_support_admin_keyboard(user.id),
+        reply_markup=support_keyboard,
         **NO_PREVIEW,
     )
     _map_support_message(header.message_id, user.id)
-    if body_message is None:
-        return
     try:
         copied = bot.copy_message(
             ADMIN_ID,
@@ -3872,7 +3922,6 @@ def start_support(chat_id, user):
             reply_markup=_support_keyboard(),
             **NO_PREVIEW,
         )
-        _notify_support_admin(user)
     except Exception as error:
         with support_state_lock:
             support_sessions.discard(user.id)
@@ -6812,14 +6861,30 @@ def admin_callbacks(call):
 
         bot.register_next_step_handler(prompt, process_broadcast_message)
     elif action == "admin_send_to_chat":
+        bot.answer_callback_query(call.id)
         show_chat_send_selector(call.message.chat.id, call.message.message_id)
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "Отправьте ID чата из списка, затем отправьте сообщение для него.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_send_to_chat_id)
     elif action.startswith("admin_send_chats_page_"):
         show_chat_send_selector(
             call.message.chat.id, call.message.message_id,
             int(action.rsplit("_", 1)[1]),
         )
     elif action == "admin_send_to_user":
+        bot.answer_callback_query(call.id)
         show_user_send_selector(call.message.chat.id, call.message.message_id)
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "Отправьте ID пользователя из списка, затем отправьте сообщение для него.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_send_to_user_id)
     elif action.startswith("admin_send_users_page_"):
         show_user_send_selector(
             call.message.chat.id, call.message.message_id,
@@ -7224,6 +7289,50 @@ def callback_handler(call):
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=text, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
+        elif call.data == "video_instruction":
+            bot.answer_callback_query(call.id)
+            video_keyboard = types.InlineKeyboardMarkup(row_width=1)
+            video_keyboard.add(types.InlineKeyboardButton(
+                "1️⃣ 1 вариант · QR-код", callback_data="video_instruction_qr"
+            ))
+            video_keyboard.add(types.InlineKeyboardButton(
+                "2️⃣ 1 вариант · телефон", callback_data="video_instruction_phone"
+            ))
+            video_keyboard.add(types.InlineKeyboardButton(
+                "3️⃣ 2 вариант · готовый аккаунт", callback_data="video_instruction_project"
+            ))
+            video_keyboard.add(types.InlineKeyboardButton(
+                "🔙 Назад к подключению", callback_data="parse_setup"
+            ))
+            bot.edit_message_text(
+                "🎬 <b>Видео инструкция</b>\n\nВыберите способ подключения:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=video_keyboard,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        elif call.data.startswith("video_instruction_"):
+            if call.data not in {
+                "video_instruction_qr",
+                "video_instruction_phone",
+                "video_instruction_project",
+            }:
+                bot.answer_callback_query(call.id, "Не удалось определить способ", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            video_keyboard = types.InlineKeyboardMarkup(row_width=1)
+            video_keyboard.add(types.InlineKeyboardButton(
+                "🔙 К выбору способа", callback_data="video_instruction"
+            ))
+            bot.edit_message_text(
+                "🎬 <b>Видео инструкция</b>\n\nВидео для этого способа пока не добавлено.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=video_keyboard,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
         elif call.data == "instruction":
             instruction_kb = types.InlineKeyboardMarkup(row_width=1)
             instruction_kb.add(types.InlineKeyboardButton("💬 Задать вопрос к поддержке", callback_data="support_start"))
