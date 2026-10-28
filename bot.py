@@ -4979,6 +4979,11 @@ def _verify_project_chat_access(
         return False
     session_path = _session_path_for_chat(chat)
     if not os.path.exists(session_path):
+        if (
+            str(pending_state.get("chat_id") or "") == str(chat_id)
+            and pending_state.get("screen") == "verifying"
+        ):
+            pending_state["screen"] = "invite"
         report(
             "Ссылка сохранена. Готовый аккаунт ещё не подключён. "
             "После его авторизации бот автоматически проверит доступ к этому чату.",
@@ -5053,6 +5058,11 @@ def _verify_project_chat_access(
             "PROJECT_GROUP_ACCESS_CHECK_FAILED chat_id=%s owner_id=%s error_type=%s",
             chat_id, owner_id, type(error).__name__,
         )
+        if (
+            str(pending_state.get("chat_id") or "") == str(chat_id)
+            and pending_state.get("screen") == "verifying"
+        ):
+            pending_state["screen"] = "invite"
         latest_chat = get_chat_by_id(chat_id)
         keyboard = _project_access_retry_keyboard(
             chat_id,
@@ -5386,14 +5396,6 @@ def customer_source_url(message):
                 message.chat.id,
                 "Ссылка уже передана администратору. Дождитесь, пока он вручную вступит "
                 "и отправит боту обычную ссылку на чат.",
-                **NO_PREVIEW,
-            )
-            return
-        if state.get("screen") == "invite" and link_kind != "invite":
-            bot.send_message(
-                message.chat.id,
-                "На этом шаге нужна именно ссылка-приглашение. После ручного вступления администратор "
-                "сам отправит боту обычную ссылку на чат.",
                 **NO_PREVIEW,
             )
             return
