@@ -449,8 +449,6 @@ def _find_uncaptioned_media_record(chat_id: int, post: dict):
                 same_chat = False
             if not same_chat or str(item.get("source_id") or "").strip() != source_id:
                 continue
-            # Older records predate the explicit caption flag. Their fallback
-            # preview means the original delivery contained media without text.
             captioned = item.get("captioned")
             if captioned is True or item.get("text_sent") is True:
                 continue
@@ -458,8 +456,6 @@ def _find_uncaptioned_media_record(chat_id: int, post: dict):
                 continue
             record_is_index = bool(item.get("source_id_is_index"))
             if not item.get("has_media") and not item.get("media_hashes"):
-                # Pre-migration records used this preview for media-only sends.
-                # Stable MAX IDs are sufficient to try attaching the late caption.
                 if record_is_index or post_is_index or item.get("preview") != "Медиа или вложение":
                     continue
             if post_is_index or record_is_index:
@@ -848,8 +844,6 @@ def _telegram_call(fn, *args, **kwargs):
             now = time.monotonic()
             wait = TELEGRAM_MIN_SEND_INTERVAL_SECONDS - (now - _telegram_last_send)
             if method_name.startswith("send_") and destination_key is not None:
-                # Telegram allows at most 20 messages/minute in a group and
-                # recommends at most one message/second in a private chat.
                 last_chat_send = _telegram_last_send_by_chat.get(destination_key, 0.0)
                 if destination_key < 0:
                     wait = max(wait, 3.0 - (now - last_chat_send))
@@ -1118,7 +1112,6 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                     len(chunk), log_preview(album_error, 240),
                 )
                 print(f"⚠️ [{chat_id}] Не удалось отправить альбом медиа: {album_error}")
-                # Если Telegram отклонил подпись/HTML, повторяем тот же альбом без неё.
                 if caption_in_album:
                     try:
                         retry_album = [_telegram_media_input(media, post) for media in chunk]
@@ -4738,8 +4731,6 @@ def _forward_project_invite_to_admin(owner_id, chat_id, invite_url):
         "awaiting_source_url": False,
     }
     try:
-        # Do not allow the scheduler or post-login checks to reuse an older
-        # source URL while the admin is still joining from the invitation.
         update_chat_url(chat_id, None)
     except Exception as error:
         project_invite_pending.pop(chat_id, None)
@@ -4902,8 +4893,6 @@ def _verify_project_chat_access(
             status_message_id = int(pending_state.get("status_message_id") or 0) or None
         except (TypeError, ValueError):
             status_message_id = None
-    # Keep the setup instructions intact. Progress and result belong in a
-    # separate status message, including automatic checks after login.
     report_message_id = progress_message_id or status_message_id
 
     def remember_status_message(message_id):
@@ -5012,8 +5001,6 @@ def _verify_project_chat_access(
             ):
                 report("Проверка остановлена: подключение было удалено или изменено.")
                 return False
-            # A successful retry must enable parsing; a failed retry never turns
-            # an already active chat off.
             toggle_chat(chat_id, True)
             current = get_chat_by_id(chat_id)
             if not current or not current.get("is_active"):
@@ -7449,7 +7436,6 @@ def callback_handler(call):
                 call.message.message_id,
             )
         elif call.data in ("renew_self", "renew_project"):
-            # Backward compatibility for old renewal buttons still in chat history.
             plan_code = "self" if call.data == "renew_self" else "project"
             bot.answer_callback_query(call.id)
             show_subscription_terms(
@@ -7457,7 +7443,6 @@ def callback_handler(call):
                 back_callback="subscription_products",
             )
         elif call.data in ("my_acc_250", "not_my_acc_250"):
-            # Backward compatibility for old connection buttons.
             plan_code = "self" if call.data == "my_acc_250" else "project"
             bot.answer_callback_query(call.id)
             _begin_connection_for_plan(
@@ -7494,18 +7479,16 @@ def callback_handler(call):
                 "1️⃣ 1 вариант · QR-код", callback_data="video_instruction_qr"
             ))
             video_keyboard.add(types.InlineKeyboardButton(
-                "2️⃣ 1 вариант · телефон", callback_data="video_instruction_phone"
+                "2️⃣ 1 вариант · Номер телефона", callback_data="video_instruction_phone"
             ))
             video_keyboard.add(types.InlineKeyboardButton(
-                "3️⃣ 2 вариант · готовый аккаунт", callback_data="video_instruction_project"
+                "3️⃣ 2 вариант · Готовый аккаунт", callback_data="video_instruction_project"
             ))
             video_keyboard.add(types.InlineKeyboardButton(
                 "🔙 Назад к подключению", callback_data="parse_setup"
             ))
             menu_text = "🎬 <b>Видео инструкция</b>\n\nВыберите способ подключения:"
             if getattr(call.message, "video", None):
-                # Telegram cannot edit a video message's text; replace it with
-                # the method menu when the user returns from the phone video.
                 bot.send_message(
                     call.message.chat.id,
                     menu_text,

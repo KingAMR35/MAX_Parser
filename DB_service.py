@@ -135,8 +135,6 @@ def init_db():
                 PRIMARY KEY (admin_chat_id, message_id)
             """)
 
-        # Separate names keep the Telegram payment schema independent from any
-        # earlier experimental payment tables that may still exist in Postgres.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS telegram_payment_orders (
                 payload TEXT PRIMARY KEY,
@@ -160,7 +158,6 @@ def init_db():
             ON telegram_payment_orders (user_id, created_at DESC)
         """)
 
-        # Existing installations may still have the original two-plan constraint.
         conn.execute("""
             ALTER TABLE telegram_payment_orders
             DROP CONSTRAINT IF EXISTS telegram_payment_orders_plan_code_check
@@ -194,9 +191,6 @@ def init_db():
             )
         """)
 
-        # Keep independent access periods for the two single-method products and
-        # the multi subscription. This prevents one purchase from overwriting
-        # another active product.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS telegram_subscription_entitlements (
                 user_id BIGINT NOT NULL,
@@ -211,7 +205,6 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_telegram_subscription_entitlements_active_until
             ON telegram_subscription_entitlements (active_until)
         """)
-        # Migrate the previous one-subscription-per-user records idempotently.
         conn.execute("""
             INSERT INTO telegram_subscription_entitlements
                 (user_id, plan_code, active_until, updated_at, reminder_sent_at)
@@ -255,8 +248,6 @@ def init_db():
                 applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Existing review text was test data. Clear it once while preserving
-        # each user's eligibility state so they are not prompted a second time.
         conn.execute("""
             WITH inserted AS (
                 INSERT INTO app_migrations (version)
@@ -787,8 +778,6 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
     """Bind a Telegram destination to one customer; never transfer an existing owner."""
     with get_connection() as conn:
         with conn.transaction():
-            # Serialize new claims per customer so simultaneous /bind commands
-            # cannot bypass the per-owner chat limit.
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (int(owner_id),))
             conn.execute("""
                 INSERT INTO chats (chat_id, title, owner_id, account_mode, is_active, message_count)
@@ -934,7 +923,7 @@ def get_global_stats():
     }
 
 
-#! ============ TELEGRAM PAYMENTS / SUBSCRIPTIONS ============
+#! ============ TELEGRAM PAYMENTS ============
 
 def create_payment_order(
     user_id: int, plan_code: str, amount: int, duration_months: int = 1
