@@ -91,10 +91,49 @@ def init_db():
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS support_message_routes (
-                message_id BIGINT PRIMARY KEY,
-                user_id BIGINT NOT NULL
+                admin_chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                PRIMARY KEY (admin_chat_id, message_id)
             )
         """)
+        conn.execute("""
+            ALTER TABLE support_message_routes
+            ADD COLUMN IF NOT EXISTS admin_chat_id BIGINT
+        """)
+        primary_admin_id = int(os.getenv("ADMIN_ID") or 0)
+        conn.execute(
+            "UPDATE support_message_routes SET admin_chat_id = %s WHERE admin_chat_id IS NULL",
+            (primary_admin_id,),
+        )
+        conn.execute("""
+            ALTER TABLE support_message_routes
+            ALTER COLUMN admin_chat_id SET NOT NULL
+        """)
+        route_primary_key = conn.execute("""
+            SELECT c.conname,
+                   array_agg(a.attname ORDER BY route_key.ordinality) AS columns
+            FROM pg_constraint AS c
+            JOIN LATERAL unnest(c.conkey) WITH ORDINALITY
+                AS route_key(attnum, ordinality) ON TRUE
+            JOIN pg_attribute AS a
+              ON a.attrelid = c.conrelid AND a.attnum = route_key.attnum
+            WHERE c.conrelid = 'support_message_routes'::regclass
+              AND c.contype = 'p'
+            GROUP BY c.conname
+        """).fetchone()
+        if not route_primary_key or list(route_primary_key["columns"]) != [
+            "admin_chat_id", "message_id"
+        ]:
+            conn.execute("""
+                ALTER TABLE support_message_routes
+                DROP CONSTRAINT IF EXISTS support_message_routes_pkey
+            """)
+            conn.execute("""
+                ALTER TABLE support_message_routes
+                ADD CONSTRAINT support_message_routes_pkey
+                PRIMARY KEY (admin_chat_id, message_id)
+            """)
 
         # Separate names keep the Telegram payment schema independent from any
         # earlier experimental payment tables that may still exist in Postgres.
@@ -363,6 +402,12 @@ def add_or_update_user(user_id: int, username: str = None, first_name: str = Non
         """, (user_id, username, first_name, last_name))
 
 
+def delete_user(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM users WHERE user_id = %s", (int(user_id),))
+        return cursor.rowcount == 1
+
+
 def get_all_users():
     with get_connection() as conn:
         rows = conn.execute("""
@@ -392,18 +437,25 @@ def get_open_support_sessions():
         return [int(row["user_id"]) for row in rows]
 
 
-def save_support_message_route(message_id: int, user_id: int):
+def save_support_message_route(admin_chat_id: int, message_id: int, user_id: int):
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO support_message_routes (message_id, user_id) VALUES (%s, %s)
-            ON CONFLICT (message_id) DO UPDATE SET user_id = EXCLUDED.user_id
-        """, (message_id, user_id))
+            INSERT INTO support_message_routes (admin_chat_id, message_id, user_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (admin_chat_id, message_id)
+            DO UPDATE SET user_id = EXCLUDED.user_id
+        """, (int(admin_chat_id), int(message_id), int(user_id)))
 
 
 def get_support_message_routes():
     with get_connection() as conn:
-        rows = conn.execute("SELECT message_id, user_id FROM support_message_routes").fetchall()
-        return {int(row["message_id"]): int(row["user_id"]) for row in rows}
+        rows = conn.execute(
+            "SELECT admin_chat_id, message_id, user_id FROM support_message_routes"
+        ).fetchall()
+        return {
+            (int(row["admin_chat_id"]), int(row["message_id"])): int(row["user_id"])
+            for row in rows
+        }
 
 
 def close_support_session(user_id: int):

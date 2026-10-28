@@ -27,6 +27,16 @@ print("🚀 MAX Parser Bot запущен")
 bot = telebot.TeleBot(os.getenv("BOT_TOKEN"), parse_mode='HTML')
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 add_admin(ADMIN_ID, "main_admin")
+try:
+    BOT_USER_ID = int(os.getenv("BOT_TOKEN", "").split(":", 1)[0])
+    delete_user(BOT_USER_ID)
+except (TypeError, ValueError):
+    BOT_USER_ID = None
+except Exception as error:
+    BOT_USER_ID = None
+    debug_logger.warning(
+        "BOT_USER_TABLE_CLEANUP_FAILED error_type=%s", type(error).__name__
+    )
 TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "").strip()
 YOOKASSA_RECEIPTS_SETTING = os.getenv("YOOKASSA_RECEIPTS_ENABLED", "").strip().lower()
 YOOKASSA_RECEIPTS_SETTING_CONFIRMED = YOOKASSA_RECEIPTS_SETTING in {
@@ -1965,6 +1975,10 @@ def get_cancel_keyboard():
 def track_user(message_or_callback):
     try:
         user = message_or_callback.from_user
+        if getattr(user, "is_bot", False) or (
+            BOT_USER_ID is not None and int(user.id) == BOT_USER_ID
+        ):
+            return
         username = user.username or ''
         first_name = user.first_name or ''
         last_name = user.last_name or ''
@@ -3811,13 +3825,25 @@ def _support_user_label(user):
     return full_name, username
 
 
-def _map_support_message(message_id, user_id):
+def _map_support_message(admin_chat_id, message_id, user_id):
+    route_key = (int(admin_chat_id), int(message_id))
     with support_state_lock:
-        support_message_routes[message_id] = user_id
-        save_support_message_route(message_id, user_id)
+        support_message_routes[route_key] = int(user_id)
+        save_support_message_route(admin_chat_id, message_id, user_id)
 
 
-def _notify_support_admin(user, body_message=None):
+def _support_admin_ids():
+    admin_ids = {int(ADMIN_ID)}
+    try:
+        admin_ids.update(int(admin["user_id"]) for admin in get_all_admins())
+    except Exception as error:
+        debug_logger.warning(
+            "SUPPORT_ADMIN_LIST_FAILED error_type=%s", type(error).__name__
+        )
+    return sorted(admin_ids)
+
+
+def _notify_support_admin_one(admin_id, user, body_message=None):
     full_name, username = _support_user_label(user)
     header_text = (
         "🆘 <b>Обращение в тех поддержку</b>\n"
@@ -3827,13 +3853,13 @@ def _notify_support_admin(user, body_message=None):
     )
     if body_message is None:
         header = bot.send_message(
-            ADMIN_ID,
+            admin_id,
             header_text,
             parse_mode="HTML",
             reply_markup=_support_admin_keyboard(user.id),
             **NO_PREVIEW,
         )
-        _map_support_message(header.message_id, user.id)
+        _map_support_message(admin_id, header.message_id, user.id)
         return
 
     support_keyboard = _support_admin_keyboard(user.id)
@@ -3845,13 +3871,13 @@ def _notify_support_admin(user, body_message=None):
 
     if content_type == "text" and len(card_prefix) + len(escaped_body_text) <= 4096:
         card = bot.send_message(
-            ADMIN_ID,
+            admin_id,
             card_prefix + quoted_body_text,
             parse_mode="HTML",
             reply_markup=support_keyboard,
             **NO_PREVIEW,
         )
-        _map_support_message(card.message_id, user.id)
+        _map_support_message(admin_id, card.message_id, user.id)
         return
 
     caption_media_types = {"photo", "video", "document", "audio", "voice", "animation"}
@@ -3862,14 +3888,14 @@ def _notify_support_admin(user, body_message=None):
         if len(caption) <= 1024:
             try:
                 copied = bot.copy_message(
-                    ADMIN_ID,
+                    admin_id,
                     body_message.chat.id,
                     body_message.message_id,
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=support_keyboard,
                 )
-                _map_support_message(copied.message_id, user.id)
+                _map_support_message(admin_id, copied.message_id, user.id)
                 return
             except Exception as error:
                 debug_logger.info(
@@ -3878,22 +3904,22 @@ def _notify_support_admin(user, body_message=None):
                 )
 
     header = bot.send_message(
-        ADMIN_ID,
+        admin_id,
         card_prefix.rstrip(),
         parse_mode="HTML",
         reply_markup=support_keyboard,
         **NO_PREVIEW,
     )
-    _map_support_message(header.message_id, user.id)
+    _map_support_message(admin_id, header.message_id, user.id)
     if content_type == "text":
         try:
             quoted_message = bot.send_message(
-                ADMIN_ID,
+                admin_id,
                 quoted_body_text or "<blockquote>[без текста]</blockquote>",
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
-            _map_support_message(quoted_message.message_id, user.id)
+            _map_support_message(admin_id, quoted_message.message_id, user.id)
         except Exception as error:
             debug_logger.warning(
                 "SUPPORT_TEXT_CARD_SEND_FAILED user_id=%s error_type=%s",
@@ -3903,14 +3929,14 @@ def _notify_support_admin(user, body_message=None):
     try:
         if content_type in caption_media_types and body_text:
             quoted_message = bot.send_message(
-                ADMIN_ID,
+                admin_id,
                 quoted_body_text,
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
-            _map_support_message(quoted_message.message_id, user.id)
+            _map_support_message(admin_id, quoted_message.message_id, user.id)
             copied = bot.copy_message(
-                ADMIN_ID,
+                admin_id,
                 body_message.chat.id,
                 body_message.message_id,
                 caption="",
@@ -3918,22 +3944,37 @@ def _notify_support_admin(user, body_message=None):
             )
         else:
             copied = bot.copy_message(
-                ADMIN_ID,
+                admin_id,
                 body_message.chat.id,
                 body_message.message_id,
             )
-        _map_support_message(copied.message_id, user.id)
+        _map_support_message(admin_id, copied.message_id, user.id)
     except Exception as error:
         fallback = body_message.text or body_message.caption or "[Вложение не удалось скопировать]"
         copied = bot.send_message(
-            ADMIN_ID,
+            admin_id,
             f"⚠️ <b>Сообщение не удалось скопировать</b>\n"
             f"<blockquote>{escape_html(fallback[:3000])}</blockquote>\n\n"
             f"Причина: <code>{escape_html(str(error)[:500])}</code>",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
-        _map_support_message(copied.message_id, user.id)
+        _map_support_message(admin_id, copied.message_id, user.id)
+
+
+def _notify_support_admin(user, body_message=None):
+    delivered = 0
+    for admin_id in _support_admin_ids():
+        try:
+            _notify_support_admin_one(admin_id, user, body_message)
+            delivered += 1
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_ADMIN_NOTIFY_FAILED admin_id=%s user_id=%s error_type=%s",
+                admin_id, user.id, type(error).__name__,
+            )
+    if delivered == 0:
+        raise RuntimeError("Не удалось доставить обращение ни одному администратору")
 
 
 def start_support(chat_id, user):
@@ -3981,9 +4022,9 @@ def _close_support(user_id, notify_user=True):
     with support_state_lock:
         was_open = user_id in support_sessions
         support_sessions.discard(user_id)
-        for message_id, routed_user_id in list(support_message_routes.items()):
+        for route_key, routed_user_id in list(support_message_routes.items()):
             if routed_user_id == user_id:
-                support_message_routes.pop(message_id, None)
+                support_message_routes.pop(route_key, None)
         close_support_session(user_id)
     if was_open and notify_user:
         bot.send_message(
@@ -5470,9 +5511,9 @@ def handle_customer_review(message):
 
 @bot.message_handler(
     func=lambda m: m.chat.type == "private"
-    and m.from_user.id == ADMIN_ID
+    and is_admin(m.from_user.id)
     and m.reply_to_message is not None
-    and m.reply_to_message.message_id in support_message_routes
+    and (m.chat.id, m.reply_to_message.message_id) in support_message_routes
     and (
         not m.text
         or not m.text.startswith("/")
@@ -5481,7 +5522,8 @@ def handle_customer_review(message):
     content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
 )
 def support_admin_reply(message):
-    user_id = support_message_routes.get(message.reply_to_message.message_id)
+    route_key = (int(message.chat.id), int(message.reply_to_message.message_id))
+    user_id = support_message_routes.get(route_key)
     if not user_id:
         return
     if message.content_type == "text" and message.text.strip().lower() == "/close":
@@ -6034,7 +6076,8 @@ def admin_callbacks(call):
         except (ValueError, IndexError):
             bot.answer_callback_query(call.id, "Не удалось определить обращение", show_alert=True)
             return
-        if support_message_routes.get(call.message.message_id) != user_id:
+        route_key = (int(call.message.chat.id), int(call.message.message_id))
+        if support_message_routes.get(route_key) != user_id:
             bot.answer_callback_query(call.id, "Кнопка относится к уже завершённому обращению")
             return
         if _close_support(user_id):
