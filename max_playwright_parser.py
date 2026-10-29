@@ -1514,11 +1514,14 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
     cache = message_cache_by_chat.get(chat_id, set())
     source_id = str(post.get("source_id") or "").strip()
     if source_id and not post.get("source_id_is_index"):
-        # Stable MAX ids distinguish two legitimate posts with identical text
-        # and timestamps. Content signatures are only safe when MAX exposes no
-        # stable message id.
+        # Prefer a previously cached stable id, but do not treat an unfamiliar
+        # id as proof that a post is new. MAX can expose a different DOM id after
+        # reloading a card that an older parser version cached by content (or
+        # when an index-based id was replaced by a stable id). Fall through to
+        # the content signatures below so that such cached history is suppressed.
         stable_id_hash = get_legacy_message_hash(post)
-        return bool(stable_id_hash and stable_id_hash not in cache)
+        if stable_id_hash and stable_id_hash in cache:
+            return False
     signature = _get_post_content_signature(post)
     known_signatures = message_signatures_by_chat.get(chat_id, set())
     if signature and signature in known_signatures:
