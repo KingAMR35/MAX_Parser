@@ -926,27 +926,20 @@ def get_global_stats():
 #! ============ TELEGRAM PAYMENTS ============
 
 def create_payment_order(
-    user_id: int,
-    plan_code: str,
-    amount: int,
-    duration_months: int = 1,
-    currency: str = "RUB",
+    user_id: int, plan_code: str, amount: int, duration_months: int = 1
 ) -> str:
     if plan_code not in ("self", "project", "multi"):
         raise ValueError("Некорректный тариф")
     duration_months = int(duration_months)
     if duration_months not in {1, 3, 12}:
         raise ValueError("Некорректный срок подписки")
-    currency = str(currency).upper()
-    if currency not in {"RUB", "XTR"}:
-        raise ValueError("Неподдерживаемая валюта платежа")
     payload = f"maxparser_{uuid.uuid4().hex}"
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO telegram_payment_orders
-                (payload, user_id, plan_code, duration_months, amount, currency)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (payload, int(user_id), plan_code, duration_months, int(amount), currency))
+                (payload, user_id, plan_code, duration_months, amount)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (payload, int(user_id), plan_code, duration_months, int(amount)))
     return payload
 
 
@@ -985,7 +978,7 @@ def complete_payment_order(
     user_id: int,
     currency: str,
     total_amount: int,
-    provider_payment_charge_id: str | None,
+    provider_payment_charge_id: str,
     telegram_payment_charge_id: str,
 ):
     """Record a successful payment and extend the account subscription once."""
@@ -1009,8 +1002,6 @@ def complete_payment_order(
                     "already_paid": True,
                     "plan_code": order["plan_code"],
                     "duration_months": order["duration_months"],
-                    "amount": int(order["amount"]),
-                    "currency": order["currency"],
                     "active_until": subscription["active_until"] if subscription else None,
                 }
             if order["status"] != "checkout":
@@ -1048,8 +1039,6 @@ def complete_payment_order(
                 "already_paid": False,
                 "plan_code": order["plan_code"],
                 "duration_months": order["duration_months"],
-                "amount": int(order["amount"]),
-                "currency": order["currency"],
                 "active_until": subscription["active_until"],
             }
 

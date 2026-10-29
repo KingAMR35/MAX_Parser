@@ -38,16 +38,6 @@ except Exception as error:
         "BOT_USER_TABLE_CLEANUP_FAILED error_type=%s", type(error).__name__
     )
 TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "").strip()
-TELEGRAM_STARS_ENABLED = os.getenv("TELEGRAM_STARS_ENABLED", "true").strip().lower() in {
-    "1", "true", "yes", "on"
-}
-# Approximate creator proceeds per Star, expressed in RUB. Telegram currently
-# assigns $0.013 of reward value per Star; update this setting as the RUB/USD
-# rate changes if you want the RUB reference prices to track creator proceeds.
-try:
-    TELEGRAM_STARS_RUB_PER_STAR = float(os.getenv("TELEGRAM_STARS_RUB_PER_STAR", "1.0512632"))
-except (TypeError, ValueError):
-    TELEGRAM_STARS_RUB_PER_STAR = 1.0512632
 YOOKASSA_RECEIPTS_SETTING = os.getenv("YOOKASSA_RECEIPTS_ENABLED", "").strip().lower()
 YOOKASSA_RECEIPTS_SETTING_CONFIRMED = YOOKASSA_RECEIPTS_SETTING in {
     "1", "true", "yes", "on", "0", "false", "no", "off"
@@ -57,7 +47,7 @@ YOOKASSA_RECEIPT_VAT_CODE = os.getenv("YOOKASSA_RECEIPT_VAT_CODE", "").strip()
 YOOKASSA_RECEIPT_PAYMENT_MODE = os.getenv("YOOKASSA_RECEIPT_PAYMENT_MODE", "").strip()
 YOOKASSA_RECEIPT_PAYMENT_SUBJECT = os.getenv("YOOKASSA_RECEIPT_PAYMENT_SUBJECT", "").strip()
 YOOKASSA_RECEIPT_TAX_SYSTEM_CODE = os.getenv("YOOKASSA_RECEIPT_TAX_SYSTEM_CODE", "").strip()
-PAYMENTS_ENABLED = bool(TELEGRAM_PAYMENT_PROVIDER_TOKEN) or TELEGRAM_STARS_ENABLED
+PAYMENTS_ENABLED = bool(TELEGRAM_PAYMENT_PROVIDER_TOKEN)
 PAYMENT_ACCESS_ENFORCEMENT_ENABLED = os.getenv("PAYMENT_ACCESS_ENFORCEMENT_ENABLED").strip().lower() in {"1", "true", "yes", "on"}
 PAYMENT_ADMIN_BYPASS = os.getenv("PAYMENT_ADMIN_BYPASS", "true").strip().lower() in {"1", "true", "yes", "on"}
 _current_cycle_hashes = {}
@@ -3569,22 +3559,8 @@ def _yookassa_receipt_provider_data(plan_code, duration_months, amount):
     return json.dumps({"receipt": receipt}, ensure_ascii=False)
 
 
-def _subscription_stars_keyboard(plan_code, duration_months):
-    if not TELEGRAM_STARS_ENABLED:
-        return None
-    stars_amount = _subscription_stars_amount(plan_code, duration_months)
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(types.InlineKeyboardButton(
-        f"⭐ Оплата через Telegram Stars · {stars_amount} ⭐",
-        callback_data=f"subscription_stars_{plan_code}_{duration_months}",
-    ))
-    return keyboard
-
-
 def _send_subscription_invoice(user_id, plan_code, duration_months):
     if not TELEGRAM_PAYMENT_PROVIDER_TOKEN:
-        if TELEGRAM_STARS_ENABLED:
-            return _send_stars_subscription_invoice(user_id, plan_code, duration_months)
         bot.send_message(
             user_id,
             "Оплата пока не настроена.",
@@ -3596,7 +3572,6 @@ def _send_subscription_invoice(user_id, plan_code, duration_months):
             user_id,
             "Администратор ещё не подтвердил настройки фискальных чеков ЮKassa. "
             "Счёт пока нельзя выставить; пожалуйста, обратитесь в поддержку командой /help.",
-            reply_markup=_subscription_stars_keyboard(plan_code, duration_months),
             **NO_PREVIEW,
         )
         return False
@@ -3612,7 +3587,6 @@ def _send_subscription_invoice(user_id, plan_code, duration_months):
             user_id,
             "Оплата временно недоступна: не завершена настройка фискального чека. "
             "Администратору нужно проверить параметры ЮKassa.",
-            reply_markup=_subscription_stars_keyboard(plan_code, duration_months),
             **NO_PREVIEW,
         )
         return False
@@ -3635,10 +3609,6 @@ def _send_subscription_invoice(user_id, plan_code, duration_months):
             "send_email_to_provider": YOOKASSA_RECEIPTS_ENABLED,
             "is_flexible": False,
         }
-        if TELEGRAM_STARS_ENABLED:
-            invoice_options["reply_markup"] = _subscription_stars_keyboard(
-                plan_code, duration_months
-            )
         if provider_data:
             invoice_options["provider_data"] = provider_data
         bot.send_invoice(**invoice_options)
@@ -3651,61 +3621,6 @@ def _send_subscription_invoice(user_id, plan_code, duration_months):
         bot.send_message(
             user_id,
             "Не удалось выставить счёт. Попробуйте ещё раз чуть позже или напишите в поддержку командой /help.",
-            reply_markup=_subscription_stars_keyboard(plan_code, duration_months),
-            **NO_PREVIEW,
-        )
-        return False
-
-
-def _subscription_stars_amount(plan_code, duration_months):
-    if plan_code not in SUBSCRIPTION_PRICES or duration_months not in (1, 3, 12):
-        raise ValueError("Некорректный тариф или срок подписки")
-    if TELEGRAM_STARS_RUB_PER_STAR <= 0:
-        raise ValueError("TELEGRAM_STARS_RUB_PER_STAR должен быть положительным")
-    rub_price = SUBSCRIPTION_PRICES[plan_code][duration_months]
-    return max(1, int(round(rub_price / TELEGRAM_STARS_RUB_PER_STAR)))
-
-
-def _send_stars_subscription_invoice(user_id, plan_code, duration_months):
-    if not TELEGRAM_STARS_ENABLED:
-        bot.send_message(user_id, "Оплата через Telegram Stars пока не включена.", **NO_PREVIEW)
-        return False
-    if plan_code not in SUBSCRIPTION_PRICES or duration_months not in (1, 3, 12):
-        raise ValueError("Некорректный тариф или срок подписки")
-
-    stars_amount = _subscription_stars_amount(plan_code, duration_months)
-    rub_reference = SUBSCRIPTION_PRICES[plan_code][duration_months]
-    plan_description = _subscription_plan(plan_code)
-    try:
-        payload = create_payment_order(
-            user_id, plan_code, stars_amount, duration_months, currency="XTR"
-        )
-        bot.send_invoice(
-            chat_id=user_id,
-            title="MAX_Parser · подписка",
-            description=(
-                f"{plan_description} · {SUBSCRIPTION_PERIOD_LABELS[duration_months]} "
-                f"· ориентир {rub_reference} ₽"
-            ),
-            invoice_payload=payload,
-            provider_token="",
-            currency="XTR",
-            prices=[types.LabeledPrice(
-                label=f"{SUBSCRIPTION_PERIOD_LABELS[duration_months]} · MAX_Parser",
-                amount=stars_amount,
-            )],
-            start_parameter=payload,
-            is_flexible=False,
-        )
-        return True
-    except Exception as error:
-        debug_logger.error(
-            "TELEGRAM_STARS_INVOICE_SEND_FAILED user_id=%s plan=%s error_type=%s",
-            user_id, plan_code, type(error).__name__,
-        )
-        bot.send_message(
-            user_id,
-            "Не удалось выставить счёт Stars. Попробуйте ещё раз чуть позже или напишите в поддержку командой /help.",
             **NO_PREVIEW,
         )
         return False
@@ -4184,7 +4099,7 @@ def start_bot(message):
     bot.send_message(message.chat.id, text, **NO_PREVIEW, reply_markup=start_keyboard())
 
 
-@bot.message_handler(commands=['help', 'help1', 'paysupport'])
+@bot.message_handler(commands=['help', 'help1'])
 def help_command(message):
     start_support(message.chat.id, message.from_user)
 
@@ -4266,7 +4181,7 @@ def handle_successful_payment(message):
             user_id=user_id,
             currency=payment.currency,
             total_amount=payment.total_amount,
-            provider_payment_charge_id=getattr(payment, "provider_payment_charge_id", None) or None,
+            provider_payment_charge_id=payment.provider_payment_charge_id,
             telegram_payment_charge_id=payment.telegram_payment_charge_id,
         )
     except Exception as error:
@@ -4287,7 +4202,7 @@ def handle_successful_payment(message):
                 ADMIN_ID,
                 "⚠️ Платёж прошёл, но подписка не активировалась автоматически.\n"
                 f"Пользователь: <code>{user_id}</code>\n"
-                f"Платёжный ID: <code>{escape_html(getattr(payment, 'telegram_payment_charge_id', '') or getattr(payment, 'provider_payment_charge_id', '') or 'не получен')}</code>\n"
+                f"ID платежа ЮKassa: <code>{escape_html(getattr(payment, 'provider_payment_charge_id', '') or 'не получен')}</code>\n"
                 f"Payload: <code>{escape_html(payment.invoice_payload)}</code>",
                 parse_mode="HTML",
                 **NO_PREVIEW,
@@ -4301,30 +4216,18 @@ def handle_successful_payment(message):
         return
 
     active_until = result["active_until"].astimezone(timezone.utc)
+    amount_rub = payment.total_amount / 100
     plan_code = result["plan_code"]
     duration_months = int(result["duration_months"])
     plan_label = SUBSCRIPTION_LABELS[plan_code]
     duration_label = SUBSCRIPTION_PERIOD_LABELS[duration_months]
     paid_at = datetime.fromtimestamp(message.date, tz=timezone.utc)
-    payment_currency = result["currency"]
-    if payment_currency == "XTR":
-        paid_stars = int(result["amount"])
-        rub_reference = SUBSCRIPTION_PRICES[plan_code][duration_months]
-        amount_label = f"{paid_stars} ⭐ <i>(ориентир {rub_reference} ₽)</i>"
-        payment_method_label = "Telegram Stars"
-        payment_id = payment.telegram_payment_charge_id
-        fiscal_receipt_note = "⭐ Оплата проведена через Telegram Stars."
-    else:
-        amount_rub = int(result["amount"]) / 100
-        amount_label = f"{amount_rub:.2f} ₽"
-        payment_method_label = "ЮKassa"
-        payment_id = payment.provider_payment_charge_id
-        fiscal_receipt_note = (
-            "🧾 Данные для фискального чека переданы платёжному провайдеру."
-            if YOOKASSA_RECEIPTS_ENABLED
-            else "ℹ️ Это подтверждение оплаты от MAX_Parser. Фискальные чеки ЮKassa в текущих настройках не подключены."
-        )
-    payment_id = escape_html(payment_id or "не получен")
+    provider_charge_id = escape_html(payment.provider_payment_charge_id or "не получен")
+    fiscal_receipt_note = (
+        "🧾 Данные для фискального чека переданы платёжному провайдеру."
+        if YOOKASSA_RECEIPTS_ENABLED
+        else "ℹ️ Это подтверждение оплаты от MAX_Parser. Фискальные чеки ЮKassa в текущих настройках не подключены."
+    )
     multi_note = "Мульти-подписка включает оба способа подключения.\n" if plan_code == "multi" else ""
     chat_limit = MULTI_MAX_CUSTOMER_CHATS if plan_code == "multi" else MAX_CUSTOMER_CHATS
     bot.send_message(
@@ -4334,10 +4237,10 @@ def handle_successful_payment(message):
         "✅ <b>Статус:</b> оплачено\n"
         f"📦 <b>Услуга:</b> подписка · {duration_label}\n"
         f"🔧 <b>Способ:</b> {plan_label}\n"
-        f"💳 <b>Сумма:</b> {amount_label}\n"
+        f"💳 <b>Сумма:</b> {amount_rub:.2f} ₽\n"
         f"🕒 <b>Оплачено:</b> {paid_at:%d.%m.%Y %H:%M} UTC\n"
         f"📅 <b>Действует до:</b> {active_until:%d.%m.%Y %H:%M} UTC\n"
-        f"🔖 <b>ID платежа:</b> <code>{payment_id}</code>\n\n"
+        f"🔖 <b>ID платежа:</b> <code>{provider_charge_id}</code>\n\n"
         f"<blockquote>Подписка распространяется на весь ваш аккаунт MAX_Parser и покрывает до {chat_limit} подключённых чатов.\n"
         f"{multi_note}Для подключения чата отправьте /connect. Автоматического списания нет — заранее напомню о продлении.</blockquote>\n"
         f"<i>{fiscal_receipt_note}</i>",
@@ -4349,9 +4252,8 @@ def handle_successful_payment(message):
             ADMIN_ID,
             "💳 <b>Успешный платёж MAX_Parser</b>\n"
             f"Пользователь: <code>{user_id}</code>\n"
-            f"Способ: <b>{payment_method_label}</b>\n"
-            f"Сумма: <b>{amount_label}</b>\n"
-            f"ID платежа: <code>{payment_id}</code>",
+            f"Сумма: <b>{amount_rub:.2f} ₽</b>\n"
+            f"ID платежа ЮKassa: <code>{escape_html(payment.provider_payment_charge_id or 'не получен')}</code>",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -7501,31 +7403,6 @@ def callback_handler(call):
             track_user(call)
             bot.answer_callback_query(call.id, "Готовлю счёт")
             _send_subscription_invoice(call.from_user.id, plan_code, months)
-        elif call.data.startswith("subscription_stars_"):
-            parts = call.data.split("_")
-            try:
-                plan_code = parts[2]
-                months = int(parts[3])
-                if plan_code not in SUBSCRIPTION_PRICES or months not in (1, 3, 12):
-                    raise ValueError("invalid product")
-            except (ValueError, IndexError):
-                bot.answer_callback_query(call.id, "Не удалось определить тариф", show_alert=True)
-                return
-            if call.message.chat.type != "private" or call.message.chat.id != call.from_user.id:
-                bot.answer_callback_query(call.id, "Откройте счёт в личном чате с ботом.", show_alert=True)
-                return
-            track_user(call)
-            bot.answer_callback_query(call.id, "Готовлю счёт Stars")
-            stars_invoice_sent = _send_stars_subscription_invoice(
-                call.from_user.id, plan_code, months
-            )
-            if stars_invoice_sent:
-                try:
-                    bot.delete_message(
-                        call.message.chat.id, call.message.message_id
-                    )
-                except Exception:
-                    pass
         elif call.data in ("connect_self", "connect_project", "connect_multi"):
             if not call.message or call.message.chat.type != "private":
                 bot.answer_callback_query(
