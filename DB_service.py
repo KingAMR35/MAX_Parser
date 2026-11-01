@@ -85,8 +85,13 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS support_sessions (
                 user_id BIGINT PRIMARY KEY,
+                assigned_admin_id BIGINT,
                 opened_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        conn.execute("""
+            ALTER TABLE support_sessions
+            ADD COLUMN IF NOT EXISTS assigned_admin_id BIGINT
         """)
 
         conn.execute("""
@@ -94,6 +99,14 @@ def init_db():
                 admin_chat_id BIGINT NOT NULL,
                 message_id BIGINT NOT NULL,
                 user_id BIGINT NOT NULL,
+                PRIMARY KEY (admin_chat_id, message_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_request_notifications (
+                user_id BIGINT NOT NULL,
+                admin_chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
                 PRIMARY KEY (admin_chat_id, message_id)
             )
         """)
@@ -414,6 +427,15 @@ def get_user_count():
         return row["count"]
 
 
+def get_user_profile(user_id: int):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT user_id, username, first_name, last_name
+            FROM users
+            WHERE user_id = %s
+        """, (int(user_id),)).fetchone()
+
+
 def open_support_session(user_id: int):
     with get_connection() as conn:
         conn.execute(
@@ -426,6 +448,77 @@ def get_open_support_sessions():
     with get_connection() as conn:
         rows = conn.execute("SELECT user_id FROM support_sessions").fetchall()
         return [int(row["user_id"]) for row in rows]
+
+
+def claim_support_session(user_id: int, admin_id: int):
+    """Atomically assign an open support conversation to its first admin."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            UPDATE support_sessions
+            SET assigned_admin_id = %s
+            WHERE user_id = %s AND assigned_admin_id IS NULL
+            RETURNING assigned_admin_id
+        """, (int(admin_id), int(user_id))).fetchone()
+        if row:
+            return {"claimed": True, "admin_id": int(row["assigned_admin_id"])}
+        row = conn.execute(
+            "SELECT assigned_admin_id FROM support_sessions WHERE user_id = %s",
+            (int(user_id),),
+        ).fetchone()
+        if not row:
+            return None
+        assigned_admin_id = row["assigned_admin_id"]
+        return {
+            "claimed": False,
+            "admin_id": int(assigned_admin_id) if assigned_admin_id else None,
+        }
+
+
+def get_support_session_assignee(user_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT assigned_admin_id FROM support_sessions WHERE user_id = %s",
+            (int(user_id),),
+        ).fetchone()
+        return int(row["assigned_admin_id"]) if row and row["assigned_admin_id"] else None
+
+
+def save_support_request_notification(user_id: int, admin_chat_id: int, message_id: int):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO support_request_notifications (user_id, admin_chat_id, message_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (admin_chat_id, message_id)
+            DO UPDATE SET user_id = EXCLUDED.user_id
+        """, (int(user_id), int(admin_chat_id), int(message_id)))
+
+
+def has_support_request_notification(user_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM support_request_notifications WHERE user_id = %s LIMIT 1",
+            (int(user_id),),
+        ).fetchone()
+        return row is not None
+
+
+def delete_support_request_notifications(user_id: int):
+    """Remove pending claim cards and their reply routes, returning their message IDs."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            DELETE FROM support_request_notifications
+            WHERE user_id = %s
+            RETURNING admin_chat_id, message_id
+        """, (int(user_id),)).fetchall()
+        for row in rows:
+            conn.execute(
+                "DELETE FROM support_message_routes WHERE admin_chat_id = %s AND message_id = %s",
+                (int(row["admin_chat_id"]), int(row["message_id"])),
+            )
+        return [
+            (int(row["admin_chat_id"]), int(row["message_id"]))
+            for row in rows
+        ]
 
 
 def save_support_message_route(admin_chat_id: int, message_id: int, user_id: int):
@@ -451,6 +544,7 @@ def get_support_message_routes():
 
 def close_support_session(user_id: int):
     with get_connection() as conn:
+        conn.execute("DELETE FROM support_request_notifications WHERE user_id = %s", (user_id,))
         conn.execute("DELETE FROM support_sessions WHERE user_id = %s", (user_id,))
         conn.execute("DELETE FROM support_message_routes WHERE user_id = %s", (user_id,))
 

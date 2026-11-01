@@ -3811,6 +3811,15 @@ def _support_admin_keyboard(user_id):
     return keyboard
 
 
+def _support_accept_keyboard(user_id):
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(
+        "🙋‍♂️ Принять обращение",
+        callback_data=f"support_accept_{int(user_id)}",
+    ))
+    return keyboard
+
+
 def _support_user_label(user):
     full_name = " ".join(part for part in (user.first_name, user.last_name) if part).strip()
     full_name = escape_html(full_name or "Имя не указано")
@@ -3818,11 +3827,13 @@ def _support_user_label(user):
     return full_name, username
 
 
-def _map_support_message(admin_chat_id, message_id, user_id):
+def _map_support_message(admin_chat_id, message_id, user_id, claim_card=False):
     route_key = (int(admin_chat_id), int(message_id))
     with support_state_lock:
         support_message_routes[route_key] = int(user_id)
         save_support_message_route(admin_chat_id, message_id, user_id)
+        if claim_card:
+            save_support_request_notification(user_id, admin_chat_id, message_id)
 
 
 def _support_admin_ids():
@@ -3836,6 +3847,65 @@ def _support_admin_ids():
     return sorted(admin_ids)
 
 
+def _support_claim_status_text(user_id, admin):
+    user_profile = get_user_profile(user_id) or {}
+    user_name = " ".join(
+        part for part in (user_profile.get("first_name"), user_profile.get("last_name")) if part
+    ).strip()
+    user_name = escape_html(user_name or "Имя не указано")
+    user_username = (
+        f"@{escape_html(user_profile['username'])}"
+        if user_profile.get("username") else "не указан"
+    )
+    admin_name, admin_username = _support_user_label(admin)
+    return (
+        "✅ <b>Обращение принято</b>\n"
+        f"👤 Администратор: {admin_name}\n"
+        f"🔎 Никнейм: {admin_username}\n"
+        f"🆔 ID: <code>{int(admin.id)}</code>\n\n"
+        "🤝 <b>Взял в работу обращение пользователя:</b>\n"
+        f"👤 {user_name}\n"
+        f"🔎 Никнейм: {user_username}\n"
+        f"🆔 ID: <code>{int(user_id)}</code>"
+    )
+
+
+def _broadcast_support_claim(user_id, admin):
+    pending_messages = delete_support_request_notifications(user_id)
+    for route_key, routed_user_id in list(support_message_routes.items()):
+        if routed_user_id == int(user_id) and route_key in pending_messages:
+            support_message_routes.pop(route_key, None)
+    for admin_chat_id, message_id in pending_messages:
+        try:
+            bot.delete_message(admin_chat_id, message_id)
+        except Exception:
+            pass
+
+    status_text = _support_claim_status_text(user_id, admin)
+    delivered = 0
+    for admin_chat_id in _support_admin_ids():
+        try:
+            status_message = bot.send_message(
+                admin_chat_id,
+                status_text,
+                parse_mode="HTML",
+                reply_markup=(
+                    _support_admin_keyboard(user_id)
+                    if int(admin_chat_id) == int(admin.id) else None
+                ),
+                **NO_PREVIEW,
+            )
+            _map_support_message(admin_chat_id, status_message.message_id, user_id)
+            delivered += 1
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_CLAIM_BROADCAST_FAILED admin_id=%s user_id=%s error_type=%s",
+                admin_chat_id, user_id, type(error).__name__,
+            )
+    if delivered == 0:
+        raise RuntimeError("Не удалось сообщить администраторам о принятом обращении")
+
+
 def _notify_support_admin_one(admin_id, user, body_message=None):
     full_name, username = _support_user_label(user)
     header_text = (
@@ -3844,18 +3914,25 @@ def _notify_support_admin_one(admin_id, user, body_message=None):
         f"🔎 Никнейм: {username}\n"
         f"🆔 ID: <code>{user.id}</code>"
     )
+    assigned_admin_id = get_support_session_assignee(user.id)
+    awaiting_acceptance = assigned_admin_id is None
+    claim_card = awaiting_acceptance and body_message is None
+    support_keyboard = (
+        _support_accept_keyboard(user.id)
+        if claim_card
+        else (_support_admin_keyboard(user.id) if assigned_admin_id == int(admin_id) else None)
+    )
     if body_message is None:
         header = bot.send_message(
             admin_id,
             header_text,
             parse_mode="HTML",
-            reply_markup=_support_admin_keyboard(user.id),
+            reply_markup=support_keyboard,
             **NO_PREVIEW,
         )
-        _map_support_message(admin_id, header.message_id, user.id)
+        _map_support_message(admin_id, header.message_id, user.id, claim_card=claim_card)
         return
 
-    support_keyboard = _support_admin_keyboard(user.id)
     body_text = body_message.text or body_message.caption or ""
     escaped_body_text = escape_html(body_text)
     quoted_body_text = f"<blockquote>{escaped_body_text}</blockquote>" if body_text else ""
@@ -3870,7 +3947,7 @@ def _notify_support_admin_one(admin_id, user, body_message=None):
             reply_markup=support_keyboard,
             **NO_PREVIEW,
         )
-        _map_support_message(admin_id, card.message_id, user.id)
+        _map_support_message(admin_id, card.message_id, user.id, claim_card=claim_card)
         return
 
     caption_media_types = {"photo", "video", "document", "audio", "voice", "animation"}
@@ -3888,7 +3965,7 @@ def _notify_support_admin_one(admin_id, user, body_message=None):
                     parse_mode="HTML",
                     reply_markup=support_keyboard,
                 )
-                _map_support_message(admin_id, copied.message_id, user.id)
+                _map_support_message(admin_id, copied.message_id, user.id, claim_card=claim_card)
                 return
             except Exception as error:
                 debug_logger.info(
@@ -3903,7 +3980,7 @@ def _notify_support_admin_one(admin_id, user, body_message=None):
         reply_markup=support_keyboard,
         **NO_PREVIEW,
     )
-    _map_support_message(admin_id, header.message_id, user.id)
+    _map_support_message(admin_id, header.message_id, user.id, claim_card=claim_card)
     if content_type == "text":
         try:
             quoted_message = bot.send_message(
@@ -3980,15 +4057,28 @@ def start_support(chat_id, user):
         return
     track_user(type("SupportUserEvent", (), {"from_user": user})())
     with support_state_lock:
-        if user.id in support_sessions:
-            bot.send_message(
-                chat_id,
-                "Чат с поддержкой уже открыт. Напишите сообщение или нажмите кнопку завершения.",
-                **NO_PREVIEW,
+        already_open = user.id in support_sessions
+        if not already_open:
+            support_sessions.add(user.id)
+            open_support_session(user.id)
+    if already_open:
+        try:
+            if (
+                get_support_session_assignee(user.id) is None
+                and not has_support_request_notification(user.id)
+            ):
+                _notify_support_admin(user)
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_LEGACY_REQUEST_NOTIFY_FAILED user_id=%s error_type=%s",
+                user.id, type(error).__name__,
             )
-            return
-        support_sessions.add(user.id)
-        open_support_session(user.id)
+        bot.send_message(
+            chat_id,
+            "Чат с поддержкой уже открыт. Напишите сообщение или нажмите кнопку завершения.",
+            **NO_PREVIEW,
+        )
+        return
     try:
         bot.send_message(
             chat_id,
@@ -3999,6 +4089,7 @@ def start_support(chat_id, user):
             reply_markup=_support_keyboard(),
             **NO_PREVIEW,
         )
+        _notify_support_admin(user)
     except Exception as error:
         with support_state_lock:
             support_sessions.discard(user.id)
@@ -5515,6 +5606,13 @@ def support_admin_reply(message):
     user_id = support_message_routes.get(route_key)
     if not user_id:
         return
+    assigned_admin_id = get_support_session_assignee(user_id)
+    if assigned_admin_id is None:
+        bot.reply_to(message, "Сначала нажмите «🙋‍♂️ Принять обращение», чтобы взять чат в работу.")
+        return
+    if assigned_admin_id != int(message.from_user.id):
+        bot.reply_to(message, "Это обращение уже ведёт другой администратор.")
+        return
     if message.content_type == "text" and message.text.strip().lower() == "/close":
         if _close_support(user_id):
             bot.reply_to(message, "Диалог завершён. Пользователь получил уведомление.")
@@ -5826,7 +5924,7 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
@@ -6059,6 +6157,52 @@ def admin_callbacks(call):
             callback_message=call.message,
         )
         return
+    if action.startswith("support_accept_"):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
+            return
+        try:
+            user_id = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Не удалось определить обращение", show_alert=True)
+            return
+        try:
+            claim_result = claim_support_session(user_id, call.from_user.id)
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_CLAIM_FAILED user_id=%s admin_id=%s error_type=%s",
+                user_id, call.from_user.id, type(error).__name__,
+            )
+            bot.answer_callback_query(call.id, "Не удалось принять обращение. Попробуйте ещё раз.", show_alert=True)
+            return
+        if not claim_result:
+            bot.answer_callback_query(call.id, "Это обращение уже завершено", show_alert=True)
+            return
+        if not claim_result["claimed"]:
+            message = (
+                "Вы уже приняли это обращение"
+                if claim_result["admin_id"] == int(call.from_user.id)
+                else "Обращение уже принял другой администратор"
+            )
+            bot.answer_callback_query(call.id, message, show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Вы приняли обращение")
+        try:
+            _broadcast_support_claim(user_id, call.from_user)
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_CLAIM_STATUS_FAILED user_id=%s admin_id=%s error_type=%s",
+                user_id, call.from_user.id, type(error).__name__,
+            )
+            try:
+                bot.send_message(
+                    call.from_user.id,
+                    "✅ Вы приняли обращение пользователя. Не удалось обновить уведомления у всех администраторов; проверьте переписку с пользователем по его ID.",
+                    **NO_PREVIEW,
+                )
+            except Exception:
+                pass
+        return
     if action.startswith("support_close_"):
         try:
             user_id = int(action.rsplit("_", 1)[1])
@@ -6068,6 +6212,14 @@ def admin_callbacks(call):
         route_key = (int(call.message.chat.id), int(call.message.message_id))
         if support_message_routes.get(route_key) != user_id:
             bot.answer_callback_query(call.id, "Кнопка относится к уже завершённому обращению")
+            return
+        assigned_admin_id = get_support_session_assignee(user_id)
+        if assigned_admin_id != int(call.from_user.id):
+            bot.answer_callback_query(
+                call.id,
+                "Завершить чат может администратор, который принял обращение",
+                show_alert=True,
+            )
             return
         if _close_support(user_id):
             bot.answer_callback_query(call.id, "Диалог завершён")
