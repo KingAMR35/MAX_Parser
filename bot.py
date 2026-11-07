@@ -2540,15 +2540,15 @@ def show_chat_details(chat_id, message_id, target_chat_id):
         f"</blockquote>"
     )
     kb = types.InlineKeyboardMarkup(row_width=1)
-    if telegram_type in ("group", "supergroup"):
-        kb.add(types.InlineKeyboardButton(
-            "💬 Написать в группу", callback_data=f"admin_group_message_{target_chat_id}"
-        ))
     if chat.get('max_url') and (chat.get('phone') or os.path.exists(session_file)):
         if chat['is_active']:
             kb.add(types.InlineKeyboardButton("⏹ Остановить парсинг", callback_data=f"admin_toggle_chat_{target_chat_id}", style="danger"))
         else:
             kb.add(types.InlineKeyboardButton("▶️ Запустить парсинг", callback_data=f"admin_toggle_chat_{target_chat_id}", style="success"))
+    if telegram_type in ("group", "supergroup"):
+        kb.add(types.InlineKeyboardButton(
+            "💬 Написать в группу", callback_data=f"admin_group_message_{target_chat_id}"
+        ))
     kb.add(types.InlineKeyboardButton("🔗 Задать URL группы MAX", callback_data=f"admin_set_url_{target_chat_id}"))
     if chat.get("account_mode") != "project":
         kb.add(types.InlineKeyboardButton("📱 Задать номер телефона", callback_data=f"admin_set_phone_{target_chat_id}"))
