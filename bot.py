@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from telebot import types
 from dotenv import load_dotenv
 import concurrent.futures
@@ -38,6 +38,7 @@ except Exception as error:
         "BOT_USER_TABLE_CLEANUP_FAILED error_type=%s", type(error).__name__
     )
 TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "").strip()
+BOT_PUBLIC_USERNAME = os.getenv("BOT_PUBLIC_USERNAME", "max_parserBot").strip().lstrip("@")
 YOOKASSA_RECEIPTS_SETTING = os.getenv("YOOKASSA_RECEIPTS_ENABLED", "").strip().lower()
 YOOKASSA_RECEIPTS_SETTING_CONFIRMED = YOOKASSA_RECEIPTS_SETTING in {
     "1", "true", "yes", "on", "0", "false", "no", "off"
@@ -2480,24 +2481,69 @@ def show_chat_details(chat_id, message_id, target_chat_id):
     session_status = "✅ Активна" if os.path.exists(session_file) else "❌ Отсутствует"
     account_mode_text = "Готовый аккаунт" if chat.get("account_mode") == "project" else "Аккаунт пользователя"
     phone_line = (
-        f"📱 <b>Телефон:</b> {chat['phone'] or '❌ не задан'}\n"
+        f"📱 <b>Телефон:</b> {escape_html(chat['phone'] or '❌ не задан')}\n"
         if chat.get("account_mode") != "project" else ""
     )
+
+    telegram_type = ""
+    group_info_lines = ""
+    try:
+        telegram_chat = bot.get_chat(int(target_chat_id))
+        telegram_type = str(getattr(telegram_chat, "type", "") or "")
+        type_labels = {
+            "private": "личный чат",
+            "group": "группа",
+            "supergroup": "супергруппа",
+            "channel": "канал",
+        }
+        type_label = type_labels.get(telegram_type, "чат")
+        member_label = "Подписчиков" if telegram_type == "channel" else "Участников"
+        try:
+            member_count = bot.get_chat_member_count(int(target_chat_id))
+            count_line = f"👥 <b>{member_label}:</b> {int(member_count):,}\n".replace(",", " ")
+        except Exception:
+            count_line = f"👥 <b>{member_label}:</b> временно недоступно\n"
+        username = getattr(telegram_chat, "username", None)
+        username_line = (
+            f"🔗 <b>Публичная ссылка:</b> https://t.me/{escape_html(username)}\n"
+            if username else ""
+        )
+        description = str(getattr(telegram_chat, "description", "") or "").strip()
+        description_line = (
+            f"📝 <b>Описание:</b> {escape_html(description[:400])}\n"
+            if description else ""
+        )
+        group_info_lines = (
+            f"📍 <b>Тип Telegram-чата:</b> {type_label}\n"
+            f"{count_line}{username_line}{description_line}\n"
+        )
+    except Exception as error:
+        debug_logger.info(
+            "ADMIN_CHAT_INFO_UNAVAILABLE chat_id=%s error_type=%s",
+            target_chat_id, type(error).__name__,
+        )
+        group_info_lines = "📍 <b>Сведения о Telegram-чате:</b> временно недоступны\n\n"
+
     text = (
-        f"📋 <b>{chat['title']}</b>\n\n"
+        f"📋 <b>{escape_html(chat['title'] or 'Без названия')}</b>\n\n"
         f"🆔 <b>ID:</b> <code>{chat['chat_id']}</code>\n"
-        f"🔗 <b>URL:</b> {chat['max_url'] or ' не задан'}\n"
+        f"🔗 <b>URL:</b> {escape_html(chat['max_url'] or ' не задан')}\n"
         f"{phone_line}"
         f"👤 <b>MAX-аккаунт:</b> {account_mode_text}\n"
         f"🧑‍💻 <b>Владелец Telegram:</b> <code>{chat.get('owner_id') or 'не назначен'}</code>\n"
         f"🔑 <b>Сессия:</b> {session_status}\n"
         f"⚙️ <b>Парсинг:</b> {status_text}\n\n"
+        f"{group_info_lines}"
         f"<blockquote>"
         f"💬 <b>Отправлено:</b> {stats['today']} сегодня / {stats['total']} всего\n"
         f"📦 <b>Ключей защиты от дублей:</b> {cache_count}"
         f"</blockquote>"
     )
     kb = types.InlineKeyboardMarkup(row_width=1)
+    if telegram_type in ("group", "supergroup"):
+        kb.add(types.InlineKeyboardButton(
+            "💬 Написать в группу", callback_data=f"admin_group_message_{target_chat_id}"
+        ))
     if chat.get('max_url') and (chat.get('phone') or os.path.exists(session_file)):
         if chat['is_active']:
             kb.add(types.InlineKeyboardButton("⏹ Остановить парсинг", callback_data=f"admin_toggle_chat_{target_chat_id}", style="danger"))
@@ -2510,7 +2556,67 @@ def show_chat_details(chat_id, message_id, target_chat_id):
     kb.add(types.InlineKeyboardButton("🗑 Очистить кэш чата", callback_data=f"admin_clear_chat_cache_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("❌ Удалить чат", callback_data=f"admin_ask_delete_{target_chat_id}", style="danger"))
     kb.add(types.InlineKeyboardButton("🔙 К списку чатов", callback_data="admin_chats", style="primary"))
-    safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+    safe_edit_message(text, chat_id, message_id, reply_markup=kb, parse_mode="HTML", **NO_PREVIEW)
+
+def process_admin_group_question(message, target_chat_id):
+    admin_id = int(message.from_user.id)
+    if not is_admin(admin_id):
+        return
+    if message.content_type != "text" or not (message.text or "").strip() or message.text.strip().startswith("/"):
+        prompt = bot.send_message(
+            message.chat.id,
+            "Отправьте вопрос обычным текстом или нажмите «Отмена».",
+            reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+                "❌ Отмена", callback_data=f"admin_group_message_cancel_{int(target_chat_id)}"
+            )),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_admin_group_question, int(target_chat_id))
+        return
+    question = message.text.strip()
+    if len(question) > 3800:
+        prompt = bot.send_message(
+            message.chat.id,
+            "Сообщение слишком длинное. Сократите его до 3800 символов или нажмите «Отмена».",
+            reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+                "❌ Отмена", callback_data=f"admin_group_message_cancel_{int(target_chat_id)}"
+            )),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_admin_group_question, int(target_chat_id))
+        return
+    try:
+        telegram_chat = bot.get_chat(int(target_chat_id))
+        if getattr(telegram_chat, "type", None) not in ("group", "supergroup"):
+            bot.send_message(message.chat.id, "Этот чат больше не является группой.", **NO_PREVIEW)
+            return
+        sent = bot.send_message(
+            int(target_chat_id),
+            "📩 <b>Вопрос от команды MAX_Parser</b>\n\n"
+            f"{escape_html(question)}\n\n"
+            "Чтобы ответ дошёл администратору, ответьте именно на это сообщение.",
+            parse_mode="HTML",
+            reply_markup=types.ForceReply(),
+            **NO_PREVIEW,
+        )
+        save_admin_group_thread_message(target_chat_id, sent.message_id, admin_id)
+        bot.send_message(
+            message.chat.id,
+            f"✅ Сообщение отправлено в группу «{escape_html(telegram_chat.title or str(target_chat_id))}». Ответы на сообщение бота будут приходить всем администраторам.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+    except Exception as error:
+        debug_logger.warning(
+            "ADMIN_GROUP_QUESTION_SEND_FAILED group_id=%s admin_id=%s error_type=%s",
+            target_chat_id, admin_id, type(error).__name__,
+        )
+        bot.send_message(
+            message.chat.id,
+            "Не удалось отправить сообщение. Проверьте, что бот состоит в группе и может писать в неё.",
+            **NO_PREVIEW,
+        )
+
 
 def show_chat_statistics(chat_id, message_id, target_chat_id):
     chat = get_chat_by_id(target_chat_id)
@@ -3312,9 +3418,83 @@ def start_keyboard():
     keyboard.add(types.InlineKeyboardButton("✔ Подключить MAX_Parser", callback_data="parse_setup"))
     keyboard.add(types.InlineKeyboardButton("🔎 О парсинге", callback_data="about_bot"))
     keyboard.add(types.InlineKeyboardButton("💬 Тех поддержка", callback_data="support_start"))
+    keyboard.add(types.InlineKeyboardButton("🎁 Пригласить друга", callback_data="referral_program"))
     keyboard.add(types.InlineKeyboardButton("👑 Благодарности", callback_data="thanks_project"))
     keyboard.add(types.InlineKeyboardButton("⭐ Отзывы", callback_data="reviews_show"))
     return keyboard
+
+
+def _referral_start_link(user_id):
+    return f"https://t.me/{BOT_PUBLIC_USERNAME}?start=ref_{int(user_id)}"
+
+
+def show_referral_program(chat_id, user_id, message_id=None):
+    stats = get_referral_stats(user_id)
+    referral_link = _referral_start_link(user_id)
+    share_link = "https://t.me/share/url?" + urlencode({
+        "url": referral_link,
+        "text": "Попробуй MAX_Parser — получай сообщения из MAX в Telegram.",
+    })
+    text = (
+        "🎁 <b>Пригласи друга — получи 7 дней MAX_Parser</b>\n\n"
+        "За каждого нового пользователя, который разберётся в возможностях бота и выберет способ подключения,"
+        " тебе начислится 7 дней мульти-подписки. Она открывает оба способа и позволяет подключить до 10 чатов.\n\n"
+        "<b>Что должен сделать друг:</b>\n"
+        "1. Впервые открыть бота по твоей ссылке.\n"
+        "2. Посмотреть сравнение способов подключения.\n"
+        "3. Открыть инструкцию.\n"
+        "4. Выбрать способ подключения.\n\n"
+        f"📨 <b>Твоя ссылка:</b>\n<code>{escape_html(referral_link)}</code>\n\n"
+        f"📊 <b>Приглашено:</b> {stats['total']} · <b>Наград получено:</b> {stats['rewarded']}\n"
+        f"⏳ <b>Ещё выполняют условия:</b> {stats['in_progress']}"
+    )
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("📨 Поделиться ссылкой", url=share_link))
+    keyboard.add(types.InlineKeyboardButton("🔄 Обновить прогресс", callback_data="referral_program"))
+    keyboard.add(types.InlineKeyboardButton("🔙 В главное меню", callback_data="start_home"))
+    if message_id:
+        safe_edit_message(
+            text, chat_id, message_id, reply_markup=keyboard,
+            parse_mode="HTML", **NO_PREVIEW,
+        )
+    else:
+        bot.send_message(
+            chat_id, text, reply_markup=keyboard,
+            parse_mode="HTML", **NO_PREVIEW,
+        )
+
+
+def _record_referral_engagement(user_id, activity):
+    try:
+        reward = record_referral_activity(int(user_id), activity)
+    except Exception as error:
+        debug_logger.warning(
+            "REFERRAL_ACTIVITY_SAVE_FAILED user_id=%s activity=%s error_type=%s",
+            user_id, activity, type(error).__name__,
+        )
+        return
+    if not reward or not reward.get("rewarded"):
+        return
+    invited = get_user_profile(user_id) or {}
+    invited_name = " ".join(
+        part for part in (invited.get("first_name"), invited.get("last_name")) if part
+    ).strip() or "Друг"
+    active_until = reward["active_until"].astimezone(timezone.utc)
+    try:
+        bot.send_message(
+            reward["referrer_id"],
+            "🎉 <b>Друг выполнил условия приглашения!</b>\n\n"
+            f"👤 {escape_html(invited_name)}\n"
+            "🎁 Тебе добавлены 7 дней мульти-подписки.\n"
+            f"📅 Подписка действует до {active_until:%d.%m.%Y %H:%M} UTC.",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+    except Exception as error:
+        debug_logger.warning(
+            "REFERRAL_REWARD_NOTIFY_FAILED referrer_id=%s error_type=%s",
+            reward["referrer_id"], type(error).__name__,
+        )
 
 def return_start():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
@@ -4168,8 +4348,91 @@ def on_bot_added_to_chat(message):
                 _begin_customer_group_setup(chat_id, owner_id, setup_mode)
             return
 
+@bot.message_handler(
+    func=lambda m: m.chat.type in ("group", "supergroup")
+    and m.reply_to_message is not None
+    and m.from_user is not None
+    and not getattr(m.from_user, "is_bot", False)
+    and get_admin_group_thread_message(m.chat.id, m.reply_to_message.message_id) is not None,
+    content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
+)
+def handle_admin_group_thread_reply(message):
+    source_id = int(message.message_id)
+    group_id = int(message.chat.id)
+    parent_route = get_admin_group_thread_message(group_id, message.reply_to_message.message_id)
+    if not parent_route:
+        return
+
+    sender = message.from_user
+    sender_name = " ".join(part for part in (sender.first_name, sender.last_name) if part).strip() or "Участник"
+    username = f"@{escape_html(sender.username)}" if sender.username else "не указан"
+    body = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if not body:
+        body = {
+            "photo": "Фото",
+            "video": "Видео",
+            "document": "Файл",
+            "audio": "Аудио",
+            "voice": "Голосовое сообщение",
+            "animation": "Анимация",
+            "sticker": "Стикер",
+            "video_note": "Видеосообщение",
+            "location": "Геопозиция",
+            "contact": "Контакт",
+            "venue": "Место",
+            "poll": "Опрос",
+        }.get(message.content_type, "Сообщение без текста")
+    body = body[:2600] + ("…" if len(body) > 2600 else "")
+    group_title = escape_html(message.chat.title or str(group_id))
+    card_text = (
+        "💬 <b>Ответ в подключённую группу</b>\n"
+        f"📍 {group_title}\n"
+        f"🆔 ID группы: <code>{group_id}</code>\n"
+        f"👤 {escape_html(sender_name)}\n"
+        f"🔎 Никнейм: {username}\n"
+        f"🆔 ID: <code>{int(sender.id)}</code>\n"
+        f"💬 <b>Сообщение:</b>\n\n<blockquote>{escape_html(body)}</blockquote>"
+    )
+    delivered = 0
+    for admin_id in _support_admin_ids():
+        try:
+            card = bot.send_message(admin_id, card_text, parse_mode="HTML", **NO_PREVIEW)
+            save_admin_group_reply_route(admin_id, card.message_id, group_id, source_id)
+            if message.content_type != "text":
+                copied = bot.copy_message(
+                    admin_id, group_id, source_id,
+                    reply_to_message_id=card.message_id,
+                    caption="",
+                )
+                save_admin_group_reply_route(admin_id, copied.message_id, group_id, source_id)
+            delivered += 1
+        except Exception as error:
+            debug_logger.warning(
+                "ADMIN_GROUP_REPLY_NOTIFY_FAILED group_id=%s admin_id=%s error_type=%s",
+                group_id, admin_id, type(error).__name__,
+            )
+    if not delivered:
+        debug_logger.warning(
+            "ADMIN_GROUP_REPLY_NO_RECIPIENTS group_id=%s message_id=%s",
+            group_id, source_id,
+        )
+
+
 @bot.message_handler(commands=['start'])
 def start_bot(message):
+    if message.chat.type == "private":
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) > 1 and parts[1].startswith("ref_"):
+            try:
+                referrer_id = int(parts[1][4:])
+                register_referral(referrer_id, message.from_user.id)
+            except (ValueError, TypeError):
+                pass
+            except Exception as error:
+                debug_logger.warning(
+                    "REFERRAL_REGISTER_FAILED user_id=%s error_type=%s",
+                    message.from_user.id, type(error).__name__,
+                )
     track_user(message)
     text = (
         "👋 <b>Привет!</b>\n\n"
@@ -4188,6 +4451,15 @@ def start_bot(message):
     )
 
     bot.send_message(message.chat.id, text, **NO_PREVIEW, reply_markup=start_keyboard())
+
+
+@bot.message_handler(commands=["referral"])
+def referral_program_command(message):
+    track_user(message)
+    if message.chat.type != "private":
+        bot.reply_to(message, "Откройте личный чат со мной и отправьте /referral.")
+        return
+    show_referral_program(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(commands=['help', 'help1'])
@@ -5587,6 +5859,47 @@ def handle_customer_review(message):
         "Спасибо! Отзыв отправлен администратору на проверку. После одобрения он появится в общем списке.",
         **NO_PREVIEW,
     )
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.from_user is not None
+    and is_admin(m.from_user.id)
+    and m.reply_to_message is not None
+    and get_admin_group_reply_route(m.chat.id, m.reply_to_message.message_id) is not None
+    and (not m.text or not m.text.startswith("/")),
+    content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
+)
+def admin_group_thread_reply(message):
+    route = get_admin_group_reply_route(message.chat.id, message.reply_to_message.message_id)
+    if not route:
+        return
+    group_id = int(route["group_chat_id"])
+    reply_to_id = int(route["group_message_id"])
+    try:
+        if message.content_type == "text":
+            sent = bot.send_message(
+                group_id,
+                "📩 <b>Ответ от команды MAX_Parser</b>\n\n" + escape_html(message.text or ""),
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_id,
+                **NO_PREVIEW,
+            )
+            sent_id = sent.message_id
+        else:
+            copied = bot.copy_message(
+                group_id, message.chat.id, message.message_id,
+                reply_to_message_id=reply_to_id,
+            )
+            sent_id = copied.message_id
+        save_admin_group_thread_message(group_id, sent_id, int(message.from_user.id))
+        bot.send_message(message.chat.id, "✅ Ответ отправлен в группу.", **NO_PREVIEW)
+    except Exception as error:
+        debug_logger.warning(
+            "ADMIN_GROUP_REPLY_SEND_FAILED group_id=%s admin_id=%s error_type=%s",
+            group_id, message.from_user.id, type(error).__name__,
+        )
+        bot.reply_to(message, "Не удалось отправить ответ в группу. Проверьте, что бот всё ещё состоит в ней.")
 
 
 @bot.message_handler(
@@ -7226,6 +7539,41 @@ def admin_callbacks(call):
         _prompt_send_to_user(
             call.message.chat.id, int(action.rsplit("_", 1)[1])
         )
+    elif action.startswith("admin_group_message_cancel_"):
+        if not is_admin(call.from_user.id) or call.message.chat.type != "private":
+            bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
+            return
+        try:
+            bot.clear_step_handler_by_chat_id(call.message.chat.id)
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Отменено")
+    elif action.startswith("admin_group_message_"):
+        if not is_admin(call.from_user.id) or call.message.chat.type != "private":
+            bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
+            return
+        target_id = int(action.rsplit("_", 1)[1])
+        try:
+            telegram_chat = bot.get_chat(target_id)
+        except Exception:
+            bot.answer_callback_query(call.id, "Группа сейчас недоступна", show_alert=True)
+            return
+        if getattr(telegram_chat, "type", None) not in ("group", "supergroup"):
+            bot.answer_callback_query(call.id, "Сообщения доступны только для групп", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton(
+            "❌ Отмена", callback_data=f"admin_group_message_cancel_{target_id}"
+        ))
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "💬 Напишите сообщение для группы. Чтобы получить ответы, попросите участников ответить именно на сообщение бота.",
+            reply_markup=keyboard,
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_admin_group_question, target_id)
     elif action.startswith("admin_chat_"):
         target_id = int(action.split("_")[-1])
         show_chat_details(call.message.chat.id, call.message.message_id, target_id)
@@ -7410,7 +7758,13 @@ def my_chat_delete_callbacks(call):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     if call.message:
-        if call.data == "thanks_project":
+        if call.data == "referral_program":
+            if call.message.chat.type != "private":
+                bot.answer_callback_query(call.id, "Откройте программу приглашений в личном чате с ботом.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            show_referral_program(call.message.chat.id, call.from_user.id, call.message.message_id)
+        elif call.data == "thanks_project":
             bot.answer_callback_query(call.id)
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
@@ -7494,6 +7848,7 @@ def callback_handler(call):
                 **NO_PREVIEW,
             )
         elif call.data == "compare_modes":
+            _record_referral_engagement(call.from_user.id, "comparison")
             bot.answer_callback_query(call.id)
             bot.edit_message_text(
                 "<b>Чем отличаются способы подключения</b>\n\n"
@@ -7564,6 +7919,7 @@ def callback_handler(call):
                 )
                 return
             plan_code = call.data.removeprefix("connect_")
+            _record_referral_engagement(call.from_user.id, "connection")
             track_user(call)
             bot.answer_callback_query(call.id)
             _begin_connection_for_plan(
@@ -7577,6 +7933,7 @@ def callback_handler(call):
             if call.message.chat.type != "private":
                 bot.answer_callback_query(call.id, "Откройте личный чат с ботом.", show_alert=True)
                 return
+            _record_referral_engagement(call.from_user.id, "connection")
             if PAYMENTS_ENABLED and not _user_has_product_access(call.from_user.id, "multi"):
                 bot.answer_callback_query(call.id, "Для мульти-подписки сначала завершите оплату.", show_alert=True)
                 return
@@ -7671,6 +8028,7 @@ def callback_handler(call):
             }:
                 bot.answer_callback_query(call.id, "Не удалось определить способ", show_alert=True)
                 return
+            _record_referral_engagement(call.from_user.id, "instruction")
             bot.answer_callback_query(call.id)
             video_keyboard = types.InlineKeyboardMarkup(row_width=1)
             video_keyboard.add(types.InlineKeyboardButton(
@@ -7718,6 +8076,7 @@ def callback_handler(call):
                 **NO_PREVIEW,
             )
         elif call.data == "instruction":
+            _record_referral_engagement(call.from_user.id, "instruction")
             instruction_kb = types.InlineKeyboardMarkup(row_width=1)
             instruction_kb.add(types.InlineKeyboardButton("💬 Задать вопрос к поддержке", callback_data="support_start"))
             instruction_kb.add(types.InlineKeyboardButton("🔙 К выбору подключения", callback_data="parse_setup"))

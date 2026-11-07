@@ -74,6 +74,42 @@ def init_db():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS referral_invites (
+                invitee_id BIGINT PRIMARY KEY,
+                referrer_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                opened_comparison BOOLEAN NOT NULL DEFAULT FALSE,
+                opened_instruction BOOLEAN NOT NULL DEFAULT FALSE,
+                selected_connection BOOLEAN NOT NULL DEFAULT FALSE,
+                rewarded_at TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_referral_invites_referrer
+            ON referral_invites (referrer_id, created_at DESC)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_group_thread_messages (
+                group_chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                admin_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (group_chat_id, message_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_group_reply_routes (
+                admin_chat_id BIGINT NOT NULL,
+                admin_message_id BIGINT NOT NULL,
+                group_chat_id BIGINT NOT NULL,
+                group_message_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (admin_chat_id, admin_message_id)
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_message_daily_stats (
                 chat_id BIGINT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
                 sent_date DATE NOT NULL,
@@ -362,6 +398,138 @@ def grant_subscription(user_id: int, plan_code: str, months: int):
                 reminder_sent_at = NULL
             RETURNING user_id, plan_code, active_until
         """, (int(user_id), plan_code, months, months)).fetchone()
+
+
+def grant_subscription_days(user_id: int, plan_code: str, days: int):
+    if plan_code not in {"self", "project", "multi"}:
+        raise ValueError("Некорректный тариф подписки")
+    days = int(days)
+    if days <= 0:
+        raise ValueError("Число дней должно быть положительным")
+    with get_connection() as conn:
+        return conn.execute("""
+            INSERT INTO telegram_subscription_entitlements (user_id, plan_code, active_until)
+            VALUES (%s, %s, CURRENT_TIMESTAMP + (%s * INTERVAL '1 day'))
+            ON CONFLICT (user_id, plan_code) DO UPDATE SET
+                active_until = GREATEST(
+                    telegram_subscription_entitlements.active_until, CURRENT_TIMESTAMP
+                ) + (%s * INTERVAL '1 day'),
+                updated_at = CURRENT_TIMESTAMP,
+                reminder_sent_at = NULL
+            RETURNING user_id, plan_code, active_until
+        """, (int(user_id), plan_code, days, days)).fetchone()
+
+
+def register_referral(referrer_id: int, invitee_id: int) -> bool:
+    referrer_id = int(referrer_id)
+    invitee_id = int(invitee_id)
+    if referrer_id == invitee_id:
+        return False
+    with get_connection() as conn:
+        with conn.transaction():
+            inviter = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = %s",
+                (referrer_id,),
+            ).fetchone()
+            if not inviter:
+                return False
+            existing = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = %s",
+                (invitee_id,),
+            ).fetchone()
+            if existing:
+                return False
+            inserted = conn.execute("""
+                INSERT INTO referral_invites (invitee_id, referrer_id)
+                VALUES (%s, %s)
+                ON CONFLICT (invitee_id) DO NOTHING
+                RETURNING invitee_id
+            """, (invitee_id, referrer_id)).fetchone()
+            return inserted is not None
+
+
+def get_referral_stats(referrer_id: int):
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE rewarded_at IS NOT NULL) AS rewarded
+            FROM referral_invites
+            WHERE referrer_id = %s
+        """, (int(referrer_id),)).fetchone()
+        total = int(row["total"] or 0)
+        rewarded = int(row["rewarded"] or 0)
+        return {"total": total, "rewarded": rewarded, "in_progress": total - rewarded}
+
+
+def record_referral_activity(invitee_id: int, activity: str):
+    columns = {
+        "comparison": "opened_comparison",
+        "instruction": "opened_instruction",
+        "connection": "selected_connection",
+    }
+    column = columns.get(activity)
+    if not column:
+        raise ValueError("Неизвестный шаг реферальной программы")
+
+    with get_connection() as conn:
+        with conn.transaction():
+            row = conn.execute("""
+                SELECT referrer_id, opened_comparison, opened_instruction,
+                       selected_connection, rewarded_at
+                FROM referral_invites
+                WHERE invitee_id = %s
+                FOR UPDATE
+            """, (int(invitee_id),)).fetchone()
+            if not row:
+                return None
+            if row["rewarded_at"]:
+                return {"referrer_id": int(row["referrer_id"]), "rewarded": False}
+
+            conn.execute(
+                f"UPDATE referral_invites SET {column} = TRUE WHERE invitee_id = %s",
+                (int(invitee_id),),
+            )
+            progress = conn.execute("""
+                SELECT referrer_id, opened_comparison, opened_instruction,
+                       selected_connection, rewarded_at
+                FROM referral_invites
+                WHERE invitee_id = %s
+            """, (int(invitee_id),)).fetchone()
+            qualified = all((
+                progress["opened_comparison"],
+                progress["opened_instruction"],
+                progress["selected_connection"],
+            ))
+            if not qualified:
+                return {
+                    "referrer_id": int(progress["referrer_id"]),
+                    "rewarded": False,
+                }
+
+            claimed = conn.execute("""
+                UPDATE referral_invites
+                SET rewarded_at = CURRENT_TIMESTAMP
+                WHERE invitee_id = %s AND rewarded_at IS NULL
+                RETURNING referrer_id
+            """, (int(invitee_id),)).fetchone()
+            if not claimed:
+                return {"referrer_id": int(progress["referrer_id"]), "rewarded": False}
+            entitlement = conn.execute("""
+                INSERT INTO telegram_subscription_entitlements (user_id, plan_code, active_until)
+                VALUES (%s, 'multi', CURRENT_TIMESTAMP + INTERVAL '7 days')
+                ON CONFLICT (user_id, plan_code) DO UPDATE SET
+                    active_until = GREATEST(
+                        telegram_subscription_entitlements.active_until, CURRENT_TIMESTAMP
+                    ) + INTERVAL '7 days',
+                    updated_at = CURRENT_TIMESTAMP,
+                    reminder_sent_at = NULL
+                RETURNING active_until
+            """, (int(claimed["referrer_id"]),)).fetchone()
+            return {
+                "referrer_id": int(claimed["referrer_id"]),
+                "rewarded": True,
+                "active_until": entitlement["active_until"],
+            }
 
 
 def get_user_subscriptions(user_id: int):
@@ -951,6 +1119,55 @@ def get_all_chats():
         return list(rows)
 
 
+def save_admin_group_thread_message(group_chat_id: int, message_id: int, admin_id: int):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO admin_group_thread_messages (group_chat_id, message_id, admin_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (group_chat_id, message_id)
+            DO UPDATE SET admin_id = EXCLUDED.admin_id
+        """, (int(group_chat_id), int(message_id), int(admin_id)))
+
+
+def get_admin_group_thread_message(group_chat_id: int, message_id: int):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT group_chat_id, message_id, admin_id
+            FROM admin_group_thread_messages
+            WHERE group_chat_id = %s AND message_id = %s
+        """, (int(group_chat_id), int(message_id))).fetchone()
+
+
+def save_admin_group_reply_route(
+    admin_chat_id: int,
+    admin_message_id: int,
+    group_chat_id: int,
+    group_message_id: int,
+):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO admin_group_reply_routes
+                (admin_chat_id, admin_message_id, group_chat_id, group_message_id)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (admin_chat_id, admin_message_id)
+            DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                group_message_id = EXCLUDED.group_message_id
+        """, (
+            int(admin_chat_id), int(admin_message_id),
+            int(group_chat_id), int(group_message_id),
+        ))
+
+
+def get_admin_group_reply_route(admin_chat_id: int, admin_message_id: int):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT group_chat_id, group_message_id
+            FROM admin_group_reply_routes
+            WHERE admin_chat_id = %s AND admin_message_id = %s
+        """, (int(admin_chat_id), int(admin_message_id))).fetchone()
+
+
 def toggle_chat(chat_id: int, active: bool):
     with get_connection() as conn:
         conn.execute("UPDATE chats SET is_active = %s WHERE chat_id = %s", (bool(active), chat_id))
@@ -958,6 +1175,8 @@ def toggle_chat(chat_id: int, active: bool):
 
 def delete_chat(chat_id: int):
     with get_connection() as conn:
+        conn.execute("DELETE FROM admin_group_thread_messages WHERE group_chat_id = %s", (int(chat_id),))
+        conn.execute("DELETE FROM admin_group_reply_routes WHERE group_chat_id = %s", (int(chat_id),))
         conn.execute("DELETE FROM chats WHERE chat_id = %s", (chat_id,))
 
 
