@@ -108,6 +108,19 @@ def init_db():
                 PRIMARY KEY (admin_chat_id, admin_message_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_group_reply_link_tokens (
+                token TEXT PRIMARY KEY,
+                group_chat_id BIGINT NOT NULL,
+                group_message_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days')
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_group_reply_link_tokens_expiry
+            ON admin_group_reply_link_tokens (expires_at)
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_message_daily_stats (
@@ -1168,6 +1181,29 @@ def get_admin_group_reply_route(admin_chat_id: int, admin_message_id: int):
         """, (int(admin_chat_id), int(admin_message_id))).fetchone()
 
 
+def save_admin_group_reply_link_token(token: str, group_chat_id: int, group_message_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM admin_group_reply_link_tokens WHERE expires_at <= CURRENT_TIMESTAMP")
+        conn.execute("""
+            INSERT INTO admin_group_reply_link_tokens (token, group_chat_id, group_message_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (token) DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                group_message_id = EXCLUDED.group_message_id,
+                created_at = CURRENT_TIMESTAMP,
+                expires_at = CURRENT_TIMESTAMP + INTERVAL '30 days'
+        """, (str(token), int(group_chat_id), int(group_message_id)))
+
+
+def get_admin_group_reply_link_token(token: str):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT group_chat_id, group_message_id
+            FROM admin_group_reply_link_tokens
+            WHERE token = %s AND expires_at > CURRENT_TIMESTAMP
+        """, (str(token),)).fetchone()
+
+
 def toggle_chat(chat_id: int, active: bool):
     with get_connection() as conn:
         conn.execute("UPDATE chats SET is_active = %s WHERE chat_id = %s", (bool(active), chat_id))
@@ -1177,6 +1213,7 @@ def delete_chat(chat_id: int):
     with get_connection() as conn:
         conn.execute("DELETE FROM admin_group_thread_messages WHERE group_chat_id = %s", (int(chat_id),))
         conn.execute("DELETE FROM admin_group_reply_routes WHERE group_chat_id = %s", (int(chat_id),))
+        conn.execute("DELETE FROM admin_group_reply_link_tokens WHERE group_chat_id = %s", (int(chat_id),))
         conn.execute("DELETE FROM chats WHERE chat_id = %s", (chat_id,))
 
 

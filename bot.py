@@ -59,6 +59,7 @@ auth_qr_message_ids = {}
 awaiting_password_from = {}
 awaiting_phone_from = {}
 awaiting_code_from = {}
+awaiting_admin_group_private_reply = {}
 support_sessions = set(get_open_support_sessions())
 
 
@@ -2594,12 +2595,21 @@ def process_admin_group_question(message, target_chat_id):
             int(target_chat_id),
             "📨 <b>Сообщение от админа</b>\n\n"
             f"{escape_html(question)}\n\n"
-            "Чтобы ответ дошёл администратору, ответьте именно на это сообщение.",
+            "Ответьте на это сообщение в группе или нажмите кнопку, чтобы написать администраторам лично.",
             parse_mode="HTML",
-            reply_markup=types.ForceReply(),
             **NO_PREVIEW,
         )
         save_admin_group_thread_message(target_chat_id, sent.message_id, admin_id)
+        reply_token = uuid.uuid4().hex
+        save_admin_group_reply_link_token(reply_token, target_chat_id, sent.message_id)
+        reply_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        reply_keyboard.add(types.InlineKeyboardButton(
+            "✉️ Ответить администраторам",
+            url=f"https://t.me/{BOT_PUBLIC_USERNAME}?start=reply_{reply_token}",
+        ))
+        bot.edit_message_reply_markup(
+            int(target_chat_id), sent.message_id, reply_markup=reply_keyboard
+        )
         bot.send_message(
             message.chat.id,
             f"✅ Сообщение отправлено в группу «{escape_html(telegram_chat.title or str(target_chat_id))}». Ответы на сообщение бота будут приходить всем администраторам.",
@@ -4434,6 +4444,45 @@ def start_bot(message):
                     message.from_user.id, type(error).__name__,
                 )
     track_user(message)
+    if message.chat.type == "private":
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) > 1 and parts[1].startswith("reply_"):
+            token = parts[1][6:]
+            route = None
+            try:
+                route = get_admin_group_reply_link_token(token)
+            except Exception as error:
+                debug_logger.warning(
+                    "ADMIN_GROUP_REPLY_LINK_LOOKUP_FAILED user_id=%s error_type=%s",
+                    message.from_user.id, type(error).__name__,
+                )
+            if not route:
+                bot.send_message(
+                    message.chat.id,
+                    "Эта ссылка для ответа уже не активна. Попросите администратора отправить новый вопрос.",
+                    reply_markup=start_keyboard(),
+                    **NO_PREVIEW,
+                )
+                return
+            awaiting_admin_group_private_reply[int(message.from_user.id)] = {
+                "group_chat_id": int(route["group_chat_id"]),
+                "group_message_id": int(route["group_message_id"]),
+            }
+            try:
+                telegram_chat = bot.get_chat(int(route["group_chat_id"]))
+                group_name = escape_html(telegram_chat.title or str(route["group_chat_id"]))
+            except Exception:
+                group_name = escape_html(str(route["group_chat_id"]))
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
+            keyboard.add(types.InlineKeyboardButton("❌ Не отвечать", callback_data="group_private_reply_cancel"))
+            bot.send_message(
+                message.chat.id,
+                f"✉️ Напишите ответ администраторам по группе «{group_name}».\n\n"
+                "Сообщение увидят администраторы MAX_Parser. Ответ можно отправить текстом или вложением.",
+                reply_markup=keyboard,
+                **NO_PREVIEW,
+            )
+            return
     text = (
         "👋 <b>Привет!</b>\n\n"
         "Меня зовут <b>MAX_Parser</b>.\n\n"
@@ -4451,6 +4500,82 @@ def start_bot(message):
     )
 
     bot.send_message(message.chat.id, text, **NO_PREVIEW, reply_markup=start_keyboard())
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private"
+    and m.from_user is not None
+    and int(m.from_user.id) in awaiting_admin_group_private_reply,
+    content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
+)
+def handle_admin_group_private_reply(message):
+    user_id = int(message.from_user.id)
+    state = awaiting_admin_group_private_reply.get(user_id)
+    if not state:
+        return
+    if message.content_type == "text" and (message.text or "").strip().startswith("/"):
+        bot.send_message(
+            message.chat.id,
+            "Напишите ответ обычным сообщением или нажмите «❌ Не отвечать».",
+            **NO_PREVIEW,
+        )
+        return
+
+    group_id = int(state["group_chat_id"])
+    group_message_id = int(state["group_message_id"])
+    sender = message.from_user
+    sender_name = " ".join(part for part in (sender.first_name, sender.last_name) if part).strip() or "Участник"
+    username = f"@{escape_html(sender.username)}" if sender.username else "не указан"
+    body = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if not body:
+        body = {
+            "photo": "Фото", "video": "Видео", "document": "Файл", "audio": "Аудио",
+            "voice": "Голосовое сообщение", "animation": "Анимация", "sticker": "Стикер",
+            "video_note": "Видеосообщение", "location": "Геопозиция", "contact": "Контакт",
+            "venue": "Место", "poll": "Опрос",
+        }.get(message.content_type, "Сообщение без текста")
+    body = body[:2400] + ("…" if len(body) > 2400 else "")
+    try:
+        group_chat = bot.get_chat(group_id)
+        group_title = escape_html(group_chat.title or str(group_id))
+    except Exception:
+        group_title = escape_html(str(group_id))
+    card = (
+        "💬 <b>Ответ на сообщение в группе</b>\n"
+        f"📍 {group_title}\n"
+        f"🆔 ID группы: <code>{group_id}</code>\n"
+        f"👤 {escape_html(sender_name)}\n"
+        f"🔎 Никнейм: {username}\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"💬 <b>Сообщение:</b>\n\n<blockquote>{escape_html(body)}</blockquote>"
+    )
+    delivered = 0
+    for admin_id in _support_admin_ids():
+        try:
+            admin_message = bot.send_message(admin_id, card, parse_mode="HTML", **NO_PREVIEW)
+            save_admin_group_reply_route(admin_id, admin_message.message_id, group_id, group_message_id)
+            if message.content_type != "text":
+                copied = bot.copy_message(
+                    admin_id, message.chat.id, message.message_id,
+                    reply_to_message_id=admin_message.message_id,
+                    caption="",
+                )
+                save_admin_group_reply_route(admin_id, copied.message_id, group_id, group_message_id)
+            delivered += 1
+        except Exception as error:
+            debug_logger.warning(
+                "ADMIN_GROUP_PRIVATE_REPLY_NOTIFY_FAILED group_id=%s admin_id=%s error_type=%s",
+                group_id, admin_id, type(error).__name__,
+            )
+    if delivered:
+        awaiting_admin_group_private_reply.pop(user_id, None)
+        bot.send_message(message.chat.id, "✅ Ответ отправлен администраторам.", **NO_PREVIEW)
+    else:
+        bot.send_message(
+            message.chat.id,
+            "Не удалось доставить ответ. Попробуйте ещё раз немного позже.",
+            **NO_PREVIEW,
+        )
 
 
 @bot.message_handler(commands=["referral"])
@@ -7758,7 +7883,17 @@ def my_chat_delete_callbacks(call):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     if call.message:
-        if call.data == "referral_program":
+        if call.data == "group_private_reply_cancel":
+            awaiting_admin_group_private_reply.pop(int(call.from_user.id), None)
+            bot.answer_callback_query(call.id, "Ответ отменён")
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id, call.message.message_id, reply_markup=None
+                )
+            except Exception:
+                pass
+            bot.send_message(call.message.chat.id, "Хорошо, отвечать не нужно.", **NO_PREVIEW)
+        elif call.data == "referral_program":
             if call.message.chat.type != "private":
                 bot.answer_callback_query(call.id, "Откройте программу приглашений в личном чате с ботом.", show_alert=True)
                 return
