@@ -1812,6 +1812,79 @@ def escape_html(text: str) -> str:
     text = text.replace('>', '&gt;')
     return text
 
+def _escape_html_attribute(value):
+    return escape_html(str(value or "")).replace('"', "&quot;").replace("'", "&#x27;")
+
+
+def _telegram_entities_to_html(text, entities=None):
+    """Convert Telegram's UTF-16 entity offsets into escaped Telegram HTML."""
+    text = str(text or "")
+    if not text:
+        return ""
+
+    utf16_to_index = {0: 0}
+    utf16_offset = 0
+    for index, char in enumerate(text):
+        utf16_offset += len(char.encode("utf-16-le")) // 2
+        utf16_to_index[utf16_offset] = index + 1
+
+    tag_by_type = {
+        "bold": ("<b>", "</b>"),
+        "italic": ("<i>", "</i>"),
+        "underline": ("<u>", "</u>"),
+        "strikethrough": ("<s>", "</s>"),
+        "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
+        "code": ("<code>", "</code>"),
+        "blockquote": ("<blockquote>", "</blockquote>"),
+        "expandable_blockquote": ("<blockquote expandable>", "</blockquote>"),
+    }
+    starts = {}
+    ends = {}
+    for sequence, entity in enumerate(entities or []):
+        try:
+            kind = str(entity.type)
+            start_units = int(entity.offset)
+            end_units = start_units + int(entity.length)
+            start = utf16_to_index[start_units]
+            end = utf16_to_index[end_units]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if start < 0 or end > len(text) or end <= start:
+            continue
+        opening, closing = tag_by_type.get(kind, ("", ""))
+        if kind == "text_link" and getattr(entity, "url", None):
+            opening = f'<a href="{_escape_html_attribute(entity.url)}">'
+            closing = "</a>"
+        elif kind == "text_mention" and getattr(entity, "user", None):
+            opening = f'<a href="tg://user?id={int(entity.user.id)}">'
+            closing = "</a>"
+        elif kind == "custom_emoji" and getattr(entity, "custom_emoji_id", None):
+            opening = f'<tg-emoji emoji-id="{_escape_html_attribute(entity.custom_emoji_id)}">'
+            closing = "</tg-emoji>"
+        elif kind == "pre":
+            language = str(getattr(entity, "language", "") or "").strip()
+            if language:
+                opening = f'<pre><code class="language-{_escape_html_attribute(language)}">'
+                closing = "</code></pre>"
+            else:
+                opening, closing = "<pre>", "</pre>"
+        if not opening:
+            continue
+        item = {"start": start, "end": end, "opening": opening, "closing": closing, "sequence": sequence}
+        starts.setdefault(start, []).append(item)
+        ends.setdefault(end, []).append(item)
+
+    output = []
+    for position in range(len(text) + 1):
+        for item in sorted(ends.get(position, ()), key=lambda value: (value["start"], -value["sequence"]), reverse=True):
+            output.append(item["closing"])
+        for item in sorted(starts.get(position, ()), key=lambda value: (-value["end"], value["sequence"])):
+            output.append(item["opening"])
+        if position < len(text):
+            output.append(escape_html(text[position]))
+    return "".join(output)
+
+
 def _clean_browser_video_fallback(text: str) -> str:
     text = re.sub(
         r"(?:your browser does not support (?:this )?video|your browser does not support the video tag|"
@@ -2274,6 +2347,7 @@ def show_admin_menu(chat_id):
     kb.row(types.InlineKeyboardButton("💬 Отправить в чат", callback_data="admin_send_to_chat"))
     kb.row(types.InlineKeyboardButton("👤 Отправить пользователю", callback_data="admin_send_to_user"))
     kb.add(types.InlineKeyboardButton("🎁 Бесплатная подписка", callback_data="admin_free_subscriptions"))
+    kb.add(types.InlineKeyboardButton("🧪 Тест реферала", callback_data="admin_referral_test"))
     kb.add(types.InlineKeyboardButton("🔧 Управление подпиской", callback_data="admin_revoke_subscriptions"))
     kb.add(types.InlineKeyboardButton("🗑 Удалить отзывы", callback_data="admin_review_delete"))
     kb.add(types.InlineKeyboardButton("🔑 MAX-готовый аккаунт", callback_data="admin_project_login"))
@@ -2591,10 +2665,11 @@ def process_admin_group_question(message, target_chat_id):
         if getattr(telegram_chat, "type", None) not in ("group", "supergroup"):
             bot.send_message(message.chat.id, "Этот чат больше не является группой.", **NO_PREVIEW)
             return
+        question_html = _telegram_entities_to_html(question, getattr(message, "entities", None))
         sent = bot.send_message(
             int(target_chat_id),
             "📨 <b>Сообщение от админа</b>\n\n"
-            f"{escape_html(question)}\n\n"
+            f"{question_html}\n\n"
             "Ответьте на это сообщение в группе или нажмите кнопку, чтобы написать администраторам лично.",
             parse_mode="HTML",
             **NO_PREVIEW,
@@ -2941,6 +3016,47 @@ def show_revoke_subscription_confirmation(chat_id, user_id, plan_code):
     )
 
 
+def process_admin_referral_test_input(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or any(not re.fullmatch(r"\d{1,20}", part) for part in parts):
+        prompt = bot.send_message(
+            message.chat.id,
+            "Отправьте два числовых user ID через пробел: сначала ID пригласившего, затем ID существующего пользователя для теста.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_admin_referral_test_input)
+        return
+    referrer_id, invitee_id = (int(part) for part in parts)
+    try:
+        linked = register_referral_for_test(referrer_id, invitee_id)
+    except Exception as error:
+        debug_logger.exception(
+            "ADMIN_REFERRAL_TEST_LINK_FAILED admin_id=%s referrer_id=%s invitee_id=%s",
+            message.from_user.id, referrer_id, invitee_id,
+        )
+        bot.send_message(message.chat.id, "Не удалось создать тестовую привязку. Попробуйте позже.", **NO_PREVIEW)
+        return
+    if not linked:
+        bot.send_message(
+            message.chat.id,
+            "Не удалось создать тест: проверьте, что оба пользователя есть в таблице, ID не совпадают и у приглашённого ещё нет реферальной привязки.",
+            **NO_PREVIEW,
+        )
+        return
+    bot.send_message(
+        message.chat.id,
+        "✅ Тестовая привязка создана.\n\n"
+        f"Пригласивший: <code>{referrer_id}</code>\n"
+        f"Тестовый пользователь: <code>{invitee_id}</code>\n\n"
+        "Пусть тестовый пользователь после этой привязки откроет сравнение способов, инструкцию и выберет способ подключения. В тестовом режиме 7 дней не начисляются.",
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+
+
 def process_free_subscription_user_id(message):
     admin_id = int(message.from_user.id)
     if not is_admin(admin_id):
@@ -3210,18 +3326,30 @@ def process_set_phone(message, target_chat_id, admin_chat_id):
 
 def send_content_to_user(user_id, message):
     try:
-        header = "📨 <b>Сообщение от админа</b>\n\n"
-        caption = message.caption or ""
+        header_html = "📨 <b>Сообщение от админа</b>\n\n"
+        header_plain = "📨 Сообщение от админа\n\n"
+        caption = str(getattr(message, "caption", None) or "")
+        caption_html = _telegram_entities_to_html(
+            caption, getattr(message, "caption_entities", None)
+        )
 
         def send_captioned(send_method, file_id):
-            formatted_caption = header + escape_html(caption)
-            if len(formatted_caption) <= 1024:
+            if caption and len(header_plain) + len(caption) <= 1024:
                 send_method(
-                    user_id, file_id, caption=formatted_caption, parse_mode="HTML"
+                    user_id,
+                    file_id,
+                    caption=header_html + caption_html,
+                    parse_mode="HTML",
                 )
             else:
-                bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
-                send_method(user_id, file_id, caption=caption)
+                bot.send_message(user_id, header_html, parse_mode="HTML", **NO_PREVIEW)
+                if caption and len(caption) <= 1024:
+                    send_method(user_id, file_id, caption=caption_html, parse_mode="HTML")
+                elif caption:
+                    send_method(user_id, file_id)
+                    bot.send_message(user_id, caption_html, parse_mode="HTML", **NO_PREVIEW)
+                else:
+                    send_method(user_id, file_id)
 
         if message.video:
             send_captioned(bot.send_video, message.video.file_id)
@@ -3236,20 +3364,26 @@ def send_content_to_user(user_id, message):
         elif message.animation:
             send_captioned(bot.send_animation, message.animation.file_id)
         elif message.sticker:
-            bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
+            bot.send_message(user_id, header_html, parse_mode="HTML", **NO_PREVIEW)
             bot.send_sticker(user_id, message.sticker.file_id)
         elif message.video_note:
-            bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
+            bot.send_message(user_id, header_html, parse_mode="HTML", **NO_PREVIEW)
             bot.send_video_note(user_id, message.video_note.file_id)
-        elif message.text:
-            formatted_text = header + escape_html(message.text)
-            if len(formatted_text) <= 4096:
+        elif message.text is not None:
+            message_text = str(message.text)
+            text_html = _telegram_entities_to_html(
+                message_text, getattr(message, "entities", None)
+            )
+            if len(header_plain) + len(message_text) <= 4096:
                 bot.send_message(
-                    user_id, formatted_text, parse_mode="HTML", **NO_PREVIEW
+                    user_id,
+                    header_html + text_html,
+                    parse_mode="HTML",
+                    **NO_PREVIEW,
                 )
             else:
-                bot.send_message(user_id, header, parse_mode="HTML", **NO_PREVIEW)
-                bot.send_message(user_id, message.text, **NO_PREVIEW)
+                bot.send_message(user_id, header_html, parse_mode="HTML", **NO_PREVIEW)
+                bot.send_message(user_id, text_html, parse_mode="HTML", **NO_PREVIEW)
         else:
             return False, "Тип сообщения не поддерживается"
 
@@ -3489,6 +3623,22 @@ def _record_referral_engagement(user_id, activity):
     invited_name = " ".join(
         part for part in (invited.get("first_name"), invited.get("last_name")) if part
     ).strip() or "Друг"
+    if reward.get("is_test"):
+        try:
+            bot.send_message(
+                reward["referrer_id"],
+                "🧪 <b>Тест реферальной программы пройден</b>\n\n"
+                f"👤 {escape_html(invited_name)} выполнил тестовые шаги.\n"
+                "Тестовая привязка не начисляет подписку и не входит в статистику реальных приглашений.",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+        except Exception as error:
+            debug_logger.warning(
+                "REFERRAL_TEST_NOTIFY_FAILED referrer_id=%s error_type=%s",
+                reward["referrer_id"], type(error).__name__,
+            )
+        return
     active_until = reward["active_until"].astimezone(timezone.utc)
     try:
         bot.send_message(
@@ -6001,30 +6151,67 @@ def admin_group_thread_reply(message):
         return
     group_id = int(route["group_chat_id"])
     reply_to_id = int(route["group_message_id"])
+    header_html = "📩 <b>Ответ от команды MAX_Parser</b>\n\n"
+    header_plain = "📩 Ответ от команды MAX_Parser\n\n"
+    sent_message_ids = []
     try:
         if message.content_type == "text":
-            sent = bot.send_message(
-                group_id,
-                "📩 <b>Ответ от команды MAX_Parser</b>\n\n" + escape_html(message.text or ""),
-                parse_mode="HTML",
-                reply_to_message_id=reply_to_id,
-                **NO_PREVIEW,
+            body_html = _telegram_entities_to_html(
+                message.text or "", getattr(message, "entities", None)
             )
-            sent_id = sent.message_id
+            if len(header_plain) + len(message.text or "") <= 4096:
+                sent = bot.send_message(
+                    group_id,
+                    header_html + body_html,
+                    parse_mode="HTML",
+                    reply_to_message_id=reply_to_id,
+                    **NO_PREVIEW,
+                )
+                sent_message_ids.append(sent.message_id)
+            else:
+                header = bot.send_message(
+                    group_id, header_html, parse_mode="HTML",
+                    reply_to_message_id=reply_to_id, **NO_PREVIEW,
+                )
+                sent_message_ids.append(header.message_id)
+                body = bot.send_message(
+                    group_id, body_html, parse_mode="HTML",
+                    reply_to_message_id=header.message_id, **NO_PREVIEW,
+                )
+                sent_message_ids.append(body.message_id)
         else:
-            copied = bot.copy_message(
-                group_id, message.chat.id, message.message_id,
-                reply_to_message_id=reply_to_id,
+            caption = str(getattr(message, "caption", None) or "")
+            caption_html = _telegram_entities_to_html(
+                caption, getattr(message, "caption_entities", None)
             )
-            sent_id = copied.message_id
-        save_admin_group_thread_message(group_id, sent_id, int(message.from_user.id))
+            if caption and len(header_plain) + len(caption) <= 1024:
+                copied = bot.copy_message(
+                    group_id, message.chat.id, message.message_id,
+                    reply_to_message_id=reply_to_id,
+                    caption=header_html + caption_html,
+                    parse_mode="HTML",
+                )
+                sent_message_ids.append(copied.message_id)
+            else:
+                header = bot.send_message(
+                    group_id, header_html, parse_mode="HTML",
+                    reply_to_message_id=reply_to_id, **NO_PREVIEW,
+                )
+                sent_message_ids.append(header.message_id)
+                copied = bot.copy_message(
+                    group_id, message.chat.id, message.message_id,
+                    reply_to_message_id=header.message_id,
+                )
+                sent_message_ids.append(copied.message_id)
+        for sent_id in sent_message_ids:
+            save_admin_group_thread_message(group_id, sent_id, int(message.from_user.id))
         bot.send_message(message.chat.id, "✅ Ответ отправлен в группу.", **NO_PREVIEW)
     except Exception as error:
         debug_logger.warning(
             "ADMIN_GROUP_REPLY_SEND_FAILED group_id=%s admin_id=%s error_type=%s",
             group_id, message.from_user.id, type(error).__name__,
         )
-        bot.reply_to(message, "Не удалось отправить ответ в группу. Проверьте, что бот всё ещё состоит в ней.")
+        bot.reply_to(message, "Не удалось отправить ответ. Проверьте, что бот всё ещё состоит в группе.")
 
 
 @bot.message_handler(
@@ -6065,7 +6252,11 @@ def support_admin_reply(message):
         if message.content_type == "text" and len(message.text) <= 3900:
             bot.send_message(
                 user_id,
-                "🆘 <b>Ответ от тех поддержки</b>\n\n" + escape_html(message.text),
+                "🆘 <b>Ответ от тех поддержки</b>\n\n"
+                + _telegram_entities_to_html(
+                    message.text,
+                    getattr(message, "entities", None),
+                ),
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
@@ -7471,6 +7662,17 @@ def admin_callbacks(call):
         keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
         bot.answer_callback_query(call.id, "Доступ отключён")
         safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, **NO_PREVIEW)
+    elif action == "admin_referral_test":
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "🧪 <b>Тест реферальной программы</b>\n\n"
+            "Отправьте два user ID через пробел: сначала ID пригласившего, затем ID уже существующего пользователя.\n\n"
+            "Тестовая привязка проверяет прохождение шагов и не начисляет 7 дней.",
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_admin_referral_test_input)
     elif action == "admin_free_subscriptions":
         show_free_subscription_users(call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(call.message, process_free_subscription_user_id)
