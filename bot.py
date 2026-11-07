@@ -2347,7 +2347,6 @@ def show_admin_menu(chat_id):
     kb.row(types.InlineKeyboardButton("💬 Отправить в чат", callback_data="admin_send_to_chat"))
     kb.row(types.InlineKeyboardButton("👤 Отправить пользователю", callback_data="admin_send_to_user"))
     kb.add(types.InlineKeyboardButton("🎁 Бесплатная подписка", callback_data="admin_free_subscriptions"))
-    kb.add(types.InlineKeyboardButton("🧪 Тест реферала", callback_data="admin_referral_test"))
     kb.add(types.InlineKeyboardButton("🔧 Управление подпиской", callback_data="admin_revoke_subscriptions"))
     kb.add(types.InlineKeyboardButton("🗑 Удалить отзывы", callback_data="admin_review_delete"))
     kb.add(types.InlineKeyboardButton("🔑 MAX-готовый аккаунт", callback_data="admin_project_login"))
@@ -2873,8 +2872,68 @@ def show_users_list(chat_id, message_id, page=0):
         text += "\n\nПользователей пока нет."
     kb = types.InlineKeyboardMarkup(row_width=1)
     _page_buttons(kb, page, page_count, "admin_users_page")
+    kb.add(types.InlineKeyboardButton(
+        "🗑 Удалить пользователя",
+        callback_data=f"admin_delete_user_{page}",
+        style="danger",
+    ))
     kb.add(types.InlineKeyboardButton("🔙 Назад в меню", callback_data="admin_back"))
     safe_edit_message(text, chat_id, message_id, reply_markup=kb, **NO_PREVIEW)
+
+
+def process_admin_delete_user(message, list_message_id, page):
+    admin_id = int(message.from_user.id)
+    if not is_admin(admin_id):
+        return
+
+    raw_user_id = (message.text or "").strip()
+    if not re.fullmatch(r"\d{1,20}", raw_user_id):
+        prompt = bot.send_message(
+            message.chat.id,
+            "Пришлите только числовой user ID из таблицы пользователей.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(
+            prompt, process_admin_delete_user, list_message_id, page
+        )
+        return
+
+    user_id = int(raw_user_id)
+    if not get_user_profile(user_id):
+        prompt = bot.send_message(
+            message.chat.id,
+            "Пользователь с таким ID не найден. Проверьте ID и отправьте его ещё раз.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(
+            prompt, process_admin_delete_user, list_message_id, page
+        )
+        return
+
+    had_referral_record = has_referral_invite(user_id)
+    if not delete_user(user_id):
+        bot.send_message(
+            message.chat.id,
+            "Не удалось удалить пользователя. Обновите список и попробуйте ещё раз.",
+            **NO_PREVIEW,
+        )
+        return
+
+    result = f"✅ Пользователь <code>{user_id}</code> удалён из списка пользователей."
+    if had_referral_record:
+        result += (
+            "\n\nУ него уже есть запись об участии в реферальной программе. "
+            "Удаление профиля не сбрасывает её, поэтому повторно привязать его к другой ссылке не получится."
+        )
+    else:
+        result += (
+            "\n\nДля проверки реферальной ссылки попросите его сразу открыть её. "
+            "Бот добавит профиль заново после перехода."
+        )
+    bot.send_message(message.chat.id, result, parse_mode="HTML", **NO_PREVIEW)
+    show_users_list(message.chat.id, list_message_id, page)
 
 
 def show_free_subscription_users(chat_id, message_id, page=0):
@@ -3011,47 +3070,6 @@ def show_revoke_subscription_confirmation(chat_id, user_id, plan_code):
         f"Текущий срок действия: до {active_until:%d.%m.%Y %H:%M} UTC.\n\n"
         "Будет отключён весь оставшийся доступ по этому тарифу.",
         reply_markup=keyboard,
-        parse_mode="HTML",
-        **NO_PREVIEW,
-    )
-
-
-def process_admin_referral_test_input(message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2 or any(not re.fullmatch(r"\d{1,20}", part) for part in parts):
-        prompt = bot.send_message(
-            message.chat.id,
-            "Отправьте два числовых user ID через пробел: сначала ID пригласившего, затем ID существующего пользователя для теста.",
-            reply_markup=get_cancel_keyboard(),
-            **NO_PREVIEW,
-        )
-        bot.register_next_step_handler(prompt, process_admin_referral_test_input)
-        return
-    referrer_id, invitee_id = (int(part) for part in parts)
-    try:
-        linked = register_referral_for_test(referrer_id, invitee_id)
-    except Exception as error:
-        debug_logger.exception(
-            "ADMIN_REFERRAL_TEST_LINK_FAILED admin_id=%s referrer_id=%s invitee_id=%s",
-            message.from_user.id, referrer_id, invitee_id,
-        )
-        bot.send_message(message.chat.id, "Не удалось создать тестовую привязку. Попробуйте позже.", **NO_PREVIEW)
-        return
-    if not linked:
-        bot.send_message(
-            message.chat.id,
-            "Не удалось создать тест: проверьте, что оба пользователя есть в таблице, ID не совпадают и у приглашённого ещё нет реферальной привязки.",
-            **NO_PREVIEW,
-        )
-        return
-    bot.send_message(
-        message.chat.id,
-        "✅ Тестовая привязка создана.\n\n"
-        f"Пригласивший: <code>{referrer_id}</code>\n"
-        f"Тестовый пользователь: <code>{invitee_id}</code>\n\n"
-        "Пусть тестовый пользователь после этой привязки откроет сравнение способов, инструкцию и выберет способ подключения. В тестовом режиме 7 дней не начисляются.",
         parse_mode="HTML",
         **NO_PREVIEW,
     )
@@ -3581,13 +3599,12 @@ def show_referral_program(chat_id, user_id, message_id=None):
     })
     text = (
         "🎁 <b>Пригласи друга — получи 7 дней MAX_Parser</b>\n\n"
-        "За каждого нового пользователя, который разберётся в возможностях бота и выберет способ подключения,"
+        "За каждого нового пользователя, который перейдёт по твоей ссылке и ознакомится с возможностями бота,"
         " тебе начислится 7 дней мульти-подписки. Она открывает оба способа и позволяет подключить до 10 чатов.\n\n"
         "<b>Что должен сделать друг:</b>\n"
         "1. Впервые открыть бота по твоей ссылке.\n"
         "2. Посмотреть сравнение способов подключения.\n"
-        "3. Открыть инструкцию.\n"
-        "4. Выбрать способ подключения.\n\n"
+        "3. Открыть инструкцию.\n\n"
         f"📨 <b>Твоя ссылка:</b>\n<code>{escape_html(referral_link)}</code>\n\n"
         f"📊 <b>Приглашено:</b> {stats['total']} · <b>Наград получено:</b> {stats['rewarded']}\n"
         f"⏳ <b>Ещё выполняют условия:</b> {stats['in_progress']}"
@@ -3623,22 +3640,6 @@ def _record_referral_engagement(user_id, activity):
     invited_name = " ".join(
         part for part in (invited.get("first_name"), invited.get("last_name")) if part
     ).strip() or "Друг"
-    if reward.get("is_test"):
-        try:
-            bot.send_message(
-                reward["referrer_id"],
-                "🧪 <b>Тест реферальной программы пройден</b>\n\n"
-                f"👤 {escape_html(invited_name)} выполнил тестовые шаги.\n"
-                "Тестовая привязка не начисляет подписку и не входит в статистику реальных приглашений.",
-                parse_mode="HTML",
-                **NO_PREVIEW,
-            )
-        except Exception as error:
-            debug_logger.warning(
-                "REFERRAL_TEST_NOTIFY_FAILED referrer_id=%s error_type=%s",
-                reward["referrer_id"], type(error).__name__,
-            )
-        return
     active_until = reward["active_until"].astimezone(timezone.utc)
     try:
         bot.send_message(
@@ -7546,6 +7547,23 @@ def admin_callbacks(call):
             call.message.chat.id, call.message.message_id,
             int(action.rsplit("_", 1)[1]),
         )
+    elif action.startswith("admin_delete_user_"):
+        try:
+            page = int(action.rsplit("_", 1)[1])
+        except ValueError:
+            page = 0
+        prompt = bot.send_message(
+            call.message.chat.id,
+            "Отправьте user ID пользователя, которого нужно удалить из списка.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(
+            prompt,
+            process_admin_delete_user,
+            call.message.message_id,
+            page,
+        )
     elif action == "admin_review_delete":
         bot.answer_callback_query(call.id)
         show_admin_review_delete_list(call.message.chat.id, call.message.message_id)
@@ -7662,17 +7680,6 @@ def admin_callbacks(call):
         keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
         bot.answer_callback_query(call.id, "Доступ отключён")
         safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, **NO_PREVIEW)
-    elif action == "admin_referral_test":
-        prompt = bot.send_message(
-            call.message.chat.id,
-            "🧪 <b>Тест реферальной программы</b>\n\n"
-            "Отправьте два user ID через пробел: сначала ID пригласившего, затем ID уже существующего пользователя.\n\n"
-            "Тестовая привязка проверяет прохождение шагов и не начисляет 7 дней.",
-            parse_mode="HTML",
-            reply_markup=get_cancel_keyboard(),
-            **NO_PREVIEW,
-        )
-        bot.register_next_step_handler(prompt, process_admin_referral_test_input)
     elif action == "admin_free_subscriptions":
         show_free_subscription_users(call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(call.message, process_free_subscription_user_id)

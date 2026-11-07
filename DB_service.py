@@ -89,11 +89,6 @@ def init_db():
             ON referral_invites (referrer_id, created_at DESC)
         """)
         conn.execute("""
-            ALTER TABLE referral_invites
-            ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT FALSE
-        """)
-
-        conn.execute("""
             CREATE TABLE IF NOT EXISTS admin_group_thread_messages (
                 group_chat_id BIGINT NOT NULL,
                 message_id BIGINT NOT NULL,
@@ -465,41 +460,11 @@ def register_referral(referrer_id: int, invitee_id: int) -> bool:
             return inserted is not None
 
 
-def register_referral_for_test(referrer_id: int, invitee_id: int) -> bool:
-    referrer_id = int(referrer_id)
-    invitee_id = int(invitee_id)
-    if referrer_id == invitee_id:
-        return False
-    with get_connection() as conn:
-        with conn.transaction():
-            users = conn.execute("""
-                SELECT COUNT(*) AS found
-                FROM users
-                WHERE user_id IN (%s, %s)
-            """, (referrer_id, invitee_id)).fetchone()
-            if int(users["found"] or 0) != 2:
-                return False
-            inserted = conn.execute("""
-                INSERT INTO referral_invites (invitee_id, referrer_id, is_test)
-                VALUES (%s, %s, TRUE)
-                ON CONFLICT (invitee_id) DO UPDATE SET
-                    referrer_id = EXCLUDED.referrer_id,
-                    created_at = CURRENT_TIMESTAMP,
-                    opened_comparison = FALSE,
-                    opened_instruction = FALSE,
-                    selected_connection = FALSE,
-                    rewarded_at = NULL
-                WHERE referral_invites.is_test = TRUE
-                RETURNING invitee_id
-            """, (invitee_id, referrer_id)).fetchone()
-            return inserted is not None
-
-
 def get_referral_stats(referrer_id: int):
     with get_connection() as conn:
         row = conn.execute("""
-            SELECT COUNT(*) FILTER (WHERE NOT is_test) AS total,
-                   COUNT(*) FILTER (WHERE NOT is_test AND rewarded_at IS NOT NULL) AS rewarded
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE rewarded_at IS NOT NULL) AS rewarded
             FROM referral_invites
             WHERE referrer_id = %s
         """, (int(referrer_id),)).fetchone()
@@ -526,7 +491,7 @@ def record_referral_activity(invitee_id: int, activity: str):
         with conn.transaction():
             row = conn.execute("""
                 SELECT referrer_id, opened_comparison, opened_instruction,
-                       selected_connection, rewarded_at, is_test
+                       selected_connection, rewarded_at
                 FROM referral_invites
                 WHERE invitee_id = %s
                 FOR UPDATE
@@ -542,14 +507,13 @@ def record_referral_activity(invitee_id: int, activity: str):
             )
             progress = conn.execute("""
                 SELECT referrer_id, opened_comparison, opened_instruction,
-                       selected_connection, rewarded_at, is_test
+                       selected_connection, rewarded_at
                 FROM referral_invites
                 WHERE invitee_id = %s
             """, (int(invitee_id),)).fetchone()
             qualified = all((
                 progress["opened_comparison"],
                 progress["opened_instruction"],
-                progress["selected_connection"],
             ))
             if not qualified:
                 return {
@@ -565,12 +529,6 @@ def record_referral_activity(invitee_id: int, activity: str):
             """, (int(invitee_id),)).fetchone()
             if not claimed:
                 return {"referrer_id": int(progress["referrer_id"]), "rewarded": False}
-            if progress["is_test"]:
-                return {
-                    "referrer_id": int(claimed["referrer_id"]),
-                    "rewarded": True,
-                    "is_test": True,
-                }
             entitlement = conn.execute("""
                 INSERT INTO telegram_subscription_entitlements (user_id, plan_code, active_until)
                 VALUES (%s, 'multi', CURRENT_TIMESTAMP + INTERVAL '7 days')
@@ -585,7 +543,6 @@ def record_referral_activity(invitee_id: int, activity: str):
             return {
                 "referrer_id": int(claimed["referrer_id"]),
                 "rewarded": True,
-                "is_test": False,
                 "active_until": entitlement["active_until"],
             }
 
@@ -636,6 +593,15 @@ def delete_user(user_id: int) -> bool:
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM users WHERE user_id = %s", (int(user_id),))
         return cursor.rowcount == 1
+
+
+def has_referral_invite(invitee_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 AS found FROM referral_invites WHERE invitee_id = %s",
+            (int(invitee_id),),
+        ).fetchone()
+        return row is not None
 
 
 def get_all_users():
