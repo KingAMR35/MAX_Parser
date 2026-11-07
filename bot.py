@@ -2604,7 +2604,7 @@ def process_admin_group_question(message, target_chat_id):
         save_admin_group_reply_link_token(reply_token, target_chat_id, sent.message_id)
         reply_keyboard = types.InlineKeyboardMarkup(row_width=1)
         reply_keyboard.add(types.InlineKeyboardButton(
-            "✉️ Ответить администраторам",
+            "✉️ Ответить",
             url=f"https://t.me/{BOT_PUBLIC_USERNAME}?start=reply_{reply_token}",
         ))
         bot.edit_message_reply_markup(
