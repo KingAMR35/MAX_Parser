@@ -2687,6 +2687,7 @@ def process_admin_group_question(message, target_chat_id):
         bot.send_message(
             message.chat.id,
             f"✅ Сообщение отправлено в группу «{escape_html(telegram_chat.title or str(target_chat_id))}». Ответы на сообщение бота будут приходить всем администраторам.",
+            reply_markup=admin_send_again_keyboard("group", target_chat_id),
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -3439,13 +3440,24 @@ def process_broadcast_message(message):
 
     bot.send_message(message.chat.id, report)
 
+
+def admin_send_again_keyboard(target_type, target_id):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "✉️ Отправить ещё",
+        callback_data=f"admin_send_again_{target_type}_{int(target_id)}",
+    ))
+    return keyboard
+
+
 def process_send_to_one(message, target_user_id):
     ok, error = send_content_to_user(target_user_id, message)
 
     if ok:
         bot.send_message(
             message.chat.id,
-            f"✅ Сообщение отправлено пользователю {target_user_id}"
+            f"✅ Сообщение отправлено пользователю {target_user_id}",
+            reply_markup=admin_send_again_keyboard("user", target_user_id),
         )
     else:
         bot.send_message(
@@ -3460,7 +3472,8 @@ def process_send_to_chat(message, target_chat_id):
     if ok:
         bot.send_message(
             message.chat.id,
-            f"✅ Сообщение отправлено в чат {target_chat_id}"
+            f"✅ Сообщение отправлено в чат {target_chat_id}",
+            reply_markup=admin_send_again_keyboard("chat", target_chat_id),
         )
     else:
         bot.send_message(
@@ -3475,7 +3488,8 @@ def process_send_to_user_content(message, target_user_id):
     if ok:
         bot.send_message(
             message.chat.id,
-            f"✅ Сообщение отправлено пользователю {target_user_id}"
+            f"✅ Сообщение отправлено пользователю {target_user_id}",
+            reply_markup=admin_send_again_keyboard("user", target_user_id),
         )
     else:
         bot.send_message(
@@ -3554,7 +3568,8 @@ def process_send_to_chat_content(message, target_chat_id):
     if ok:
         bot.send_message(
             message.chat.id,
-            f"✅ Сообщение отправлено в чат {target_chat_id}"
+            f"✅ Сообщение отправлено в чат {target_chat_id}",
+            reply_markup=admin_send_again_keyboard("chat", target_chat_id),
         )
     else:
         bot.send_message(
@@ -3590,8 +3605,9 @@ def _referral_start_link(user_id):
     return f"https://t.me/{BOT_PUBLIC_USERNAME}?start=ref_{int(user_id)}"
 
 
-def show_referral_program(chat_id, user_id, message_id=None):
-    stats = get_referral_stats(user_id)
+def show_referral_program(chat_id, user_id, message_id=None, stats=None):
+    if stats is None:
+        stats = get_referral_stats(user_id)
     referral_link = _referral_start_link(user_id)
     share_link = "https://t.me/share/url?" + urlencode({
         "url": referral_link,
@@ -3603,7 +3619,7 @@ def show_referral_program(chat_id, user_id, message_id=None):
         " тебе начислится 7 дней мульти-подписки. Она открывает оба способа и позволяет подключить до 10 чатов.\n\n"
         "<b>Что должен сделать друг:</b>\n"
         "1. Впервые открыть бота по твоей ссылке.\n"
-        "2. Посмотреть сравнение способов подключения.\n"
+        "2. Посмотреть разницу способов подключения.\n"
         "3. Открыть инструкцию.\n\n"
         f"📨 <b>Твоя ссылка:</b>\n<code>{escape_html(referral_link)}</code>\n\n"
         f"📊 <b>Приглашено:</b> {stats['total']} · <b>Наград получено:</b> {stats['rewarded']}\n"
@@ -3611,7 +3627,7 @@ def show_referral_program(chat_id, user_id, message_id=None):
     )
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("📨 Поделиться ссылкой", url=share_link))
-    keyboard.add(types.InlineKeyboardButton("🔄 Обновить прогресс", callback_data="referral_program"))
+    keyboard.add(types.InlineKeyboardButton("🔄 Обновить прогресс", callback_data="referral_refresh"))
     keyboard.add(types.InlineKeyboardButton("🔙 В главное меню", callback_data="start_home"))
     if message_id:
         safe_edit_message(
@@ -6206,7 +6222,12 @@ def admin_group_thread_reply(message):
                 sent_message_ids.append(copied.message_id)
         for sent_id in sent_message_ids:
             save_admin_group_thread_message(group_id, sent_id, int(message.from_user.id))
-        bot.send_message(message.chat.id, "✅ Ответ отправлен в группу.", **NO_PREVIEW)
+        bot.send_message(
+            message.chat.id,
+            "✅ Ответ отправлен в группу.",
+            reply_markup=admin_send_again_keyboard("group", group_id),
+            **NO_PREVIEW,
+        )
     except Exception as error:
         debug_logger.warning(
             "ADMIN_GROUP_REPLY_SEND_FAILED group_id=%s admin_id=%s error_type=%s",
@@ -6250,27 +6271,78 @@ def support_admin_reply(message):
             bot.reply_to(message, "Диалог уже закрыт. Откройте новое обращение, если пользователь напишет снова.")
             return
     try:
-        if message.content_type == "text" and len(message.text) <= 3900:
-            bot.send_message(
-                user_id,
-                "🆘 <b>Ответ от тех поддержки</b>\n\n"
-                + _telegram_entities_to_html(
-                    message.text,
-                    getattr(message, "entities", None),
-                ),
-                parse_mode="HTML",
-                **NO_PREVIEW,
-            )
-            return
+        _send_support_admin_message(user_id, message)
+        bot.send_message(
+            message.chat.id,
+            f"✅ Ответ отправлен пользователю <code>{user_id}</code>.",
+            parse_mode="HTML",
+            reply_markup=admin_send_again_keyboard("support", user_id),
+            **NO_PREVIEW,
+        )
+    except Exception as error:
+        bot.reply_to(message, f"Не удалось доставить ответ: {escape_html(str(error)[:300])}")
+
+
+def _send_support_admin_message(user_id, message):
+    if message.content_type == "text" and len(message.text or "") <= 3900:
         bot.send_message(
             user_id,
-            "🆘 <b>Ответ от тех поддержки</b>",
+            "🆘 <b>Ответ от тех поддержки</b>\n\n"
+            + _telegram_entities_to_html(
+                message.text or "",
+                getattr(message, "entities", None),
+            ),
             parse_mode="HTML",
             **NO_PREVIEW,
         )
-        bot.copy_message(user_id, message.chat.id, message.message_id)
+        return
+    bot.send_message(
+        user_id,
+        "🆘 <b>Ответ от тех поддержки</b>",
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
+    bot.copy_message(user_id, message.chat.id, message.message_id)
+
+
+def process_support_admin_followup(message, user_id):
+    admin_id = int(message.from_user.id)
+    user_id = int(user_id)
+    if not is_admin(admin_id):
+        return
+    if message.content_type == "text" and (message.text or "").strip().startswith("/"):
+        if (message.text or "").strip().lower() == "/close":
+            if get_support_session_assignee(user_id) == admin_id and _close_support(user_id):
+                bot.send_message(message.chat.id, "✅ Чат с пользователем завершён.", **NO_PREVIEW)
+            else:
+                bot.send_message(message.chat.id, "Этот диалог уже закрыт.", **NO_PREVIEW)
+            return
+        prompt = bot.send_message(
+            message.chat.id,
+            "Отправьте ответ обычным сообщением, нажмите «❌ Отмена» или введите /close, чтобы завершить чат.",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, process_support_admin_followup, user_id)
+        return
+    if get_support_session_assignee(user_id) != admin_id:
+        bot.send_message(message.chat.id, "Это обращение уже закрыто или его ведёт другой администратор.", **NO_PREVIEW)
+        return
+    try:
+        _send_support_admin_message(user_id, message)
+        bot.send_message(
+            message.chat.id,
+            f"✅ Ответ отправлен пользователю <code>{user_id}</code>.",
+            parse_mode="HTML",
+            reply_markup=admin_send_again_keyboard("support", user_id),
+            **NO_PREVIEW,
+        )
     except Exception as error:
-        bot.reply_to(message, f"Не удалось доставить ответ: {escape_html(str(error)[:300])}")
+        bot.send_message(
+            message.chat.id,
+            f"Не удалось доставить ответ: {escape_html(str(error)[:300])}",
+            **NO_PREVIEW,
+        )
 
 
 @bot.message_handler(
@@ -7821,6 +7893,40 @@ def admin_callbacks(call):
         )
 
         bot.register_next_step_handler(prompt, process_broadcast_message)
+    elif action.startswith("admin_send_again_"):
+        if not is_admin(call.from_user.id) or call.message.chat.type != "private":
+            bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
+            return
+        try:
+            target_type, raw_target_id = action[len("admin_send_again_"):].split("_", 1)
+            target_id = int(raw_target_id)
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Не удалось определить получателя", show_alert=True)
+            return
+        if target_type not in {"user", "chat", "group", "support"}:
+            bot.answer_callback_query(call.id, "Неизвестный тип получателя", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        if target_type == "user":
+            prompt_text = f"Отправьте ещё одно сообщение пользователю <code>{target_id}</code>."
+            handler = process_send_to_user_content
+        elif target_type == "support":
+            prompt_text = f"Отправьте следующий ответ пользователю <code>{target_id}</code>."
+            handler = process_support_admin_followup
+        elif target_type == "group":
+            prompt_text = "Напишите ещё одно сообщение для группы."
+            handler = process_admin_group_question
+        else:
+            prompt_text = f"Отправьте ещё одно сообщение в чат <code>{target_id}</code>."
+            handler = process_send_to_chat_content
+        prompt = bot.send_message(
+            call.message.chat.id,
+            prompt_text,
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard(),
+            **NO_PREVIEW,
+        )
+        bot.register_next_step_handler(prompt, handler, target_id)
     elif action == "admin_send_to_chat":
         bot.answer_callback_query(call.id)
         show_chat_send_selector(call.message.chat.id, call.message.message_id)
@@ -8108,6 +8214,33 @@ def callback_handler(call):
                 return
             bot.answer_callback_query(call.id)
             show_referral_program(call.message.chat.id, call.from_user.id, call.message.message_id)
+        elif call.data == "referral_refresh":
+            if call.message.chat.type != "private":
+                bot.answer_callback_query(call.id, "Откройте программу приглашений в личном чате с ботом.", show_alert=True)
+                return
+            try:
+                stats = get_referral_stats(call.from_user.id)
+            except Exception as error:
+                debug_logger.warning(
+                    "REFERRAL_REFRESH_FAILED user_id=%s error_type=%s",
+                    call.from_user.id, type(error).__name__,
+                )
+                bot.answer_callback_query(
+                    call.id,
+                    "Не удалось обновить прогресс. Попробуйте ещё раз.",
+                    show_alert=True,
+                )
+                return
+            bot.answer_callback_query(
+                call.id,
+                f"📊 Наград: {stats['rewarded']} · выполняют условия: {stats['in_progress']}",
+            )
+            show_referral_program(
+                call.message.chat.id,
+                call.from_user.id,
+                call.message.message_id,
+                stats=stats,
+            )
         elif call.data == "thanks_project":
             bot.answer_callback_query(call.id)
             bot.edit_message_text(
