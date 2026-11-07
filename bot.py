@@ -2592,7 +2592,7 @@ def process_admin_group_question(message, target_chat_id):
             return
         sent = bot.send_message(
             int(target_chat_id),
-            "📩 <b>Вопрос от команды MAX_Parser</b>\n\n"
+            "📨 <b>Сообщение от админа</b>\n\n"
             f"{escape_html(question)}\n\n"
             "Чтобы ответ дошёл администратору, ответьте именно на это сообщение.",
             parse_mode="HTML",
