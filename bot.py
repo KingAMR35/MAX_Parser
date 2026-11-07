@@ -2037,7 +2037,7 @@ def format_message(post: dict) -> str:
 
 def get_cancel_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step", style="danger"))
     return kb
 
 def track_user(message_or_callback):
@@ -2061,7 +2061,7 @@ def _build_qr_keyboard(target_chat_id):
     kb.add(types.InlineKeyboardButton("✅ Готово, я отсканировал", callback_data=f"qr_ready_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("📱 Войти по номеру телефона", callback_data=f"qr_phone_{target_chat_id}"))
     kb.add(types.InlineKeyboardButton("🔄 Обновить QR", callback_data=f"qr_refresh_{target_chat_id}"))
-    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}", style="danger"))
     return kb
 
 
@@ -2071,14 +2071,14 @@ def _qr_target_from_action(action):
 
 def _build_password_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}", style="danger"))
     return kb
 
 
 def _build_auth_check_keyboard(target_chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("🔄 Проверить вход MAX", callback_data=f"qr_ready_{target_chat_id}"))
-    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}", style="danger"))
     return kb
 
 
@@ -2641,7 +2641,7 @@ def process_admin_group_question(message, target_chat_id):
             message.chat.id,
             "Отправьте вопрос обычным текстом или нажмите «Отмена».",
             reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
-                "❌ Отмена", callback_data=f"admin_group_message_cancel_{int(target_chat_id)}"
+                "❌ Отмена", callback_data=f"admin_group_message_cancel_{int(target_chat_id)}", style="danger"
             )),
             **NO_PREVIEW,
         )
@@ -2653,7 +2653,7 @@ def process_admin_group_question(message, target_chat_id):
             message.chat.id,
             "Сообщение слишком длинное. Сократите его до 3800 символов или нажмите «Отмена».",
             reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
-                "❌ Отмена", callback_data=f"admin_group_message_cancel_{int(target_chat_id)}"
+                "❌ Отмена", callback_data=f"admin_group_message_cancel_{int(target_chat_id)}", style="danger"
             )),
             **NO_PREVIEW,
         )
@@ -3064,7 +3064,7 @@ def show_revoke_subscription_confirmation(chat_id, user_id, plan_code):
         "✅ Подтвердить отключение",
         callback_data=f"admin_revoke_confirm_{plan_code}_{int(user_id)}",
     ))
-    keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="admin_back"))
+    keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="admin_back", style="danger"))
     bot.send_message(
         chat_id,
         f"Отключить тариф <b>{escape_html(plan_label)}</b> у пользователя <code>{user_id}</code>?\n"
@@ -3856,10 +3856,9 @@ def _start_customer_setup_prompt(user_id, account_mode, chat_id, message_id=None
     bot.send_message(
         chat_id,
         f"<b>Шаг 1 из {2 if account_mode == 'project' else 3} · Telegram-группа</b>\n\n"
-        f"Вы выбрали: <b>{label}</b>. Добавьте меня в Telegram-группу, в которую я буду присылать сообщения. "
-        "Когда я появлюсь в группе, настройка продолжится автоматически. Если я уже состою в ней, то "
-        "напишите в группе команду /bind.\n\n"
-        "Убедитесь, что мне разрешено отправлять сообщения. Чтобы остановить настройку, нажмите «❌ Отмена».",
+        f"Вы выбрали: <b>{label}</b>.\n\n <b>Добавьте меня в Telegram-группу, в которую я буду присылать сообщения.</b> \n"
+        "Если я уже состою в ней, то напишите в группе команду /bind.\n\n"
+        "<i>Убедитесь, что мне разрешено отправлять сообщения. Чтобы остановить настройку, нажмите «❌ Отмена».</i>",
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
         **NO_PREVIEW,
@@ -4995,7 +4994,7 @@ def _max_source_link_kind(value):
 
 
 def _setup_cancel_button(chat_id):
-    return types.InlineKeyboardButton("❌ Отмена", callback_data=f"setup_cancel_{int(chat_id)}")
+    return types.InlineKeyboardButton("❌ Отмена", callback_data=f"setup_cancel_{int(chat_id)}", style="danger")
 
 
 SETUP_CANCEL_NOTICE = "Настройка отменена. Её можно начать заново через /connect."
@@ -5244,11 +5243,11 @@ def _project_source_instructions(owner_id, source_type, chat_id):
         ))
         text = (
             "<b>Шаг 2 из 2 · Группа или чат</b>\n\n"
-            f"1) Добавьте в вашу MAX группу готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>.\n "
+            f"1) Добавьте в вашу MAX группу готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>.\n"
             "2) Затем перейдите по ссылке https://web.max.ru/, войдите в свой аккаунт, нажмите на свою группу, "
-            "скопируйе ссылку на группу и отправте сюда в чат\n"
+            "скопируйте ссылку на группу и отправьте сюда в чат.\n\n"
             "После этого бот проверит доступность бота и сообщит вам после проверки.\n\n "
-            "Если у вас будут какие-то вопросы или проблемы, то пишите /help"
+            "<i>Если у вас будут какие-то вопросы или проблемы, то пишите /help</i>"
         )
     else:
         keyboard.add(types.InlineKeyboardButton(
@@ -5311,8 +5310,8 @@ def _project_invite_prompt(owner_id, chat_id):
     keyboard.add(types.InlineKeyboardButton(back_label, callback_data=f"{back_action}_{chat_id}"))
     keyboard.add(_setup_cancel_button(chat_id))
     return (
-        f"Отправьте ссылку-приглашение на MAX {('группу' if source_type == 'group' else 'канал')}. "
-        "После этого администратор сам все настроит, если будут проблемы, то напишет вам.",
+        f"<b>Отправьте ссылку-приглашение на MAX {('группу' if source_type == 'group' else 'канал')}.</b>\n\n "
+        "После этого <b>администратор сам все настроит</b>, если будут проблемы, то напишет вам.",
         keyboard,
     )
 
@@ -5819,8 +5818,8 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
     sent = bot.send_message(
         owner_id,
         f"✅ Группа <b>{escape_html(title)}</b> закреплена за вами.\n\n"
-        f"<b>Шаг 2 из {2 if account_mode == 'project' else 3}.</b> Пришлите ссылку на чат, группу или канал MAX, откуда получать сообщения.\n"
-        "Как скопировать ссылку: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
+        f"<b>Шаг 2 из {2 if account_mode == 'project' else 3}.</b>\n Пришлите ссылку на чат, группу или канал MAX, откуда получать сообщения.\n\n"
+        "<b>Как скопировать ссылку</b>: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
         "откройте нужный чат, группу или канал и скопируйте ссылку из меню.\n\n"
         + (f"Для закрытого чата MAX отправьте ссылку-приглашение — бот перешлёт её администратору, "
            f"который вручную вступит с аккаунта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
@@ -6067,9 +6066,9 @@ def customer_source_url(message):
             pass
         bot.send_message(
             message.chat.id,
-            "<b>Шаг 3 из 3.</b> Сейчас пришлю QR-код для входа в MAX. Отсканируйте его в приложении MAX "
-            "и нажмите «Готово, я отсканировал». Авторизация будет сохранена только для вашей группы. "
-            "Если удобнее входить по номеру, на QR-экране выберите защищённую страницу и завершите вход там.",
+            "<b>Шаг 3 из 3.</b> Сейчас пришлю QR-код для входа в MAX.\n\n Отсканируйте его в приложении MAX "
+            "и нажмите «Готово, я отсканировал». Авторизация будет сохранена только для вашей группы. \n\n"
+            "<b>Если удобнее входить по номеру телефона</b>, то нажмите кнопку «Войти по номеру телефона»",
             parse_mode="HTML",
             **NO_PREVIEW,
         )
@@ -7367,7 +7366,7 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "Защищённая страница готова")
         cancel_keyboard = types.InlineKeyboardMarkup(row_width=1)
         cancel_keyboard.add(types.InlineKeyboardButton(
-            "❌ Отмена", callback_data=f"qr_cancel_{target_id}"
+            "❌ Отмена", callback_data=f"qr_cancel_{target_id}", style="danger"
         ))
         try:
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=cancel_keyboard)
@@ -7859,7 +7858,7 @@ def admin_callbacks(call):
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.row(
             types.InlineKeyboardButton("✅ Да, очистить", callback_data="admin_yes_clear_cache"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_back")
+            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_back", style="danger")
         )
         safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=kb, **NO_PREVIEW)
         return
@@ -8005,7 +8004,7 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id)
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton(
-            "❌ Отмена", callback_data=f"admin_group_message_cancel_{target_id}"
+            "❌ Отмена", callback_data=f"admin_group_message_cancel_{target_id}", style="danger"
         ))
         prompt = bot.send_message(
             call.message.chat.id,
@@ -8069,7 +8068,7 @@ def admin_callbacks(call):
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.row(
             types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"admin_yes_delete_{target_id}"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data=f"admin_chat_{target_id}")
+            types.InlineKeyboardButton("❌ Отмена", callback_data=f"admin_chat_{target_id}", style="danger")
         )
         safe_edit_message(text, call.message.chat.id, call.message.message_id,
                           reply_markup=kb, **NO_PREVIEW)
@@ -8100,7 +8099,7 @@ def admin_callbacks(call):
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.row(
             types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"admin_yes_delete_admin_{target_id}"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_admins")
+            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_admins", style="danger")
         )
         safe_edit_message(text, call.message.chat.id, call.message.message_id,
                           reply_markup=kb, **NO_PREVIEW)
@@ -8180,7 +8179,7 @@ def my_chat_delete_callbacks(call):
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         keyboard.row(
             types.InlineKeyboardButton("🗑 Удалить", callback_data=f"mychat_confirm_delete_{target_chat_id}", style="danger"),
-            types.InlineKeyboardButton("↩️ Отмена", callback_data=f"mychat_cancel_delete_{target_chat_id}")
+            types.InlineKeyboardButton("↩️ Отмена", callback_data=f"mychat_cancel_delete_{target_chat_id}", style="danger")
         )
         safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
         bot.answer_callback_query(call.id)
