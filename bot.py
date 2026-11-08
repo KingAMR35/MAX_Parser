@@ -3681,9 +3681,15 @@ def return_start():
 
 def parser_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(types.InlineKeyboardButton("1️⃣ Свой MAX-аккаунт · от 249 ₽", callback_data="connect_self"))
-    keyboard.add(types.InlineKeyboardButton("2️⃣ Готовый аккаунт · от 499 ₽", callback_data="connect_project"))
-    keyboard.add(types.InlineKeyboardButton("✨ Мульти-подписка · от 599 ₽", callback_data="connect_multi"))
+    keyboard.add(types.InlineKeyboardButton(
+        _subscription_product_button_label("self"), callback_data="connect_self"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        _subscription_product_button_label("project"), callback_data="connect_project"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        _subscription_product_button_label("multi"), callback_data="connect_multi"
+    ))
     keyboard.add(types.InlineKeyboardButton("ℹ️ Разница способов", callback_data="compare_modes"))
     keyboard.add(types.InlineKeyboardButton("📖 Инструкция", callback_data="instruction"))
     keyboard.add(types.InlineKeyboardButton("🎬 Видео инструкция", callback_data="video_instruction"))
@@ -3696,24 +3702,72 @@ SUBSCRIPTION_PRICES = {
     "project": {1: 499, 3: 1199, 12: 5499},
     "multi": {1: 599, 3: 1499, 12: 6499},
 }
+SUBSCRIPTION_DISCOUNT_PERCENT = 50
 SUBSCRIPTION_LABELS = {
     "self": "Подключение своего MAX-аккаунта",
     "project": "Подключение аккаунта MAX_Parser",
     "multi": "Мульти-подписка",
 }
+SUBSCRIPTION_SHORT_LABELS = {
+    "self": "1️⃣ Свой MAX-аккаунт",
+    "project": "2️⃣ Готовый аккаунт",
+    "multi": "✨ Мульти-подписка",
+}
 SUBSCRIPTION_PERIOD_LABELS = {1: "1 месяц", 3: "3 месяца", 12: "1 год"}
+
+
+def _format_rubles(amount_kopecks):
+    rubles, kopecks = divmod(int(amount_kopecks), 100)
+    formatted = f"{rubles:,}".replace(",", " ")
+    if kopecks:
+        formatted += f",{kopecks:02d}"
+    return f"{formatted} ₽"
+
+
+def _discounted_price_kopecks(plan_code, months):
+    regular_rubles = SUBSCRIPTION_PRICES[plan_code][months]
+    return regular_rubles * (100 - SUBSCRIPTION_DISCOUNT_PERCENT)
+
+
+def _strikethrough_button_text(text):
+    return "".join(
+        f"{character}\u0336" if not character.isspace() else character
+        for character in text
+    )
+
+
+def _subscription_product_button_label(plan_code):
+    regular_price = SUBSCRIPTION_PRICES[plan_code][1] * 100
+    discounted_price = _discounted_price_kopecks(plan_code, 1)
+    return (
+        f"{SUBSCRIPTION_SHORT_LABELS[plan_code]} · от "
+        f"{_strikethrough_button_text(_format_rubles(regular_price))} → "
+        f"{_format_rubles(discounted_price)}"
+    )
+
+
+def _subscription_discount_text_html(plan_code):
+    prices = []
+    for months in (1, 3, 12):
+        period = SUBSCRIPTION_PERIOD_LABELS[months]
+        regular_price = _format_rubles(SUBSCRIPTION_PRICES[plan_code][months] * 100)
+        discounted_price = _format_rubles(_discounted_price_kopecks(plan_code, months))
+        prices.append(
+            f"{period} — <s>{regular_price}</s> <b>{discounted_price}</b>"
+        )
+    return " · ".join(prices)
 
 
 def subscription_products_keyboard(prefix="subscription_product"):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
-        "1️⃣ Свой MAX-аккаунт · от 249 ₽", callback_data=f"{prefix}_self"
+        _subscription_product_button_label("self"), callback_data=f"{prefix}_self"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        "2️⃣ Готовый аккаунт · от 499 ₽", callback_data=f"{prefix}_project"
+        _subscription_product_button_label("project"), callback_data=f"{prefix}_project"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        "✨ Мульти-подписка · от 599 ₽", callback_data=f"{prefix}_multi"
+        _subscription_product_button_label("multi"), callback_data=f"{prefix}_multi"
     ))
     return keyboard
 
@@ -3721,10 +3775,12 @@ def subscription_products_keyboard(prefix="subscription_product"):
 def subscription_period_keyboard(plan_code, back_callback="subscription_products"):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     for months in (1, 3, 12):
-        amount = SUBSCRIPTION_PRICES[plan_code][months]
+        regular_amount = SUBSCRIPTION_PRICES[plan_code][months] * 100
+        discounted_amount = _discounted_price_kopecks(plan_code, months)
         period = SUBSCRIPTION_PERIOD_LABELS[months]
         keyboard.add(types.InlineKeyboardButton(
-            f"{period} · {amount:,} ₽".replace(",", " "),
+            f"{period} · {_strikethrough_button_text(_format_rubles(regular_amount))} → "
+            f"{_format_rubles(discounted_amount)}",
             callback_data=f"subscription_buy_{plan_code}_{months}",
         ))
     keyboard.add(types.InlineKeyboardButton("🔙 К тарифам", callback_data=back_callback))
@@ -3933,7 +3989,7 @@ def _send_subscription_invoice(user_id, plan_code, duration_months):
         return False
     if plan_code not in SUBSCRIPTION_PRICES or duration_months not in (1, 3, 12):
         raise ValueError("Некорректный тариф или срок подписки")
-    amount = SUBSCRIPTION_PRICES[plan_code][duration_months] * 100
+    amount = _discounted_price_kopecks(plan_code, duration_months)
     plan_description = _subscription_plan(plan_code)
     try:
         provider_data = _yookassa_receipt_provider_data(plan_code, duration_months, amount)
@@ -4803,11 +4859,24 @@ def subscription_status_command(message):
 @bot.pre_checkout_query_handler(func=lambda query: True)
 def handle_pre_checkout_query(query):
     try:
-        accepted = claim_payment_order_for_checkout(
-            payload=query.invoice_payload,
-            user_id=query.from_user.id,
-            currency=query.currency,
-            total_amount=query.total_amount,
+        order = get_payment_order(query.invoice_payload)
+        expected_amount = None
+        if (
+            order
+            and order["plan_code"] in SUBSCRIPTION_PRICES
+            and int(order["duration_months"]) in (1, 3, 12)
+        ):
+            expected_amount = _discounted_price_kopecks(
+                order["plan_code"], int(order["duration_months"])
+            )
+        accepted = (
+            expected_amount == int(query.total_amount)
+            and claim_payment_order_for_checkout(
+                payload=query.invoice_payload,
+                user_id=query.from_user.id,
+                currency=query.currency,
+                total_amount=query.total_amount,
+            )
         )
     except Exception as error:
         accepted = False
@@ -8329,16 +8398,17 @@ def callback_handler(call):
             bot.edit_message_text(
                 "<b>Чем отличаются способы подключения</b>\n\n"
                 "<blockquote><b>1️⃣ Свой MAX-аккаунт</b>\n"
-                "1 месяц — 249 ₽ · 3 месяца — 599 ₽ · 1 год — 2 499 ₽.\n"
+                f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('self')}.\n"
                 "Вы входите в свой MAX. Парсер читает выбранные вами чаты, которые доступны вашему аккаунту.\n"
                 "Подходит, если не хотите добавлять готовый аккаунт в чат.</blockquote>\n\n"
                 "<blockquote><b>2️⃣ Через готовый аккаунт</b>\n"
-                "1 месяц — 499 ₽ · 3 месяца — 1 199 ₽ · 1 год — 5 499 ₽.\n"
+                f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('project')}.\n"
                 f"Используется готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
                 "Для группы его нужно добавить или пригласить, для канала — просто скинуть ссылку.\n"
                 "Вы не вводите данные своего MAX.</blockquote>\n\n"
                 "<blockquote><b>✨ Мульти-подписка</b>\n"
-                "1 месяц — 599 ₽ · 3 месяца — 1 499 ₽ · 1 год — 6 499 ₽. Включает оба способа, "
+                f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('multi')}. "
+                "Включает оба способа, "
                 "чтобы выбирать удобный вариант для каждого чата.</blockquote>",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
