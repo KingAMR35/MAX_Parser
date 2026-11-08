@@ -3709,19 +3709,20 @@ SUBSCRIPTION_LABELS = {
     "multi": "Мульти-подписка",
 }
 SUBSCRIPTION_SHORT_LABELS = {
-    "self": "1️⃣ Свой MAX-аккаунт",
-    "project": "2️⃣ Готовый аккаунт",
-    "multi": "✨ Мульти-подписка",
+    "self": "1️⃣ Свой",
+    "project": "2️⃣ Готовый",
+    "multi": "✨ Мульти",
 }
 SUBSCRIPTION_PERIOD_LABELS = {1: "1 месяц", 3: "3 месяца", 12: "1 год"}
+SUBSCRIPTION_SHORT_PERIOD_LABELS = {1: "1 мес", 3: "3 мес", 12: "1 год"}
 
 
-def _format_rubles(amount_kopecks):
+def _format_rubles(amount_kopecks, include_currency=True):
     rubles, kopecks = divmod(int(amount_kopecks), 100)
     formatted = f"{rubles:,}".replace(",", " ")
     if kopecks:
         formatted += f",{kopecks:02d}"
-    return f"{formatted} ₽"
+    return f"{formatted} ₽" if include_currency else formatted
 
 
 def _discounted_price_kopecks(plan_code, months):
@@ -3740,8 +3741,8 @@ def _subscription_product_button_label(plan_code):
     regular_price = SUBSCRIPTION_PRICES[plan_code][1] * 100
     discounted_price = _discounted_price_kopecks(plan_code, 1)
     return (
-        f"{SUBSCRIPTION_SHORT_LABELS[plan_code]} · от "
-        f"{_strikethrough_button_text(_format_rubles(regular_price))} → "
+        f"{SUBSCRIPTION_SHORT_LABELS[plan_code]}: "
+        f"{_strikethrough_button_text(_format_rubles(regular_price, include_currency=False))}→"
         f"{_format_rubles(discounted_price)}"
     )
 
@@ -3777,9 +3778,9 @@ def subscription_period_keyboard(plan_code, back_callback="subscription_products
     for months in (1, 3, 12):
         regular_amount = SUBSCRIPTION_PRICES[plan_code][months] * 100
         discounted_amount = _discounted_price_kopecks(plan_code, months)
-        period = SUBSCRIPTION_PERIOD_LABELS[months]
+        period = SUBSCRIPTION_SHORT_PERIOD_LABELS[months]
         keyboard.add(types.InlineKeyboardButton(
-            f"{period} · {_strikethrough_button_text(_format_rubles(regular_amount))} → "
+            f"{period} · {_strikethrough_button_text(_format_rubles(regular_amount, include_currency=False))}→"
             f"{_format_rubles(discounted_amount)}",
             callback_data=f"subscription_buy_{plan_code}_{months}",
         ))
