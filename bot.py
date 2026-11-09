@@ -6040,11 +6040,17 @@ def _send_max_payload_with_sender(
         )
         return
     text = f"{header}\n\n{body}".strip() if header else body
-    send_message_to_max(text=text, media=media, bold_first_line=not bool(media), **common)
+    send_message_to_max(
+        text=text,
+        media=media,
+        bold_first_line=bool(header and not media),
+        **common,
+    )
 
 
 def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id):
     result_text = "⚠️ Не удалось отправить сообщение в MAX. Проверьте подключение и попробуйте позже."
+    result_keyboard = None
     try:
         with admin_max_send_flow_lock:
             flow = admin_max_send_flows.get(int(admin_id))
@@ -6116,6 +6122,10 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 on_before_send=remember_outbound_echo,
             )
         result_text = "✅ Сообщение отправлено в MAX."
+        result_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        result_keyboard.add(types.InlineKeyboardButton(
+            "✍️ Написать в MAX", callback_data=f"admin_max_source_{int(source_chat_id)}"
+        ))
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
     except Exception as error:
         debug_logger.warning(
@@ -6141,11 +6151,14 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 admin_max_send_flows.pop(int(admin_id), None)
         try:
             bot.edit_message_text(
-                result_text, int(admin_id), int(preview_message_id), reply_markup=None, **NO_PREVIEW
+                result_text, int(admin_id), int(preview_message_id),
+                reply_markup=result_keyboard, **NO_PREVIEW
             )
         except Exception:
             try:
-                bot.send_message(int(admin_id), result_text, **NO_PREVIEW)
+                bot.send_message(
+                    int(admin_id), result_text, reply_markup=result_keyboard, **NO_PREVIEW
+                )
             except Exception:
                 pass
 
@@ -6401,6 +6414,7 @@ def _start_public_max_send(call, source_chat_id):
             "destination_chat_id": destination_chat_id,
             "user_id": int(user.id),
             "destination_type": str(chat.get("destination_type") or "group"),
+            "source_is_private": is_private_source,
             "nonce": nonce,
             "stage": initial_stage,
             "sender_name": "",
@@ -6408,6 +6422,14 @@ def _start_public_max_send(call, source_chat_id):
         }
     bot.answer_callback_query(call.id)
     try:
+        prompt_options = {
+            "reply_markup": _public_max_send_keyboard(nonce),
+            **NO_PREVIEW,
+        }
+        # In a private conversation (or for a private MAX source), use a
+        # standalone prompt instead of replying to the parser post.
+        if call.message.chat.type in {"group", "supergroup"} and not is_private_source:
+            prompt_options["reply_to_message_id"] = int(call.message.message_id)
         prompt = bot.send_message(
             destination_chat_id,
             (
@@ -6415,9 +6437,7 @@ def _start_public_max_send(call, source_chat_id):
                 if is_private_source
                 else "👤 Кто отправляет сообщение? Ответьте на это сообщение своим именем."
             ),
-            reply_to_message_id=int(call.message.message_id),
-            reply_markup=_public_max_send_keyboard(nonce),
-            **NO_PREVIEW,
+            **prompt_options,
         )
     except Exception:
         with public_max_send_flow_lock:
@@ -6454,6 +6474,8 @@ def _is_public_max_send_reply(message):
             return False
         if message.chat.type == "private":
             return flow.get("destination_type") == "private"
+        if flow.get("source_is_private"):
+            return True
         if getattr(message, "reply_to_message", None) and int(flow.get("prompt_message_id") or 0) == int(message.reply_to_message.message_id):
             return True
         media_group_id = getattr(message, "media_group_id", None)
@@ -6631,6 +6653,7 @@ def _is_public_max_file_oversize(file_size):
 
 def _send_public_max_message(flow_key, nonce, preview_message_id):
     result_text = "⚠️ Не удалось отправить сообщение в MAX. Проверьте подключение и попробуйте позже."
+    result_keyboard = None
     try:
         with public_max_send_flow_lock:
             flow = public_max_send_flows.get(flow_key)
@@ -6700,6 +6723,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
             )
         result_text = "✅ Сообщение отправлено в MAX."
+        result_keyboard = _public_max_send_button_keyboard(source_chat_id)
     except Exception as error:
         debug_logger.warning(
             "PUBLIC_MAX_SEND_FAILED user_chat=%s error_type=%s error=%s",
@@ -6729,7 +6753,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 result_text,
                 int(flow_key[0]),
                 int(preview_message_id),
-                reply_markup=None,
+                reply_markup=result_keyboard,
                 **NO_PREVIEW,
             )
         except Exception:

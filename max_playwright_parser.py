@@ -7802,6 +7802,48 @@ def send_message_to_max(
             # send only the accompanying text.
             page.wait_for_timeout(250)
         if upload_payload and send_button is None:
+            # MAX sometimes renders the send control as an icon button without
+            # an accessible name, so get_by_role("button", name=...) cannot see
+            # it. Try only explicit submit/send controls next, and require that
+            # the control sits beside the message composer before clicking.
+            submit_selectors = (
+                "button[type='submit']",
+                "input[type='submit']",
+                "[data-testid*='send' i]",
+                "[data-testid*='submit' i]",
+                "button[aria-label*='отправ' i]",
+                "[role='button'][aria-label*='отправ' i]",
+                "button[aria-label*='send' i]",
+                "[role='button'][aria-label*='send' i]",
+                "button[title*='отправ' i]",
+                "button[title*='send' i]",
+                "button[class*='send' i]",
+                "[role='button'][class*='send' i]",
+            )
+            for selector in submit_selectors:
+                candidates = page.locator(selector)
+                for index in reversed(range(candidates.count())):
+                    candidate = candidates.nth(index)
+                    try:
+                        if not candidate.is_visible(timeout=250) or not candidate.is_enabled(timeout=250):
+                            continue
+                        beside_composer = candidate.evaluate("""el => {
+                            const composer = document.querySelector('[data-max-parser-send-composer="true"]');
+                            if (!composer) return false;
+                            const c = composer.getBoundingClientRect();
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 &&
+                                Math.abs(r.top - c.top) < 180 &&
+                                r.left >= c.left + c.width * 0.45;
+                        }""")
+                        if beside_composer:
+                            send_button = candidate
+                            break
+                    except Exception:
+                        continue
+                if send_button is not None:
+                    break
+        if upload_payload and send_button is None:
             raise RuntimeError("MAX_UPLOAD_NOT_READY")
         before_tail = chat_tail_snapshot() if upload_payload else ()
         if on_before_send:
