@@ -7108,3 +7108,144 @@ def parse_max_group_media(
                 pw.stop()
         except Exception:
             pass
+
+
+def send_message_to_max(
+    group_url: str,
+    text: str,
+    chat_id: int,
+    session_path: str = None,
+) -> None:
+    """Send one user-approved text through the already authenticated MAX Web UI."""
+    session_file = session_path or f"{SESSIONS_DIR}/{chat_id}.json"
+    if not os.path.exists(session_file):
+        raise RuntimeError("NO_SESSION")
+    if not str(group_url or "").strip() or not str(text or "").strip():
+        raise ValueError("MAX_URL_OR_MESSAGE_EMPTY")
+
+    pw = browser = context = page = None
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            storage_state=session_file,
+            viewport={"width": 1280, "height": 800},
+            timezone_id=MAX_TIMEZONE_ID,
+        )
+        page = context.new_page()
+        _goto_max_with_retry(page, "https://web.max.ru", chat_id, "главная страница MAX")
+        page.wait_for_timeout(1000)
+        if not _is_logged_in(page):
+            raise RuntimeError("SESSION_EXPIRED")
+
+        _goto_max_with_retry(page, group_url, chat_id, "переход в чат MAX")
+        page.wait_for_timeout(1800)
+        _accept_max_invite_if_available(page, group_url, chat_id)
+        current_url = page.url
+        requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
+        current_parts = urlparse(current_url)
+        current_host = (current_parts.hostname or "").lower().rstrip(".")
+        current_path = current_parts.path.rstrip("/").lower()
+        redirected_to_chat = (
+            (requested_host == "max.ru" or requested_host.endswith(".max.ru"))
+            and (current_host == "max.ru" or current_host.endswith(".max.ru"))
+            and current_path not in {"", "/", "/auth", "/login", "/signin", "/sign-in"}
+        )
+        if group_url not in current_url and not redirected_to_chat:
+            raise RuntimeError("WRONG_MAX_CHAT")
+        if len(page.content()) < 1000:
+            raise RuntimeError("MAX_CHAT_NOT_LOADED")
+
+        composer_found = page.evaluate("""() => {
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+            };
+            const candidates = [...document.querySelectorAll(
+                'textarea, [contenteditable="true"], [role="textbox"]'
+            )].filter(el => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+            let best = null;
+            let bestScore = -1000;
+            for (const el of candidates) {
+                const label = [el.getAttribute('aria-label'), el.getAttribute('placeholder'),
+                    el.getAttribute('data-placeholder'), el.getAttribute('title'),
+                    el.innerText].filter(Boolean).join(' ').toLowerCase();
+                const rect = el.getBoundingClientRect();
+                let score = el.isContentEditable ? 2 : 0;
+                if (el.tagName === 'TEXTAREA') score += 3;
+                if (rect.top > window.innerHeight * 0.55) score += 5;
+                if (/сообщ|message|написать|write|ответить|reply/.test(label)) score += 20;
+                if (/поиск|search|найти/.test(label)) score -= 50;
+                if (score > bestScore) { best = el; bestScore = score; }
+            }
+            if (!best || bestScore < 0) return false;
+            best.setAttribute('data-max-parser-send-composer', 'true');
+            return true;
+        }""")
+        if not composer_found:
+            raise RuntimeError("MAX_COMPOSER_NOT_FOUND")
+
+        composer = page.locator('[data-max-parser-send-composer="true"]').first
+        # Fill in one operation to preserve Unicode and the exact order of characters.
+        composer.fill(str(text), timeout=5000)
+        try:
+            supports_rich_text = bool(composer.evaluate("el => el.isContentEditable"))
+        except Exception:
+            supports_rich_text = False
+        if supports_rich_text:
+            try:
+                composer.press("Control+Home", timeout=1500)
+                composer.press("Shift+End", timeout=1500)
+                composer.press("Control+B", timeout=1500)
+                composer.press("Control+End", timeout=1500)
+            except Exception:
+                # If this MAX client has a different editor, send the text as entered.
+                pass
+
+        send_buttons = page.get_by_role("button", name=re.compile(r"отправить|send", re.I))
+        send_button = None
+        for index in reversed(range(send_buttons.count())):
+            candidate = send_buttons.nth(index)
+            if candidate.is_visible(timeout=250):
+                send_button = candidate
+                break
+        if send_button is not None:
+            send_button.click(timeout=2500)
+        else:
+            # A single send action only. If the button cannot be identified, use
+            # MAX's usual Enter shortcut instead of retrying after a click timeout.
+            composer.press("Enter", timeout=2500)
+
+        for _ in range(24):
+            try:
+                remaining = composer.input_value(timeout=300) if composer.evaluate("el => el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'") else composer.inner_text(timeout=300)
+            except Exception:
+                remaining = ""
+            if not str(remaining or "").strip():
+                return
+            page.wait_for_timeout(250)
+        raise RuntimeError("MAX_SEND_NOT_CONFIRMED")
+    except Exception as error:
+        if isinstance(error, RuntimeError):
+            raise
+        raise RuntimeError(f"MAX_SEND_FAILED: {type(error).__name__}: {error}") from error
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                pw.stop()
+        except Exception:
+            pass

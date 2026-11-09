@@ -201,6 +201,12 @@ PARSE_DIAGNOSTICS_LOCK = threading.RLock()
 CHAT_LIFECYCLE_LOCK = threading.RLock()
 pending_setup_modes = {}
 customer_setup_state = {}
+max_send_flows = {}
+max_send_prompt_routes = {}
+max_send_flow_lock = threading.RLock()
+max_send_source_locks = {}
+max_send_source_lock_guard = threading.Lock()
+max_send_browser_semaphore = threading.Semaphore(1)
 project_access_message_ids = {}
 project_invite_pending = {}
 project_admin_source_prompts = {}
@@ -375,7 +381,10 @@ def _post_time_key(value) -> str:
     return raw.casefold()
 
 
-def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=False, captioned=False, text_sent=False):
+def _record_parser_sent_post(
+    chat_id: int, post: dict, message_ids, partial=False, captioned=False,
+    text_sent=False, destination_chat_id=None,
+):
     ids = []
     for value in message_ids or []:
         try:
@@ -401,6 +410,7 @@ def _record_parser_sent_post(chat_id: int, post: dict, message_ids, partial=Fals
     record = {
         "record_id": uuid.uuid4().hex[:12],
         "chat_id": int(chat_id),
+        "destination_chat_id": int(destination_chat_id or chat_id),
         "message_ids": ids,
         "source_id": str(post.get("source_id") or post.get("idx") or "")[:80],
         "sent_at": datetime.now(timezone.utc).isoformat(),
@@ -679,7 +689,7 @@ def _get_poll_delivery_state(chat_id: int, post: dict) -> dict:
         entry = _poll_message_cache.get(key)
         return dict(entry) if isinstance(entry, dict) else {}
 
-def _remember_sent_poll(chat_id: int, post: dict, message_id):
+def _remember_sent_poll(chat_id: int, post: dict, message_id, destination_chat_id=None):
     if not message_id or not post.get("poll"):
         return
     key = _poll_cache_key(chat_id, post)
@@ -709,6 +719,7 @@ def _remember_sent_poll(chat_id: int, post: dict, message_id):
             media.get("type") == "image" for media in (post.get("media_files") or [])
         )
         entry["stage"] = "final" if closed else "initial"
+        entry["destination_chat_id"] = int(destination_chat_id or chat_id)
         _poll_message_cache[key] = entry
         _save_poll_message_cache_locked()
     debug_logger.info(
@@ -742,13 +753,15 @@ def _refresh_poll_snapshot(chat_id: int, post: dict, entry: dict, closed: bool) 
                 chat_id, post.get("source_id") or "?", len(text),
             )
             return False
+        destination_chat_id = int(entry.get("destination_chat_id") or chat_id)
         edit = lambda: _telegram_call(
-            bot.edit_message_caption, chat_id=chat_id, message_id=int(message_id),
+            bot.edit_message_caption, chat_id=destination_chat_id, message_id=int(message_id),
             caption=text, parse_mode="HTML",
         )
     else:
+        destination_chat_id = int(entry.get("destination_chat_id") or chat_id)
         edit = lambda: _telegram_call(
-            bot.edit_message_text, text, chat_id=chat_id, message_id=int(message_id),
+            bot.edit_message_text, text, chat_id=destination_chat_id, message_id=int(message_id),
             parse_mode="HTML", **NO_PREVIEW,
         )
 
@@ -915,7 +928,8 @@ def _telegram_call(fn, *args, **kwargs):
     raise RuntimeError("Не удалось отправить сообщение в Telegram после нескольких попыток")
 
 
-def _attach_caption_to_prior_media(chat_id: int, post: dict) -> bool:
+def _attach_caption_to_prior_media(chat_id: int, post: dict, destination_chat_id=None) -> bool:
+    destination_chat_id = int(destination_chat_id or chat_id)
     record = _find_uncaptioned_media_record(chat_id, post)
     if not record:
         return False
@@ -927,7 +941,7 @@ def _attach_caption_to_prior_media(chat_id: int, post: dict) -> bool:
         return False
     try:
         bot.edit_message_caption(
-            chat_id=chat_id,
+            chat_id=destination_chat_id,
             message_id=int(message_ids[0]),
             caption=caption,
             parse_mode="HTML",
@@ -942,7 +956,7 @@ def _attach_caption_to_prior_media(chat_id: int, post: dict) -> bool:
             _mark_parser_record_captioned(str(record.get("record_id") or ""), post)
             return True
         try:
-            fallback = _telegram_call(bot.send_message, chat_id, caption, **NO_PREVIEW)
+            fallback = _telegram_call(bot.send_message, destination_chat_id, caption, **NO_PREVIEW)
         except Exception as fallback_exc:
             debug_logger.warning(
                 "MEDIA_CAPTION_TEXT_FALLBACK_FAILED chat_id=%s source_id=%s error=%s",
@@ -965,7 +979,8 @@ def _attach_caption_to_prior_media(chat_id: int, post: dict) -> bool:
     )
     return True
 
-def _send_post_impl(chat_id: int, post: dict) -> None:
+def _send_post_impl(chat_id: int, post: dict, destination_chat_id=None) -> None:
+    destination_chat_id = int(destination_chat_id or chat_id)
     msg_text = format_message(post)
     media_files = post.get("media_files", []) or []
     emoji_image_urls = {
@@ -1015,13 +1030,13 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         if map_media:
             obj=_media_to_bytesio(map_media)
             try:
-                _telegram_call(bot.send_photo,chat_id,obj,caption=caption,parse_mode="HTML")
+                _telegram_call(bot.send_photo,destination_chat_id,obj,caption=caption,parse_mode="HTML")
             except Exception as exc:
                 print(f"⚠️ [{chat_id}] Не удалось отправить карту с caption: {exc}")
-                _telegram_call(bot.send_message,chat_id,caption,parse_mode="HTML",**NO_PREVIEW)
+                _telegram_call(bot.send_message,destination_chat_id,caption,parse_mode="HTML",**NO_PREVIEW)
             send_media=[]
         else:
-            _telegram_call(bot.send_message,chat_id,caption,parse_mode="HTML",**NO_PREVIEW)
+            _telegram_call(bot.send_message,destination_chat_id,caption,parse_mode="HTML",**NO_PREVIEW)
             send_media=[]
         special_sent=True
 
@@ -1038,7 +1053,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
             f"Номер телефона: <code>{escape_html(detail_value)}</code>"
             "</blockquote>"
         )
-        _telegram_call(bot.send_message,chat_id,text,parse_mode="HTML",**NO_PREVIEW)
+        _telegram_call(bot.send_message,destination_chat_id,text,parse_mode="HTML",**NO_PREVIEW)
         special_sent=True
         send_media=[]
 
@@ -1050,12 +1065,12 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         if poll_image:
             image_file = _media_to_bytesio(poll_image)
             if len(poll_text) <= 1024:
-                _telegram_call(bot.send_photo, chat_id, image_file, caption=poll_text, parse_mode="HTML")
+                _telegram_call(bot.send_photo, destination_chat_id, image_file, caption=poll_text, parse_mode="HTML")
             else:
-                _telegram_call(bot.send_photo, chat_id, image_file)
-                _telegram_call(bot.send_message, chat_id, poll_text, parse_mode="HTML", **NO_PREVIEW)
+                _telegram_call(bot.send_photo, destination_chat_id, image_file)
+                _telegram_call(bot.send_message, destination_chat_id, poll_text, parse_mode="HTML", **NO_PREVIEW)
         else:
-            _telegram_call(bot.send_message, chat_id, poll_text, parse_mode="HTML", **NO_PREVIEW)
+            _telegram_call(bot.send_message, destination_chat_id, poll_text, parse_mode="HTML", **NO_PREVIEW)
         special_sent=True
         send_media=[]
 
@@ -1078,7 +1093,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
 
     if not send_media:
         if actual_text and not special_sent:
-            _telegram_call(bot.send_message,chat_id,msg_text,**NO_PREVIEW)
+            _telegram_call(bot.send_message,destination_chat_id,msg_text,**NO_PREVIEW)
         return
 
     has_voice_or_circle=any(m.get("type") in ("voice","video_note") for m in send_media)
@@ -1103,7 +1118,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 if caption:
                     caption_in_album=True
             try:
-                _telegram_call(bot.send_media_group,chat_id,album)
+                _telegram_call(bot.send_media_group,destination_chat_id,album)
                 album_sent_ids.update(id(m) for m in chunk)
                 if caption_in_album:
                     caption_pending=False
@@ -1117,11 +1132,11 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                 if caption_in_album:
                     try:
                         retry_album = [_telegram_media_input(media, post) for media in chunk]
-                        _telegram_call(bot.send_media_group, chat_id, retry_album)
+                        _telegram_call(bot.send_media_group, destination_chat_id, retry_album)
                         album_sent_ids.update(id(media) for media in chunk)
                         if caption_pending:
                             try:
-                                _telegram_call(bot.send_message, chat_id, msg_text, **NO_PREVIEW)
+                                _telegram_call(bot.send_message, destination_chat_id, msg_text, **NO_PREVIEW)
                             except Exception as text_error:
                                 debug_logger.warning(
                                     "MEDIA_ALBUM_CAPTION_FALLBACK_FAILED chat_id=%s source_id=%s error=%s",
@@ -1147,12 +1162,12 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         try:
             if media_type=="image":
                 if caption_pending and len(msg_text)<=1024:
-                    _telegram_call(bot.send_photo,chat_id,obj,caption=msg_text,parse_mode="HTML")
+                    _telegram_call(bot.send_photo,destination_chat_id,obj,caption=msg_text,parse_mode="HTML")
                     caption_pending=False
                 else:
-                    _telegram_call(bot.send_photo,chat_id,obj)
+                    _telegram_call(bot.send_photo,destination_chat_id,obj)
             elif media_type=="video_note":
-                _telegram_call(bot.send_video_note,chat_id,obj)
+                _telegram_call(bot.send_video_note,destination_chat_id,obj)
                 caption_pending=False
             elif media_type=="video":
                 if _media_is_mp4_file(media):
@@ -1166,7 +1181,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                     if caption_pending and len(msg_text)<=1024:
                         video_options.update(caption=msg_text, parse_mode="HTML")
                     try:
-                        _telegram_call(bot.send_video, chat_id, obj, **video_options)
+                        _telegram_call(bot.send_video, destination_chat_id, obj, **video_options)
                         if caption_pending and len(msg_text)<=1024:
                             caption_pending=False
                     except Exception as video_error:
@@ -1180,7 +1195,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                         document_options = {"visible_file_name": filename}
                         if caption_pending and len(msg_text)<=1024:
                             document_options.update(caption=msg_text, parse_mode="HTML")
-                        _telegram_call(bot.send_document, chat_id, obj, **document_options)
+                        _telegram_call(bot.send_document, destination_chat_id, obj, **document_options)
                         if caption_pending and len(msg_text)<=1024:
                             caption_pending=False
                 else:
@@ -1193,33 +1208,33 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
                     )
                     if caption_pending and len(msg_text)<=1024:
                         _telegram_call(
-                            bot.send_document, chat_id, obj, caption=msg_text,
+                            bot.send_document, destination_chat_id, obj, caption=msg_text,
                             parse_mode="HTML", visible_file_name=filename,
                         )
                         caption_pending=False
                     else:
-                        _telegram_call(bot.send_document, chat_id, obj, visible_file_name=filename)
+                        _telegram_call(bot.send_document, destination_chat_id, obj, visible_file_name=filename)
             elif media_type=="voice":
                 try:
-                    _telegram_call(bot.send_voice,chat_id,obj)
+                    _telegram_call(bot.send_voice,destination_chat_id,obj)
                 except Exception as voice_error:
                     print(f"⚠️ [{chat_id}] send_voice не принят Telegram: {voice_error}; пробуем audio")
                     obj.seek(0)
-                    _telegram_call(bot.send_audio,chat_id,obj,title=filename)
+                    _telegram_call(bot.send_audio,destination_chat_id,obj,title=filename)
                 caption_pending=False
             elif media_type=="audio":
-                _telegram_call(bot.send_audio,chat_id,obj,title=filename)
+                _telegram_call(bot.send_audio,destination_chat_id,obj,title=filename)
                 caption_pending=False
             elif media_type=="animation":
-                _telegram_call(bot.send_animation,chat_id,obj)
+                _telegram_call(bot.send_animation,destination_chat_id,obj)
             elif media_type=="sticker":
-                _telegram_call(bot.send_photo,chat_id,obj)
+                _telegram_call(bot.send_photo,destination_chat_id,obj)
             else:
                 if caption_pending and len(msg_text)<=1024:
-                    _telegram_call(bot.send_document,chat_id,obj,caption=msg_text,visible_file_name=filename)
+                    _telegram_call(bot.send_document,destination_chat_id,obj,caption=msg_text,visible_file_name=filename)
                     caption_pending=False
                 else:
-                    _telegram_call(bot.send_document,chat_id,obj,visible_file_name=filename)
+                    _telegram_call(bot.send_document,destination_chat_id,obj,visible_file_name=filename)
         except Exception as error:
             print(f"⚠️ [{chat_id}] Ошибка отправки {media_type}: {error}")
             if media_type == "video":
@@ -1227,7 +1242,7 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
             if media_type not in ("voice","video_note","image","sticker"):
                 try:
                     obj.seek(0)
-                    _telegram_call(bot.send_document,chat_id,obj,visible_file_name=filename)
+                    _telegram_call(bot.send_document,destination_chat_id,obj,visible_file_name=filename)
                 except Exception as fallback_error:
                     raise RuntimeError(
                         f"Не отправилось медиа {media_type}; fallback send_document также завершился ошибкой: {fallback_error}"
@@ -1237,12 +1252,14 @@ def _send_post_impl(chat_id: int, post: dict) -> None:
         time.sleep(0.5)
 
     if caption_pending:
-        _telegram_call(bot.send_message,chat_id,msg_text,**NO_PREVIEW)
+        _telegram_call(bot.send_message,destination_chat_id,msg_text,**NO_PREVIEW)
 
-def _send_post(chat_id: int, post: dict) -> bool:
+def _send_post(chat_id: int, post: dict, destination_chat_id=None) -> bool:
+    destination_chat_id = int(destination_chat_id or chat_id)
     post_id = str(post.get("source_id") or post.get("idx") or "?")
     context = {
         "chat_id": chat_id,
+        "destination_chat_id": destination_chat_id,
         "source_id": post_id,
         "api_ok": 0,
         "api_errors": 0,
@@ -1269,15 +1286,19 @@ def _send_post(chat_id: int, post: dict) -> bool:
     )
     sent_record_saved = False
     try:
-        _send_post_impl(chat_id, post)
+        _send_post_impl(chat_id, post, destination_chat_id=destination_chat_id)
         if context["message_ids"]:
             _record_parser_sent_post(
                 chat_id, post, context["message_ids"],
                 captioned=context["caption_sent"], text_sent=context["text_sent"],
+                destination_chat_id=destination_chat_id,
             )
             sent_record_saved = True
         if post.get("poll") and context["message_ids"]:
-            _remember_sent_poll(chat_id, post, context["message_ids"][0])
+            _remember_sent_poll(
+                chat_id, post, context["message_ids"][0],
+                destination_chat_id=destination_chat_id,
+            )
         if context["api_ok"]:
             result = "sent"
         elif context["suppressed_media"]:
@@ -1296,6 +1317,7 @@ def _send_post(chat_id: int, post: dict) -> bool:
             _record_parser_sent_post(
                 chat_id, post, context["message_ids"], partial=True,
                 captioned=context["caption_sent"], text_sent=context["text_sent"],
+                destination_chat_id=destination_chat_id,
             )
         debug_logger.exception(
             "POST_SEND_COMPLETE chat_id=%s source_id=%s result=failed api_ok=%s api_errors=%s error=%s",
@@ -1379,7 +1401,10 @@ def _record_parse_diagnostic_failure(chat_id, title, error):
     _store_parse_diagnostic(chat_id, title, 0, 0, 1, [], error=error)
 
 
-def _process_posts(chat_id: int, title: str, posts: list, record_diagnostics=True, diagnostics_out=None) -> tuple:
+def _process_posts(
+    chat_id: int, title: str, posts: list, record_diagnostics=True,
+    diagnostics_out=None, destination_chat_id=None,
+) -> tuple:
     if posts is None:
         raise TypeError(f"Парсер MAX для чата {title} вернул None вместо списка сообщений")
     if not isinstance(posts, list):
@@ -1390,6 +1415,7 @@ def _process_posts(chat_id: int, title: str, posts: list, record_diagnostics=Tru
     skipped_count = 0
     failed_count = 0
     diagnostic_posts = []
+    destination_chat_id = int(destination_chat_id or chat_id)
     debug_logger.info("CHAT_PROCESS_START chat_id=%s title=%s posts=%s", chat_id, log_preview(title, 100), len(posts))
     cycle_ids = set()
     for post in posts:
@@ -1443,7 +1469,7 @@ def _process_posts(chat_id: int, title: str, posts: list, record_diagnostics=Tru
             and str(post.get("text") or "").strip()
             and not post.get("location")
             and not (post.get("contact") or {}).get("is_contact")
-            and _attach_caption_to_prior_media(chat_id, post)
+            and _attach_caption_to_prior_media(chat_id, post, destination_chat_id)
         ):
             _commit_successful_post(chat_id, post)
             increment_message_count(chat_id)
@@ -1466,7 +1492,7 @@ def _process_posts(chat_id: int, title: str, posts: list, record_diagnostics=Tru
             continue
 
         try:
-            sent = _send_post(chat_id, post)
+            sent = _send_post(chat_id, post, destination_chat_id)
             if not sent:
                 skipped_count += 1
                 diagnostic_posts.append(_diagnostic_post(post, "skipped", "нет поддерживаемого содержимого"))
@@ -1516,6 +1542,9 @@ def _process_chat_posts_if_present(chat_id, title, posts, record_diagnostics=Tru
                 chat_id, title, posts,
                 record_diagnostics=record_diagnostics,
                 diagnostics_out=diagnostics_out,
+                destination_chat_id=(
+                    get_chat_by_id(chat_id) or {}
+                ).get("destination_chat_id") or chat_id,
             )
         except Exception:
             for post in posts or []:
@@ -2132,6 +2161,7 @@ def _complete_login(target_chat_id, output_chat_id):
         title = chat["title"] if chat else "MAX"
         if chat and chat.get("max_url"):
             toggle_chat(target_chat_id, True)
+            _ensure_max_send_button(int(target_chat_id))
     bot.send_message(
         output_chat_id,
         f"🎉 <b>Успешно!</b>\nСессия для <b>{escape_html(title)}</b> сохранена.",
@@ -2270,6 +2300,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
     if status == "already_logged_in":
         if not is_project_account and chat.get("account_mode") == "self" and chat.get("max_url"):
             toggle_chat(target_chat_id, True)
+            _ensure_max_send_button(int(target_chat_id))
         bot.send_message(
             admin_chat_id,
             f"✅ <b>Уже авторизован!</b>\nСессия для <b>{escape_html(title)}</b> актуальна.",
@@ -2397,7 +2428,7 @@ def _show_sent_parser_chats(chat_id, message_id=None):
             ))
         text = (
             "🗑 <b>Удаление сообщений парсера</b>\n\n"
-            "Выберите Telegram-группу. Здесь доступны отправки за последние 47 часов.\n\n"
+            "Выберите подключение. Здесь доступны отправки за последние 47 часов.\n\n"
             "Отметьте сообщения кнопками и подтвердите удаление."
         )
     else:
@@ -2473,7 +2504,7 @@ def _delete_sent_parser_record(record_id):
         return 0, [], "Запись уже удалена или не найдена."
     if not _sent_record_is_deletable(record):
         return 0, list(record.get("message_ids") or []), "Telegram разрешает удалить отправленные сообщения только в течение 48 часов."
-    target_chat_id = int(record.get("chat_id"))
+    target_chat_id = int(record.get("destination_chat_id") or record.get("chat_id"))
     remaining = []
     deleted = 0
     errors = []
@@ -2553,6 +2584,12 @@ def show_chat_details(chat_id, message_id, target_chat_id):
         status_text = "🔴 Остановлен"
     session_file = _session_path_for_chat(chat)
     session_status = "✅ Активна" if os.path.exists(session_file) else "❌ Отсутствует"
+    destination_chat_id = int(chat.get("destination_chat_id") or target_chat_id)
+    identifier_line = (
+        f"🆔 <b>ID Telegram-получателя:</b> <code>{destination_chat_id}</code>\n"
+        if chat.get("destination_type") == "private"
+        else f"🆔 <b>ID:</b> <code>{chat['chat_id']}</code>\n"
+    )
     account_mode_text = "Готовый аккаунт" if chat.get("account_mode") == "project" else "Аккаунт пользователя"
     phone_line = (
         f"📱 <b>Телефон:</b> {escape_html(chat['phone'] or '❌ не задан')}\n"
@@ -2561,46 +2598,50 @@ def show_chat_details(chat_id, message_id, target_chat_id):
 
     telegram_type = ""
     group_info_lines = ""
-    try:
-        telegram_chat = bot.get_chat(int(target_chat_id))
-        telegram_type = str(getattr(telegram_chat, "type", "") or "")
-        type_labels = {
-            "private": "личный чат",
-            "group": "группа",
-            "supergroup": "супергруппа",
-            "channel": "канал",
-        }
-        type_label = type_labels.get(telegram_type, "чат")
-        member_label = "Подписчиков" if telegram_type == "channel" else "Участников"
+    if chat.get("destination_type") == "private":
+        telegram_type = "private"
+        group_info_lines = "📍 <b>Куда отправляются сообщения:</b> личные сообщения владельца\n\n"
+    else:
         try:
-            member_count = bot.get_chat_member_count(int(target_chat_id))
-            count_line = f"👥 <b>{member_label}:</b> {int(member_count):,}\n".replace(",", " ")
-        except Exception:
-            count_line = f"👥 <b>{member_label}:</b> временно недоступно\n"
-        username = getattr(telegram_chat, "username", None)
-        username_line = (
-            f"🔗 <b>Публичная ссылка:</b> https://t.me/{escape_html(username)}\n"
-            if username else ""
-        )
-        description = str(getattr(telegram_chat, "description", "") or "").strip()
-        description_line = (
-            f"📝 <b>Описание:</b> {escape_html(description[:400])}\n"
-            if description else ""
-        )
-        group_info_lines = (
-            f"📍 <b>Тип Telegram-чата:</b> {type_label}\n"
-            f"{count_line}{username_line}{description_line}\n"
-        )
-    except Exception as error:
-        debug_logger.info(
-            "ADMIN_CHAT_INFO_UNAVAILABLE chat_id=%s error_type=%s",
-            target_chat_id, type(error).__name__,
-        )
-        group_info_lines = "📍 <b>Сведения о Telegram-чате:</b> временно недоступны\n\n"
+            telegram_chat = bot.get_chat(destination_chat_id)
+            telegram_type = str(getattr(telegram_chat, "type", "") or "")
+            type_labels = {
+                "private": "личный чат",
+                "group": "группа",
+                "supergroup": "супергруппа",
+                "channel": "канал",
+            }
+            type_label = type_labels.get(telegram_type, "чат")
+            member_label = "Подписчиков" if telegram_type == "channel" else "Участников"
+            try:
+                member_count = bot.get_chat_member_count(destination_chat_id)
+                count_line = f"👥 <b>{member_label}:</b> {int(member_count):,}\n".replace(",", " ")
+            except Exception:
+                count_line = f"👥 <b>{member_label}:</b> временно недоступно\n"
+            username = getattr(telegram_chat, "username", None)
+            username_line = (
+                f"🔗 <b>Публичная ссылка:</b> https://t.me/{escape_html(username)}\n"
+                if username else ""
+            )
+            description = str(getattr(telegram_chat, "description", "") or "").strip()
+            description_line = (
+                f"📝 <b>Описание:</b> {escape_html(description[:400])}\n"
+                if description else ""
+            )
+            group_info_lines = (
+                f"📍 <b>Тип Telegram-чата:</b> {type_label}\n"
+                f"{count_line}{username_line}{description_line}\n"
+            )
+        except Exception as error:
+            debug_logger.info(
+                "ADMIN_CHAT_INFO_UNAVAILABLE chat_id=%s error_type=%s",
+                target_chat_id, type(error).__name__,
+            )
+            group_info_lines = "📍 <b>Сведения о Telegram-чате:</b> временно недоступны\n\n"
 
     text = (
         f"📋 <b>{escape_html(chat['title'] or 'Без названия')}</b>\n\n"
-        f"🆔 <b>ID:</b> <code>{chat['chat_id']}</code>\n"
+        f"{identifier_line}"
         f"🔗 <b>URL:</b> {escape_html(chat['max_url'] or ' не задан')}\n"
         f"{phone_line}"
         f"👤 <b>MAX-аккаунт:</b> {account_mode_text}\n"
@@ -3910,27 +3951,30 @@ def _start_customer_setup_prompt(user_id, account_mode, chat_id, message_id=None
         return
     pending_setup_modes[user_id] = account_mode
     label = "настройку своего аккаунта MAX" if account_mode == "self" else "настройку через готовый аккаунт"
-    bot.send_message(
-        chat_id,
-        f"<b>Шаг 1 из {2 if account_mode == 'project' else 3} · Telegram-группа</b>\n\n"
-        f"Вы выбрали: <b>{label}</b>.\n\n<b>Добавьте меня в Telegram-группу, в которую я буду присылать сообщения.</b> "
-        "Если я уже состою в ней, то напишите в группе команду /bind.\n\n"
-        "<i>Чтобы остановить настройку, нажмите «❌ Отмена».</i>",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard(),
-        **NO_PREVIEW,
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "👥 В Telegram-группу", callback_data=f"connectdest_group_{account_mode}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "👤 В личные сообщения", callback_data=f"connectdest_private_{account_mode}"
+    ))
+    keyboard.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
+    text = (
+        f"Вы выбрали: <b>{label}</b>.\n\n"
+        "Куда отправлять новые сообщения из MAX?"
     )
     if message_id:
         try:
             bot.edit_message_text(
-                "Настройка начата. Продолжите её в вашей Telegram-группе; подробная инструкция доступна по кнопке ниже.",
-                chat_id,
-                message_id,
-                reply_markup=parser_keyboard(),
-                **NO_PREVIEW,
+                text, chat_id, message_id, reply_markup=keyboard,
+                parse_mode="HTML", **NO_PREVIEW,
             )
+            return
         except Exception:
             pass
+    bot.send_message(
+        chat_id, text, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW,
+    )
 
 
 def _subscription_plan(plan_code):
@@ -4285,36 +4329,61 @@ def _support_claim_status_text(user_id, admin):
 
 def _broadcast_support_claim(user_id, admin):
     pending_messages = delete_support_request_notifications(user_id)
-    for route_key, routed_user_id in list(support_message_routes.items()):
-        if routed_user_id == int(user_id) and route_key in pending_messages:
-            support_message_routes.pop(route_key, None)
-    for admin_chat_id, message_id in pending_messages:
-        try:
-            bot.delete_message(admin_chat_id, message_id)
-        except Exception:
-            pass
-
     status_text = _support_claim_status_text(user_id, admin)
     delivered = 0
-    for admin_chat_id in _support_admin_ids():
+    admin_cards = list(pending_messages)
+    notified_admin_ids = {int(admin_chat_id) for admin_chat_id, _ in admin_cards}
+    admin_cards.extend(
+        (admin_id, None)
+        for admin_id in _support_admin_ids()
+        if int(admin_id) not in notified_admin_ids
+    )
+
+    for admin_chat_id, message_id in admin_cards:
+        reply_markup = (
+            _support_admin_keyboard(user_id)
+            if int(admin_chat_id) == int(admin.id) else None
+        )
         try:
-            status_message = bot.send_message(
-                admin_chat_id,
-                status_text,
-                parse_mode="HTML",
-                reply_markup=(
-                    _support_admin_keyboard(user_id)
-                    if int(admin_chat_id) == int(admin.id) else None
-                ),
-                **NO_PREVIEW,
-            )
-            _map_support_message(admin_chat_id, status_message.message_id, user_id)
+            if message_id is not None:
+                bot.edit_message_text(
+                    status_text,
+                    chat_id=admin_chat_id,
+                    message_id=message_id,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    **NO_PREVIEW,
+                )
+                status_message_id = message_id
+            else:
+                status_message = bot.send_message(
+                    admin_chat_id,
+                    status_text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    **NO_PREVIEW,
+                )
+                status_message_id = status_message.message_id
+            _map_support_message(admin_chat_id, status_message_id, user_id)
             delivered += 1
         except Exception as error:
             debug_logger.warning(
                 "SUPPORT_CLAIM_BROADCAST_FAILED admin_id=%s user_id=%s error_type=%s",
                 admin_chat_id, user_id, type(error).__name__,
             )
+            if message_id is not None:
+                try:
+                    status_message = bot.send_message(
+                        admin_chat_id,
+                        status_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                        **NO_PREVIEW,
+                    )
+                    _map_support_message(admin_chat_id, status_message.message_id, user_id)
+                    delivered += 1
+                except Exception:
+                    pass
     if delivered == 0:
         raise RuntimeError("Не удалось сообщить администраторам о принятом обращении")
 
@@ -4447,7 +4516,13 @@ def _notify_support_admin_one(admin_id, user, body_message=None):
 
 def _notify_support_admin(user, body_message=None):
     delivered = 0
-    for admin_id in _support_admin_ids():
+    assigned_admin_id = get_support_session_assignee(user.id)
+    admin_ids = (
+        [assigned_admin_id]
+        if assigned_admin_id is not None
+        else _support_admin_ids()
+    )
+    for admin_id in admin_ids:
         try:
             _notify_support_admin_one(admin_id, user, body_message)
             delivered += 1
@@ -4475,11 +4550,10 @@ def start_support(chat_id, user):
             support_sessions.add(user.id)
             open_support_session(user.id)
     if already_open:
+        assigned_admin_id = None
         try:
-            if (
-                get_support_session_assignee(user.id) is None
-                and not has_support_request_notification(user.id)
-            ):
+            assigned_admin_id = get_support_session_assignee(user.id)
+            if assigned_admin_id is None and not has_support_request_notification(user.id):
                 _notify_support_admin(user)
         except Exception as error:
             debug_logger.warning(
@@ -4488,16 +4562,24 @@ def start_support(chat_id, user):
             )
         bot.send_message(
             chat_id,
-            "Чат с поддержкой уже открыт. Напишите сообщение или нажмите кнопку завершения.",
+            (
+                "✅ Обращение уже принято администратором. Можете продолжать переписку. "
+                "Чтобы завершить чат, нажмите кнопку ниже."
+                if assigned_admin_id is not None
+                else "🕐 Обращение ожидает ответа администратора. Пожалуйста, подождите — "
+                "администратор скоро его примет. Пока ждёте, можете отправить дополнительные сообщения."
+            ),
+            reply_markup=_support_keyboard(),
             **NO_PREVIEW,
         )
         return
     try:
         bot.send_message(
             chat_id,
-            "💬 <b>Чат с тех поддержкой открыт</b>\n\n"
-            "Напишите, с чем нужна помощь. "
-            "Когда вопрос решён, нажмите кнопку ниже.",
+            "🆘 <b>Обращение отправлено</b>\n\n"
+            "Пожалуйста, подождите — администратор скоро его примет. Пока ждёте, "
+            "можете отправить дополнительные сообщения: их увидят все администраторы.\n\n"
+            "После принятия переписка продолжится с администратором, который взял обращение.",
             parse_mode="HTML",
             reply_markup=_support_keyboard(),
             **NO_PREVIEW,
@@ -5139,6 +5221,19 @@ def _cancel_customer_connection(user_id, chat_id=None, callback_message=None):
                     "SETUP_CANCEL_INVITE_CLEANUP_FAILED chat_id=%s error_type=%s",
                     chat_id, type(error).__name__,
                 )
+    try:
+        reserved_chat_id = int(state.get("chat_id") or 0)
+        if (
+            reserved_chat_id
+            and state.get("destination_type") == "private"
+            and not bool((get_chat_by_id(reserved_chat_id) or {}).get("is_active"))
+        ):
+            _delete_chat_everywhere(reserved_chat_id)
+    except Exception as error:
+        debug_logger.info(
+            "PRIVATE_SETUP_CANCEL_CLEANUP_FAILED user_id=%s error_type=%s",
+            user_id, type(error).__name__,
+        )
     if session:
         try:
             remote_auth_service.revoke_session(session)
@@ -5162,7 +5257,7 @@ def my_chats_command(message):
 def _show_my_chats(chat_id, owner_id, message_id=None):
     chats = get_user_chats(owner_id)
     if not chats:
-        text = "У вас пока нет подключённых Telegram-групп. Начните настройку командой /connect."
+        text = "У вас пока нет подключённых чатов MAX. Начните настройку командой /connect."
         if message_id:
             safe_edit_message(
                 text, chat_id, message_id,
@@ -5171,14 +5266,19 @@ def _show_my_chats(chat_id, owner_id, message_id=None):
         else:
             bot.send_message(chat_id, text, **NO_PREVIEW)
         return
-    lines = ["📬 <b>Ваши группы MAX_Parser</b>"]
+    lines = ["📬 <b>Ваши подключения MAX_Parser</b>"]
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     for index, chat in enumerate(chats, 1):
         state = "🟢 Парсинг включён" if chat.get("is_active") else "🟡 Ожидает настройки"
         mode = "ваш MAX-аккаунт" if chat.get("account_mode") != "project" else "готовый аккаунт"
+        destination_label = (
+            "личные сообщения"
+            if chat.get("destination_type") == "private"
+            else "Telegram-группа"
+        )
         lines.append(
-            f"\n<b>{index}. {escape_html(chat.get('title') or 'Группа')}</b>\n"
-            f"{state} · {mode}"
+            f"\n<b>{index}. {escape_html(chat.get('title') or 'Чат')}</b>\n"
+            f"{state} · {mode} · {destination_label}"
         )
         if chat.get("account_mode") == "project" and chat.get("max_url") and not chat.get("is_active"):
             keyboard.add(types.InlineKeyboardButton(
@@ -5224,6 +5324,15 @@ def _delete_chat_everywhere(chat_id):
         chat = get_chat_by_id(chat_id)
         if not chat:
             return False
+        destination_chat_id = int(chat.get("destination_chat_id") or chat_id)
+        button_message_id = chat.get("max_send_button_message_id")
+        if button_message_id:
+            try:
+                bot.edit_message_reply_markup(
+                    destination_chat_id, int(button_message_id), reply_markup=None
+                )
+            except Exception:
+                pass
         delete_chat(chat_id)
         clear_chat_cache(chat_id)
         with PARSE_DIAGNOSTICS_LOCK:
@@ -5247,13 +5356,14 @@ def _delete_chat_everywhere(chat_id):
                 pass
             except OSError as error:
                 debug_logger.warning("CHAT_DELETE_FILE_FAILED chat_id=%s path=%s error=%s", chat_id, path, log_preview(error))
-    try:
-        bot.leave_chat(chat_id)
-    except Exception as error:
-        debug_logger.warning(
-            "CHAT_DELETE_LEAVE_FAILED chat_id=%s error=%s",
-            chat_id, log_preview(error),
-        )
+    if chat.get("destination_type") != "private":
+        try:
+            bot.leave_chat(destination_chat_id)
+        except Exception as error:
+            debug_logger.warning(
+                "CHAT_DELETE_LEAVE_FAILED chat_id=%s destination=%s error=%s",
+                chat_id, destination_chat_id, log_preview(error),
+            )
     return True
 
 
@@ -5293,10 +5403,383 @@ def _project_source_type_keyboard(chat_id):
 def _project_source_type_text(chat_id):
     chat = get_chat_by_id(chat_id)
     title = escape_html((chat or {}).get("title") or f"Группа {chat_id}")
+    if chat and chat.get("destination_type") == "private":
+        destination = "✅ Пересылка в личные сообщения выбрана."
+    else:
+        destination = f"✅ Telegram-группа <b>{title}</b> выбрана для получения сообщений."
     return (
-        f"✅ Telegram-группа <b>{title}</b> выбрана для получения сообщений.\n\n"
+        f"{destination}\n\n"
         "<b>Шаг 2 из 2.</b> Что хотите подключить в MAX?"
     )
+
+
+def _max_send_button_keyboard(chat_id, title=""):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        f"✉️ В MAX · {str(title or 'отправить сообщение')[:32]}",
+        callback_data=f"maxsend_start_{int(chat_id)}",
+    ))
+    return keyboard
+
+
+def _ensure_max_send_button(chat_id):
+    chat = get_chat_by_id(int(chat_id))
+    if (
+        not chat
+        or not chat.get("owner_id")
+        or not chat.get("is_active")
+        or not chat.get("max_url")
+    ):
+        return False
+    destination_chat_id = int(chat.get("destination_chat_id") or chat_id)
+    title = str(chat.get("title") or "MAX-чат")
+    keyboard = _max_send_button_keyboard(chat_id, title)
+    button_text = (
+        f"✉️ Сообщение в MAX-чат <b>{escape_html(title)}</b> можно отправить кнопкой ниже:"
+    )
+    message_id = chat.get("max_send_button_message_id")
+    if message_id:
+        try:
+            bot.edit_message_text(
+                button_text,
+                destination_chat_id,
+                int(message_id),
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            return True
+        except Exception as error:
+            if "message is not modified" in str(error).casefold():
+                return True
+    try:
+        sent = _telegram_call(
+            bot.send_message,
+            destination_chat_id,
+            button_text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        set_max_send_button_message_id(chat_id, sent.message_id)
+        return True
+    except Exception as error:
+        debug_logger.warning(
+            "MAX_SEND_BUTTON_CREATE_FAILED chat_id=%s destination=%s error_type=%s",
+            chat_id, destination_chat_id, type(error).__name__,
+        )
+        return False
+
+
+def _remove_max_send_button(chat_id):
+    chat = get_chat_by_id(int(chat_id))
+    if not chat or not chat.get("max_send_button_message_id"):
+        return False
+    destination_chat_id = int(chat.get("destination_chat_id") or chat_id)
+    try:
+        bot.edit_message_text(
+            "Отправка в MAX приостановлена, потому что парсинг этого подключения выключен.",
+            destination_chat_id,
+            int(chat["max_send_button_message_id"]),
+            reply_markup=None,
+            **NO_PREVIEW,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_existing_max_send_buttons():
+    for chat in get_active_chats():
+        if chat.get("owner_id"):
+            _ensure_max_send_button(int(chat["chat_id"]))
+
+
+def _start_max_send_flow(call, source_chat_id):
+    user_id = int(call.from_user.id)
+    chat = get_chat_by_id(int(source_chat_id))
+    if not chat or not chat.get("is_active") or not chat.get("max_url"):
+        bot.answer_callback_query(call.id, "Этот MAX-чат больше не подключён.", show_alert=True)
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id, reply_markup=None
+            )
+        except Exception:
+            pass
+        return
+    destination_chat_id = int(chat.get("destination_chat_id") or source_chat_id)
+    if int(call.message.chat.id) != destination_chat_id:
+        bot.answer_callback_query(call.id, "Кнопка относится к другому чату.", show_alert=True)
+        return
+    if chat.get("destination_type") != "private" and call.message.chat.type not in {"group", "supergroup"}:
+        bot.answer_callback_query(call.id, "Откройте подключённую Telegram-группу.", show_alert=True)
+        return
+
+    key = (int(source_chat_id), user_id)
+    with max_send_flow_lock:
+        for stale_key, stale_flow in list(max_send_flows.items()):
+            if (
+                stale_flow.get("stage") != "sending"
+                and float(stale_flow.get("expires_at") or 0) <= time.time()
+            ):
+                max_send_flows.pop(stale_key, None)
+                for route_key, route in list(max_send_prompt_routes.items()):
+                    if route[:2] == stale_key:
+                        max_send_prompt_routes.pop(route_key, None)
+        current = max_send_flows.get(key)
+        if current and current.get("stage") not in {"expired", "cancelled"} and float(current.get("expires_at") or 0) > time.time():
+            bot.answer_callback_query(call.id, "Сначала завершите уже начатую отправку.", show_alert=True)
+            return
+        for route_key, route in list(max_send_prompt_routes.items()):
+            if route[:2] == key:
+                max_send_prompt_routes.pop(route_key, None)
+        nonce = uuid.uuid4().hex[:8]
+        flow = {
+            "nonce": nonce,
+            "stage": "name",
+            "destination_chat_id": destination_chat_id,
+            "expires_at": time.time() + 15 * 60,
+        }
+        max_send_flows[key] = flow
+    bot.answer_callback_query(call.id, "Начинаем отправку")
+    try:
+        _send_max_send_prompt(source_chat_id, user_id, "name", flow)
+    except Exception as error:
+        with max_send_flow_lock:
+            max_send_flows.pop(key, None)
+        debug_logger.warning(
+            "MAX_SEND_NAME_PROMPT_FAILED source_chat_id=%s user_id=%s error_type=%s",
+            source_chat_id, user_id, type(error).__name__,
+        )
+        bot.send_message(
+            destination_chat_id,
+            "Не удалось начать отправку. Попробуйте нажать кнопку ещё раз.",
+            **NO_PREVIEW,
+        )
+
+
+def _max_send_failure_message(error):
+    value = str(error or "")
+    if "SESSION_EXPIRED" in value or "NO_SESSION" in value:
+        return "Сессия MAX завершилась. Владелец подключения должен заново авторизовать аккаунт."
+    if "OWNER_SUBSCRIPTION_INACTIVE" in value:
+        return "Подписка владельца подключения закончилась. Попросите его продлить подписку."
+    if "CONNECTION_NO_LONGER_ACTIVE" in value:
+        return "Подключение MAX уже остановлено или удалено."
+    if "MAX_COMPOSER_NOT_FOUND" in value:
+        return "MAX не показал поле ввода сообщения. Попробуйте позже или напишите владельцу подключения."
+    if "MAX_SEND_NOT_CONFIRMED" in value:
+        return "MAX не подтвердил отправку. Проверьте чат MAX, чтобы убедиться, что сообщение не отправилось."
+    return "Не удалось отправить сообщение в MAX. Проверьте подключение и попробуйте позже."
+
+
+def _deliver_max_send_impl(source_chat_id, user_id, nonce, destination_chat_id, preview_message_id):
+    key = (int(source_chat_id), int(user_id))
+    try:
+        chat = get_chat_by_id(source_chat_id)
+        if (
+            not chat
+            or not chat.get("is_active")
+            or not chat.get("max_url")
+            or int(chat.get("destination_chat_id") or source_chat_id) != int(destination_chat_id)
+        ):
+            raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
+        owner_id = int(chat.get("owner_id") or 0)
+        if owner_id and _user_needs_subscription(owner_id, chat.get("account_mode", "self")):
+            raise RuntimeError("OWNER_SUBSCRIPTION_INACTIVE")
+        with max_send_flow_lock:
+            flow = max_send_flows.get(key)
+            if not flow or flow.get("nonce") != nonce or flow.get("stage") != "sending":
+                return
+            message_text = f"{flow['sender_name']}\n\n{flow['body']}"
+
+        with max_send_source_lock_guard:
+            source_lock = max_send_source_locks.setdefault(int(source_chat_id), threading.Lock())
+        with source_lock:
+            send_message_to_max(
+                group_url=chat["max_url"],
+                text=message_text,
+                chat_id=int(source_chat_id),
+                session_path=_session_path_for_chat(chat),
+            )
+        result_text = "✅ Сообщение отправлено в MAX."
+        debug_logger.info(
+            "MAX_USER_MESSAGE_SENT source_chat_id=%s user_id=%s destination=%s",
+            source_chat_id, user_id, destination_chat_id,
+        )
+    except Exception as error:
+        result_text = "⚠️ " + _max_send_failure_message(error)
+        debug_logger.warning(
+            "MAX_USER_MESSAGE_SEND_FAILED source_chat_id=%s user_id=%s error_type=%s",
+            source_chat_id, user_id, type(error).__name__,
+        )
+
+    with max_send_flow_lock:
+        flow = max_send_flows.get(key)
+        if flow and flow.get("nonce") == nonce:
+            max_send_flows.pop(key, None)
+        for route_key, route in list(max_send_prompt_routes.items()):
+            if route[:2] == key:
+                max_send_prompt_routes.pop(route_key, None)
+    try:
+        bot.edit_message_text(
+            result_text,
+            int(destination_chat_id),
+            int(preview_message_id),
+            reply_markup=None,
+            **NO_PREVIEW,
+        )
+    except Exception:
+        bot.send_message(int(destination_chat_id), result_text, **NO_PREVIEW)
+
+
+def _deliver_max_send(source_chat_id, user_id, nonce, destination_chat_id, preview_message_id):
+    try:
+        _deliver_max_send_impl(
+            source_chat_id, user_id, nonce, destination_chat_id, preview_message_id
+        )
+    finally:
+        max_send_browser_semaphore.release()
+
+
+def _max_send_mention(user_id):
+    try:
+        user = bot.get_chat(int(user_id))
+        if user.username:
+            return f"@{escape_html(user.username)}"
+        name = " ".join(
+            part for part in (user.first_name, user.last_name) if str(part or "").strip()
+        ).strip() or "Участник"
+    except Exception:
+        name = "Участник"
+    return f'<a href="tg://user?id={int(user_id)}">{escape_html(name)}</a>'
+
+
+def _send_max_send_prompt(source_chat_id, user_id, stage, flow):
+    destination_chat_id = int(flow["destination_chat_id"])
+    if stage == "name":
+        prompt_text = (
+            f"👤 {_max_send_mention(user_id)}, кто отправляет это сообщение? "
+            "Ответьте на это сообщение именем отправителя."
+        )
+        placeholder = "Имя отправителя"
+    else:
+        prompt_text = (
+            f"✍️ {_max_send_mention(user_id)}, напишите текст, который нужно отправить в MAX. "
+            "Ответьте на это сообщение."
+        )
+        placeholder = "Текст сообщения"
+    prompt = bot.send_message(
+        destination_chat_id,
+        prompt_text,
+        parse_mode="HTML",
+        reply_markup=types.ForceReply(
+            selective=True,
+            input_field_placeholder=placeholder,
+        ),
+        **NO_PREVIEW,
+    )
+    flow["stage"] = stage
+    flow["prompt_message_id"] = int(prompt.message_id)
+    with max_send_flow_lock:
+        max_send_prompt_routes[(destination_chat_id, int(prompt.message_id))] = (
+            int(source_chat_id), int(user_id), str(flow["nonce"]), stage
+        )
+    return prompt
+
+
+def _is_max_send_reply(message):
+    reply = getattr(message, "reply_to_message", None)
+    sender = getattr(message, "from_user", None)
+    if not reply or not sender or getattr(sender, "is_bot", False):
+        return False
+    with max_send_flow_lock:
+        route = max_send_prompt_routes.get((int(message.chat.id), int(reply.message_id)))
+        if not route:
+            return False
+        source_chat_id, user_id, nonce, stage = route
+        if int(sender.id) != user_id:
+            return False
+        flow = max_send_flows.get((source_chat_id, user_id))
+        return bool(
+            flow
+            and flow.get("nonce") == nonce
+            and flow.get("stage") == stage
+            and float(flow.get("expires_at") or 0) > time.time()
+        )
+
+
+def _max_send_preview_keyboard(source_chat_id, user_id, nonce):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "✅ Отправить", callback_data=f"maxsend_confirm_{source_chat_id}_{user_id}_{nonce}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ Отмена", callback_data=f"maxsend_cancel_{source_chat_id}_{user_id}_{nonce}"
+        ),
+    )
+    return keyboard
+
+
+@bot.message_handler(func=_is_max_send_reply, content_types=["text"])
+def handle_max_send_reply(message):
+    reply = message.reply_to_message
+    with max_send_flow_lock:
+        route = max_send_prompt_routes.pop((int(message.chat.id), int(reply.message_id)), None)
+    if not route:
+        return
+    source_chat_id, user_id, nonce, stage = route
+    key = (source_chat_id, user_id)
+    with max_send_flow_lock:
+        flow = max_send_flows.get(key)
+    if not flow or flow.get("nonce") != nonce:
+        return
+
+    value = (message.text or "").strip()
+    if value.startswith("/") or not value:
+        _send_max_send_prompt(source_chat_id, user_id, stage, flow)
+        return
+    if stage == "name":
+        if len(value) > 80:
+            bot.send_message(message.chat.id, "Имя слишком длинное. Укажите не больше 80 символов.", **NO_PREVIEW)
+            _send_max_send_prompt(source_chat_id, user_id, "name", flow)
+            return
+        with max_send_flow_lock:
+            flow["sender_name"] = value
+            flow["expires_at"] = time.time() + 15 * 60
+        try:
+            _send_max_send_prompt(source_chat_id, user_id, "body", flow)
+        except Exception as error:
+            max_send_flows.pop(key, None)
+            debug_logger.warning(
+                "MAX_SEND_BODY_PROMPT_FAILED source_chat_id=%s user_id=%s error_type=%s",
+                source_chat_id, user_id, type(error).__name__,
+            )
+        return
+
+    if len(value) > 3500:
+        bot.send_message(message.chat.id, "Сообщение слишком длинное. Сократите его до 3500 символов.", **NO_PREVIEW)
+        _send_max_send_prompt(source_chat_id, user_id, "body", flow)
+        return
+
+    with max_send_flow_lock:
+        flow["body"] = value
+        flow["stage"] = "confirm"
+        flow["expires_at"] = time.time() + 15 * 60
+    preview = (
+        f"Проверьте сообщение для MAX:\n\n<b>{escape_html(flow['sender_name'])}</b>\n\n"
+        f"{escape_html(value)}"
+    )
+    sent = bot.send_message(
+        message.chat.id,
+        preview,
+        parse_mode="HTML",
+        reply_markup=_max_send_preview_keyboard(source_chat_id, user_id, nonce),
+        **NO_PREVIEW,
+    )
+    with max_send_flow_lock:
+        flow["preview_message_id"] = int(sent.message_id)
 
 
 def _project_source_instructions(owner_id, source_type, chat_id):
@@ -5729,6 +6212,7 @@ def _verify_project_chat_access(
             current = get_chat_by_id(chat_id)
             if not current or not current.get("is_active"):
                 raise RuntimeError("CHAT_ACTIVATION_NOT_PERSISTED")
+        _ensure_max_send_button(chat_id)
         if int(pending_state.get("chat_id") or 0) == int(chat_id):
             customer_setup_state.pop(owner_id, None)
         if setup_prompt_id and setup_prompt_id != report_message_id:
@@ -5742,7 +6226,11 @@ def _verify_project_chat_access(
                 owner_id,
                 "<b>🎉 Подключение завершено!</b>\n\n"
                 "MAX открыл чат, и пересылка включена. Бот будет отправлять сообщения "
-                "в выбранную Telegram-группу.",
+                + (
+                    "в ваши личные сообщения с ботом."
+                    if chat.get("destination_type") == "private"
+                    else "в выбранную Telegram-группу."
+                ),
                 **NO_PREVIEW,
             )
         except Exception as notify_error:
@@ -5870,6 +6358,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
     customer_setup_state[owner_id] = {
         "chat_id": chat_id,
         "mode": account_mode,
+        "destination_type": "group",
         "screen": "source_type" if account_mode == "project" else "source_url",
     }
     if account_mode == "project":
@@ -5901,6 +6390,79 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         reply_markup=setup_keyboard,
         **NO_PREVIEW,
     )
+    customer_setup_state[owner_id]["prompt_message_id"] = sent.message_id
+    return True
+
+
+def _begin_customer_private_setup(owner_id, account_mode, callback_message=None):
+    owner_id = int(owner_id)
+    if _user_needs_subscription(owner_id, account_mode):
+        pending_setup_modes.pop(owner_id, None)
+        bot.send_message(
+            owner_id,
+            "Для подключения сначала оформите подписку командой /subscription.",
+            reply_markup=subscription_renewal_keyboard(),
+            **NO_PREVIEW,
+        )
+        return False
+    try:
+        user = bot.get_chat(owner_id)
+        user_name = " ".join(
+            part for part in (user.first_name, user.last_name) if str(part or "").strip()
+        ).strip() or str(owner_id)
+    except Exception:
+        user_name = str(owner_id)
+    title = f"Личные сообщения · {user_name}"[:120]
+    try:
+        source_chat_id = claim_private_chat(owner_id, title, account_mode)
+    except ChatLimitReached:
+        pending_setup_modes.pop(owner_id, None)
+        bot.send_message(
+            owner_id,
+            _chat_limit_notice(get_customer_chat_limit(owner_id)),
+            **NO_PREVIEW,
+        )
+        return False
+    pending_setup_modes.pop(owner_id, None)
+    customer_setup_state[owner_id] = {
+        "chat_id": source_chat_id,
+        "mode": account_mode,
+        "destination_type": "private",
+        "screen": "source_type" if account_mode == "project" else "source_url",
+    }
+
+    if account_mode == "project":
+        text = _project_source_type_text(source_chat_id)
+        keyboard = _project_source_type_keyboard(source_chat_id)
+    else:
+        text = (
+            "✅ Новые сообщения будут приходить в ваши личные сообщения с ботом.\n\n"
+            "<b>Шаг 2 из 3.</b> Пришлите ссылку на чат, группу или канал MAX, откуда получать сообщения.\n\n"
+            "<b>Как скопировать ссылку</b>: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
+            "откройте нужный чат, группу или канал и скопируйте ссылку из меню.\n\n"
+            "<i>Чтобы остановить настройку, нажмите «❌ Отмена».</i>"
+        )
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(_setup_cancel_button(source_chat_id))
+
+    sent = None
+    if callback_message:
+        try:
+            bot.edit_message_text(
+                text,
+                callback_message.chat.id,
+                callback_message.message_id,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            sent = callback_message
+        except Exception:
+            pass
+    if sent is None:
+        sent = bot.send_message(
+            owner_id, text, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW
+        )
     customer_setup_state[owner_id]["prompt_message_id"] = sent.message_id
     return True
 
@@ -6695,10 +7257,149 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data.startswith("connectdest_") or call.data.startswith("maxsend_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
+    if action.startswith("connectdest_"):
+        try:
+            _, destination_kind, account_mode = action.split("_", 2)
+        except ValueError:
+            bot.answer_callback_query(call.id, "Не удалось определить способ отправки", show_alert=True)
+            return
+        user_id = int(call.from_user.id)
+        if call.message.chat.type != "private":
+            bot.answer_callback_query(call.id, "Откройте настройку в личном чате с ботом.", show_alert=True)
+            return
+        if pending_setup_modes.get(user_id) != account_mode:
+            bot.answer_callback_query(call.id, "Настройка устарела. Начните её через /connect.", show_alert=True)
+            return
+        if account_mode not in {"self", "project"}:
+            bot.answer_callback_query(call.id, "Неизвестный способ подключения", show_alert=True)
+            return
+        if destination_kind not in {"group", "private"}:
+            bot.answer_callback_query(call.id, "Неизвестное место отправки", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        if destination_kind == "private":
+            _begin_customer_private_setup(user_id, account_mode, call.message)
+            return
+        label = "настройку своего аккаунта MAX" if account_mode == "self" else "настройку через готовый аккаунт"
+        try:
+            bot.edit_message_text(
+                f"<b>Шаг 1 · Telegram-группа</b>\n\n"
+                f"Вы выбрали: <b>{label}</b>.\n\n"
+                "Добавьте меня в Telegram-группу, куда нужно присылать сообщения. "
+                "Если я уже состою в ней, напишите в группе команду /bind.\n\n"
+                "<i>Чтобы остановить настройку, нажмите «❌ Отмена».</i>",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=get_cancel_keyboard(),
+                **NO_PREVIEW,
+            )
+        except Exception:
+            bot.send_message(
+                user_id,
+                f"<b>Шаг 1 · Telegram-группа</b>\n\n"
+                f"Вы выбрали: <b>{label}</b>. Добавьте меня в группу и напишите в ней /bind.",
+                parse_mode="HTML",
+                reply_markup=get_cancel_keyboard(),
+                **NO_PREVIEW,
+            )
+        return
+    if action.startswith("maxsend_start_"):
+        try:
+            source_chat_id = int(action[len("maxsend_start_"):])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Не удалось определить MAX-чат", show_alert=True)
+            return
+        _start_max_send_flow(call, source_chat_id)
+        return
+    if action.startswith(("maxsend_confirm_", "maxsend_cancel_")):
+        prefix = "maxsend_confirm_" if action.startswith("maxsend_confirm_") else "maxsend_cancel_"
+        try:
+            source_text, user_text, nonce = action[len(prefix):].rsplit("_", 2)
+            source_chat_id = int(source_text)
+            user_id = int(user_text)
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Кнопка отправки устарела", show_alert=True)
+            return
+        key = (source_chat_id, user_id)
+        send_slot_busy = False
+        with max_send_flow_lock:
+            flow = max_send_flows.get(key)
+            if (
+                int(call.from_user.id) != user_id
+                or not flow
+                or flow.get("nonce") != nonce
+                or int(flow.get("preview_message_id") or 0) != int(call.message.message_id)
+                or int(flow.get("destination_chat_id") or 0) != int(call.message.chat.id)
+            ):
+                flow = None
+            elif prefix == "maxsend_cancel_":
+                if flow.get("stage") != "confirm":
+                    bot.answer_callback_query(call.id, "Сообщение уже отправляется.")
+                    return
+                max_send_flows.pop(key, None)
+                for route_key, route in list(max_send_prompt_routes.items()):
+                    if route[:2] == key:
+                        max_send_prompt_routes.pop(route_key, None)
+            elif flow.get("stage") == "confirm":
+                if max_send_browser_semaphore.acquire(blocking=False):
+                    flow["stage"] = "sending"
+                else:
+                    send_slot_busy = True
+            else:
+                bot.answer_callback_query(call.id, "Сообщение уже отправляется.")
+                return
+        if not flow:
+            bot.answer_callback_query(call.id, "Эта кнопка принадлежит другому участнику или устарела.", show_alert=True)
+            return
+        if send_slot_busy:
+            bot.answer_callback_query(
+                call.id,
+                "Сейчас MAX занят отправкой других сообщений. Подождите немного и нажмите «Отправить» ещё раз.",
+                show_alert=True,
+            )
+            return
+        if prefix == "maxsend_cancel_":
+            bot.answer_callback_query(call.id, "Отправка отменена")
+            try:
+                bot.edit_message_text(
+                    "Отправка сообщения отменена.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=None,
+                    **NO_PREVIEW,
+                )
+            except Exception:
+                pass
+            return
+        bot.answer_callback_query(call.id, "Отправляю сообщение в MAX")
+        try:
+            bot.edit_message_text(
+                "⏳ Отправляю сообщение в MAX…",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+                **NO_PREVIEW,
+            )
+        except Exception:
+            pass
+        threading.Thread(
+            target=_deliver_max_send,
+            args=(
+                source_chat_id,
+                user_id,
+                nonce,
+                int(call.message.chat.id),
+                int(call.message.message_id),
+            ),
+            daemon=True,
+            name=f"max-send-{source_chat_id}",
+        ).start()
+        return
     if action.startswith(("project_invite_admin_joined_", "project_invite_admin_failed_")):
         if not is_admin(call.from_user.id):
             bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
@@ -8110,7 +8811,13 @@ def admin_callbacks(call):
                     ).start()
                     show_chat_details(call.message.chat.id, call.message.message_id, target_id)
                     return
-            toggle_chat(target_id, not bool(chat['is_active']))
+            new_active = not bool(chat['is_active'])
+            toggle_chat(target_id, new_active)
+            if chat.get("owner_id"):
+                if new_active:
+                    _ensure_max_send_button(target_id)
+                else:
+                    _remove_max_send_button(target_id)
         show_chat_details(call.message.chat.id, call.message.message_id, target_id)
     elif action.startswith("admin_clear_chat_cache_"):
         target_id = int(action.split("_")[-1])
@@ -8676,6 +9383,11 @@ if __name__ == "__main__":
                 print("⚠️ Сервис входа по номеру не запустился; QR-вход остаётся доступен")
         else:
             print("ℹ️ Вход по номеру ждёт REMOTE_AUTH_BASE_URL с HTTPS-доменом; QR-вход доступен")
+        threading.Thread(
+            target=_ensure_existing_max_send_buttons,
+            daemon=True,
+            name="max-send-button-bootstrap",
+        ).start()
         threading.Thread(target=background_parser, daemon=True).start()
         if PAYMENTS_ENABLED:
             threading.Thread(target=subscription_reminder_loop, daemon=True).start()

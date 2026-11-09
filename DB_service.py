@@ -72,6 +72,17 @@ def init_db():
                 added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS max_parser_private_chat_id_seq")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS destination_chat_id BIGINT")
+        conn.execute("""
+            ALTER TABLE chats
+            ADD COLUMN IF NOT EXISTS destination_type TEXT NOT NULL DEFAULT 'group'
+        """)
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_send_button_message_id BIGINT")
+        conn.execute("""
+            UPDATE chats SET destination_chat_id = chat_id
+            WHERE destination_chat_id IS NULL
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS referral_invites (
@@ -695,18 +706,13 @@ def has_support_request_notification(user_id: int) -> bool:
 
 
 def delete_support_request_notifications(user_id: int):
-    """Remove pending claim cards and their reply routes, returning their message IDs."""
+    """Clear pending markers and return claim cards so they can be edited in place."""
     with get_connection() as conn:
         rows = conn.execute("""
             DELETE FROM support_request_notifications
             WHERE user_id = %s
             RETURNING admin_chat_id, message_id
         """, (int(user_id),)).fetchall()
-        for row in rows:
-            conn.execute(
-                "DELETE FROM support_message_routes WHERE admin_chat_id = %s AND message_id = %s",
-                (int(row["admin_chat_id"]), int(row["message_id"])),
-            )
         return [
             (int(row["admin_chat_id"]), int(row["message_id"]))
             for row in rows
@@ -1049,10 +1055,11 @@ def add_chat(
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO chats
-                (chat_id, title, max_url, phone, is_active, message_count, owner_id, account_mode)
-            VALUES (%s, %s, %s, %s, FALSE, 0, %s, %s)
+                (chat_id, title, max_url, phone, is_active, message_count, owner_id, account_mode,
+                 destination_chat_id, destination_type)
+            VALUES (%s, %s, %s, %s, FALSE, 0, %s, %s, %s, 'group')
             ON CONFLICT (chat_id) DO NOTHING
-        """, (chat_id, title, max_url, phone, owner_id, account_mode))
+        """, (chat_id, title, max_url, phone, owner_id, account_mode, chat_id))
         if owner_id is not None:
             conn.execute(
                 "UPDATE chats SET owner_id = COALESCE(owner_id, %s) WHERE chat_id = %s",
@@ -1066,10 +1073,12 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (int(owner_id),))
             conn.execute("""
-                INSERT INTO chats (chat_id, title, owner_id, account_mode, is_active, message_count)
-                VALUES (%s, %s, NULL, %s, FALSE, 0)
+                INSERT INTO chats
+                    (chat_id, title, owner_id, account_mode, is_active, message_count,
+                     destination_chat_id, destination_type)
+                VALUES (%s, %s, NULL, %s, FALSE, 0, %s, 'group')
                 ON CONFLICT (chat_id) DO NOTHING
-            """, (chat_id, title, account_mode))
+            """, (chat_id, title, account_mode, chat_id))
             row = conn.execute(
                 "SELECT owner_id FROM chats WHERE chat_id = %s FOR UPDATE", (chat_id,)
             ).fetchone()
@@ -1093,10 +1102,44 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
             conn.execute("""
                 UPDATE chats
                 SET title = %s, owner_id = %s, account_mode = %s, max_url = NULL,
-                    phone = NULL, is_active = FALSE
+                    phone = NULL, is_active = FALSE, destination_chat_id = %s,
+                    destination_type = 'group'
                 WHERE chat_id = %s
-            """, (title, owner_id, account_mode, chat_id))
+            """, (title, owner_id, account_mode, chat_id, chat_id))
             return True
+
+
+def claim_private_chat(owner_id: int, title: str, account_mode: str) -> int:
+    """Create a MAX source whose Telegram destination is the owner's private chat."""
+    owner_id = int(owner_id)
+    with get_connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (owner_id,))
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM chats WHERE owner_id = %s",
+                (owner_id,),
+            ).fetchone()["count"]
+            has_multi = conn.execute("""
+                SELECT 1 AS active
+                FROM telegram_subscription_entitlements
+                WHERE user_id = %s AND plan_code = 'multi'
+                  AND active_until > CURRENT_TIMESTAMP
+                LIMIT 1
+            """, (owner_id,)).fetchone() is not None
+            chat_limit = MULTI_MAX_CUSTOMER_CHATS if has_multi else MAX_CUSTOMER_CHATS
+            if int(count) >= chat_limit:
+                raise ChatLimitReached
+            sequence = conn.execute(
+                "SELECT nextval('max_parser_private_chat_id_seq') AS value"
+            ).fetchone()["value"]
+            source_chat_id = -9_000_000_000_000_000_000 - int(sequence)
+            conn.execute("""
+                INSERT INTO chats
+                    (chat_id, title, owner_id, account_mode, is_active, message_count,
+                     destination_chat_id, destination_type)
+                VALUES (%s, %s, %s, %s, FALSE, 0, %s, 'private')
+            """, (source_chat_id, title, owner_id, account_mode, owner_id))
+            return source_chat_id
 
 
 def get_user_chats(owner_id: int):
@@ -1120,6 +1163,14 @@ def update_chat_phone(chat_id: int, phone: str):
 def update_chat_title(chat_id: int, title: str):
     with get_connection() as conn:
         conn.execute("UPDATE chats SET title = %s WHERE chat_id = %s", (title, chat_id))
+
+
+def set_max_send_button_message_id(chat_id: int, message_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE chats SET max_send_button_message_id = %s WHERE chat_id = %s",
+            (int(message_id), int(chat_id)),
+        )
 
 
 def get_chat_by_id(chat_id: int):
