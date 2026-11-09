@@ -81,6 +81,7 @@ def init_db():
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_send_button_message_id BIGINT")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type TEXT")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type_verified BOOLEAN NOT NULL DEFAULT FALSE")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS connection_generation TEXT")
         conn.execute("""
             UPDATE chats SET destination_chat_id = chat_id
             WHERE destination_chat_id IS NULL
@@ -1118,9 +1119,10 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
                 SET title = %s, owner_id = %s, account_mode = %s, max_url = NULL,
                     phone = NULL, is_active = FALSE, destination_chat_id = %s,
                     destination_type = 'group', max_source_type = NULL,
-                    max_source_type_verified = FALSE, max_send_button_message_id = NULL
+                    max_source_type_verified = FALSE, max_send_button_message_id = NULL,
+                    connection_generation = %s
                 WHERE chat_id = %s
-            """, (title, owner_id, account_mode, chat_id, chat_id))
+            """, (title, owner_id, account_mode, chat_id, uuid.uuid4().hex, chat_id))
             return True
 
 
@@ -1151,9 +1153,9 @@ def claim_private_chat(owner_id: int, title: str, account_mode: str) -> int:
             conn.execute("""
                 INSERT INTO chats
                     (chat_id, title, owner_id, account_mode, is_active, message_count,
-                     destination_chat_id, destination_type)
-                VALUES (%s, %s, %s, %s, FALSE, 0, %s, 'private')
-            """, (source_chat_id, title, owner_id, account_mode, owner_id))
+                     destination_chat_id, destination_type, connection_generation)
+                VALUES (%s, %s, %s, %s, FALSE, 0, %s, 'private', %s)
+            """, (source_chat_id, title, owner_id, account_mode, owner_id, uuid.uuid4().hex))
             return source_chat_id
 
 
@@ -1172,7 +1174,7 @@ def update_chat_url(chat_id: int, max_url: str):
 
 def update_chat_source_type(chat_id: int, source_type: str | None, verified: bool = False):
     source_type = str(source_type or "").strip().lower()
-    if source_type not in {"group", "channel"}:
+    if source_type not in {"group", "channel", "private"}:
         source_type = None
     with get_connection() as conn:
         conn.execute(
@@ -1249,6 +1251,18 @@ def get_chat_by_id(chat_id: int):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM chats WHERE chat_id = %s", (chat_id,)).fetchone()
         return row
+
+
+def get_or_create_chat_connection_generation(chat_id: int) -> str | None:
+    """Return a stable ID for one customer connection lifecycle."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            UPDATE chats
+            SET connection_generation = COALESCE(connection_generation, %s)
+            WHERE chat_id = %s
+            RETURNING connection_generation
+        """, (uuid.uuid4().hex, int(chat_id))).fetchone()
+        return str(row["connection_generation"]) if row else None
 
 
 def get_active_chats():

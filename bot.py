@@ -6260,7 +6260,6 @@ def _max_send_button_is_eligible(chat):
         or not chat.get("max_url")
         or chat.get("max_source_type") not in {"group", "private"}
         or not bool(chat.get("max_source_type_verified"))
-        or chat.get("destination_type") == "private"
         or not os.path.exists(_session_path_for_chat(chat))
     ):
         return False
@@ -6268,8 +6267,14 @@ def _max_send_button_is_eligible(chat):
     if owner_id and _user_needs_subscription(owner_id, chat.get("account_mode") or "self"):
         return False
     try:
-        telegram_chat = bot.get_chat(int(chat.get("destination_chat_id") or chat["chat_id"]))
-        return getattr(telegram_chat, "type", None) in {"group", "supergroup"}
+        destination_chat_id = int(chat.get("destination_chat_id") or chat["chat_id"])
+        telegram_chat = bot.get_chat(destination_chat_id)
+        destination_type = str(chat.get("destination_type") or "group")
+        actual_type = getattr(telegram_chat, "type", None)
+        if destination_type == "private":
+            owner_id = int(chat.get("owner_id") or 0)
+            return actual_type == "private" and (not owner_id or destination_chat_id == owner_id)
+        return actual_type in {"group", "supergroup"}
     except Exception:
         return False
 
@@ -6356,10 +6361,17 @@ def _start_public_max_send(call, source_chat_id):
     except (TypeError, ValueError):
         chat = None
     expected_destination = int((chat or {}).get("destination_chat_id") or (chat or {}).get("chat_id") or 0)
+    is_private_owner_chat = bool(
+        chat
+        and chat.get("destination_type") == "private"
+        and call.message.chat.type == "private"
+        and destination_chat_id == int(user.id)
+    )
+    is_group_chat = call.message.chat.type in {"group", "supergroup"}
     if (
         not chat
         or destination_chat_id != expected_destination
-        or call.message.chat.type not in {"group", "supergroup"}
+        or not (is_group_chat or is_private_owner_chat)
         or not _max_send_button_is_eligible(chat)
     ):
         _remove_max_send_button(source_chat_id)
@@ -6370,7 +6382,7 @@ def _start_public_max_send(call, source_chat_id):
         )
         return
     if getattr(user, "is_bot", False):
-        bot.answer_callback_query(call.id, "Эту кнопку может использовать участник группы.", show_alert=True)
+        bot.answer_callback_query(call.id, "Эту кнопку может использовать пользователь.", show_alert=True)
         return
     flow_key = (destination_chat_id, int(user.id))
     nonce = uuid.uuid4().hex[:10]
@@ -6388,6 +6400,7 @@ def _start_public_max_send(call, source_chat_id):
             "source_chat_id": source_chat_id,
             "destination_chat_id": destination_chat_id,
             "user_id": int(user.id),
+            "destination_type": str(chat.get("destination_type") or "group"),
             "nonce": nonce,
             "stage": initial_stage,
             "sender_name": "",
@@ -6422,7 +6435,13 @@ def _start_public_max_send(call, source_chat_id):
 
 
 def _is_public_max_send_reply(message):
-    if not message or not getattr(message, "from_user", None) or message.chat.type not in {"group", "supergroup"}:
+    if (
+        not message
+        or not getattr(message, "from_user", None)
+        or message.chat.type not in {"group", "supergroup", "private"}
+    ):
+        return False
+    if message.chat.type == "private" and int(message.chat.id) != int(message.from_user.id):
         return False
     key = (int(message.chat.id), int(message.from_user.id))
     with public_max_send_flow_lock:
@@ -6433,6 +6452,8 @@ def _is_public_max_send_reply(message):
             or float(flow.get("expires_at") or 0) <= time.time()
         ):
             return False
+        if message.chat.type == "private":
+            return flow.get("destination_type") == "private"
         if getattr(message, "reply_to_message", None) and int(flow.get("prompt_message_id") or 0) == int(message.reply_to_message.message_id):
             return True
         media_group_id = getattr(message, "media_group_id", None)
@@ -7393,36 +7414,35 @@ def _verify_project_chat_access(
                 bot.edit_message_reply_markup(owner_id, setup_prompt_id, reply_markup=None)
             except Exception:
                 pass
-        report("✅ Проверка завершена. MAX открыл чат, пересылка включена.")
-        try:
-            bot.send_message(
-                owner_id,
-                "<b>🎉 Подключение завершено!</b>\n\n"
-                "MAX открыл чат, и пересылка включена. Бот будет отправлять сообщения "
-                + (
-                    "в ваши личные сообщения с ботом."
-                    if chat.get("destination_type") == "private"
-                    else "в выбранную Telegram-группу."
-                ),
-                **NO_PREVIEW,
-            )
-        except Exception as notify_error:
-            debug_logger.error(
-                "PROJECT_ACCESS_SUCCESS_NOTIFY_FAILED chat_id=%s owner_id=%s error_type=%s",
-                chat_id, owner_id, type(notify_error).__name__,
-            )
+        status_reported = report("✅ Доступ к MAX подтверждён. Пересылка включена.")
         clear_project_access_buttons()
         refresh_chat_list()
+        review_offered = False
         if owner_id > 0:
             try:
-                _offer_review_after_connection(
-                    owner_id,
-                    f"{chat_id}:{chat.get('account_mode') or 'project'}",
-                )
+                connection_generation = get_or_create_chat_connection_generation(chat_id)
+                if connection_generation:
+                    review_offered = _offer_review_after_connection(
+                        owner_id,
+                        f"{chat_id}:{chat.get('account_mode') or 'project'}:{connection_generation}",
+                    )
             except Exception as notify_error:
                 debug_logger.warning(
                     "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
                     owner_id, type(notify_error).__name__,
+                )
+        if owner_id > 0 and not status_reported and not review_offered:
+            try:
+                bot.send_message(
+                    owner_id,
+                    "<b>🎉 Подключение завершено!</b>\n\n"
+                    "MAX открыл чат, пересылка включена. Новые сообщения будут приходить в выбранное место.",
+                    **NO_PREVIEW,
+                )
+            except Exception as notify_error:
+                debug_logger.error(
+                    "PROJECT_ACCESS_SUCCESS_NOTIFY_FAILED chat_id=%s owner_id=%s error_type=%s",
+                    chat_id, owner_id, type(notify_error).__name__,
                 )
         return True
     except Exception as error:
