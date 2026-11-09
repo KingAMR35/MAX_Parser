@@ -98,9 +98,13 @@ def _has_auth_captcha(page) -> bool:
 
 
 def _normalize_message_lines(text: str) -> str:
+    # These private-use chars are temporary separators used while flattening
+    # MAX's rich-text DOM. Never allow them to leak into a Telegram message.
+    text = str(text or "").replace("\uE000", "\n").replace("\uE001", "\n")
+    text = re.sub(r"[\uE002\uE003]", "", text)
     lines = [
         re.sub(r"[\t ]+", " ", line).strip()
-        for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     ]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
@@ -2138,12 +2142,31 @@ def _animated_frames_dedupe_hash(frames, media_kind: str) -> str:
 
 
 def _animated_media_dedupe_hash(frames, msg: dict, chat_id: int, media_kind: str) -> str:
-    """Prefer MAX's stable post ID; use rendered frames when only a DOM index exists."""
+    """Build a stable message-level key for an animation across parser cycles."""
     source_id = str(msg.get("source_id") or "").strip()
     if source_id and not msg.get("source_id_is_index"):
         identity = f"post:{int(chat_id)}:{source_id}:{media_kind}"
     else:
-        frame_hash = _animated_frames_dedupe_hash(frames, media_kind)
+        # The captured frame sequence changes with playback timing, so hashing
+        # every frame made the same sticker look new on every polling cycle.
+        # MAX often exposes a stable asset ID/URL even when its message ID is
+        # only a DOM index; use it together with the visible message metadata.
+        asset_identity = str(msg.get("_animated_media_identity") or "").strip()
+        if not asset_identity:
+            source_urls = [
+                str(value or "").strip()
+                for value in (msg.get("images") or [])
+                if str(value or "").strip()
+            ]
+            if source_urls:
+                try:
+                    parts = urlparse(source_urls[0])
+                    asset_identity = f"{parts.netloc}{parts.path}".casefold()
+                except Exception:
+                    asset_identity = source_urls[0].split("?", 1)[0].split("#", 1)[0]
+        # If MAX gives neither a stable ID nor a source URL, keep the key based
+        # on message metadata alone. A changing animation frame must never make
+        # an already-forwarded sticker appear new on every cycle.
         identity = "|".join((
             f"chat:{int(chat_id)}",
             f"kind:{media_kind}",
@@ -2151,7 +2174,7 @@ def _animated_media_dedupe_hash(frames, msg: dict, chat_id: int, media_kind: str
             f"text:{normalize_for_hash(msg.get('text') or '')}",
             f"date:{normalize_for_hash(msg.get('date') or '')}",
             f"time:{normalize_for_hash(msg.get('time') or '')}",
-            f"frames:{frame_hash}",
+            f"asset:{normalize_for_hash(asset_identity)}",
         ))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
@@ -2645,7 +2668,7 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0, media_kind: str
             const meta=[];
             for(let n=el,d=0;n&&d<5;n=n.parentElement,d++) {
                 meta.push(n.className||'',n.getAttribute?.('data-testid')||'',n.getAttribute?.('data-sticker')||'',
-                    n.getAttribute?.('aria-label')||'',n.getAttribute?.('data-type')||'',
+                    n.getAttribute?.('aria-label')||'',n.getAttribute?.('alt')||'',n.getAttribute?.('data-type')||'',
                     n.hasAttribute?.('data-animated-emoji')?'data-animated-emoji':'',
                     n.hasAttribute?.('data-custom-emoji')?'data-custom-emoji':'',
                     n.hasAttribute?.('data-emoji-id')?'data-emoji-id':'',
@@ -2654,7 +2677,7 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0, media_kind: str
             const text=meta.join(' ').toLowerCase();
             const tag=String(el.tagName||'').toLowerCase();
             const sticker=/sticker|стикер/.test(text);
-            const emoji=/(?:^|[ _:-])emoji(?:[ _:-]|$)|animated.?emoji|custom.?emoji|эмодзи|emoticon|smiley/.test(text);
+            const emoji=/(?:^|[ _:-])emoji(?:[ _:-]|$)|animated.?emoji|custom.?emoji|эмодзи|emoticon|smiley/.test(text) || /\\p{Extended_Pictographic}/u.test(text);
             let duration=tag==='video' && Number.isFinite(el.duration) ? el.duration : 0;
             let animated=['video','canvas'].includes(tag) || /animated|lottie|data-custom-emoji|data-emoji-id/.test(text);
             try {
@@ -2669,7 +2692,19 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0, media_kind: str
             } catch(e) {}
             const src=String(el.currentSrc||el.src||el.getAttribute?.('src')||'');
             if(/\\.(?:gif|webp)(?:[?#]|$)/i.test(src)) animated=true;
-            return {index,tag,meta:text,width:r.width||0,height:r.height||0,duration,animated,sticker,emoji};
+            if(emoji && (/^blob:/i.test(src) || /^data:image\/(?:gif|webp)/i.test(src))) animated=true;
+            if(tag==='svg' && el.querySelector?.('animate,animateTransform,set')) animated=true;
+            let stableId='';
+            for(let n=el,d=0;n&&d<6&&!stableId;d++,n=n.parentElement) {
+                stableId=n.getAttribute?.('data-sticker-id')||n.getAttribute?.('data-emoji-id')||
+                    n.getAttribute?.('data-custom-emoji-id')||n.getAttribute?.('data-document-id')||
+                    n.getAttribute?.('data-file-id')||'';
+            }
+            if(!stableId && src && !/^blob:/i.test(src)) {
+                try { const u=new URL(src,location.href); stableId=`${u.host}${u.pathname}`; }
+                catch(e) { stableId=src.split(/[?#]/)[0]; }
+            }
+            return {index,tag,meta:text,width:r.width||0,height:r.height||0,duration,animated,sticker,emoji,stableId};
         })""")
         valid = [
             item for item in (candidates or [])
@@ -2689,6 +2724,7 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0, media_kind: str
             0 if item.get("tag") in {"video", "canvas", "img", "svg"} else 1,
         ))
         chosen = valid[0]
+        msg["_animated_media_identity"] = str(chosen.get("stableId") or "").strip()
         sticker = nodes.nth(int(chosen["index"]))
         try:
             sticker.scroll_into_view_if_needed(timeout=1500)
@@ -5774,7 +5810,7 @@ def parse_max_group_media(
                         if (poll) {
                             const cleanPollLine = s => clean(String(s || "")).replace(/^[⚪⚫▫•]+\s*/u, "").replace(/\s+/g, " ").trim();
                             const multiSelectMeta = /^(?:select one or multiple answers|select one or more answers|select multiple answers|выберите один или несколько (?:вариантов )?ответов)(?:\s*[:.]?\s*\d+)?$/i;
-                            const isPollMetaLine = s => multiSelectMeta.test(cleanPollLine(s)) || /^(?:select an answer|выберите(?:\s+вариант)?\s+ответ(?:а)?|голосовать|vote|ответить|проголосовать|show results|показать результаты(?: опроса)?|poll ended\b.*|опрос заверш[её]н\b.*|total votes?\b.*|всего голосов?\b.*)$/i.test(cleanPollLine(s));
+                            const isPollMetaLine = s => multiSelectMeta.test(cleanPollLine(s)) || /^(?:\d+\s+voted|voted\s+\d+|\d+\s+(?:person|people)\s+voted|(?:проголосовал(?:и|о)?\s+)?\d+\s+голосующ(?:ий|их)|select an answer|выберите(?:\s+вариант)?\s+ответ(?:а)?|голосовать|vote|ответить|проголосовать|show results|показать результаты(?: опроса)?|poll ended\b.*|опрос заверш[её]н\b.*|total votes?\b.*|всего голосов?\b.*)$/i.test(cleanPollLine(s));
                             const serviceOnly = /^(?:select one or multiple answers|select one or more answers|select multiple answers|выберите один или несколько (?:вариантов )?ответов|select an answer|выберите(?:\s+вариант)?\s+ответ(?:а)?|голосовать|vote|ответить|проголосовать|show results|показать результаты(?: опроса)?)(?:\b|$)/i;
                             const rawPollText = String(poll.innerText || poll.textContent || "");
                             const activePoll = /select\s+an\s+answer|choose\s+an\s+answer|выберите\s+(?:вариант\s+)?ответ(?:а)?/i.test(rawPollText);
@@ -5853,6 +5889,7 @@ def parse_max_group_media(
                                 }
                                 if (/^\d+$/.test(value) && !isExplicitOption) return;
                                 if (/^(option|вариант|вариант ответа|название)$/i.test(value)) return;
+                                if (/^(?:\d+\s+voted|voted\s+\d+|\d+\s+(?:person|people)\s+voted)$/i.test(value)) return;
                                 const existing = options.find(x => String(x.text || "").toLowerCase() === value.toLowerCase());
                                 if (!existing) {
                                     options.push({text:value, votes, explicit:isExplicitOption});
@@ -5963,8 +6000,8 @@ def parse_max_group_media(
                             if (!question || /^\d+$/.test(question) || serviceOnly.test(question)) question="Опрос";
 
                             // MAX can expose a whole active poll's choices as one option node.
-                            // Recover only the observed flat shapes, after all DOM and text sources
-                            // have been combined and the poll-level vote count is available.
+                            // Recover a flattened sequence of three single-word choices when MAX
+                            // exposes them as one zero-vote option (for example "A B C: 0").
                             if (activePoll && options.length===1) {
                                 const flatValue=cleanPollLine(options[0].text);
                                 const flatTwoChoiceSequence=flatValue.match(/^([a-zа-яё][a-zа-яё0-9_-]*)\s+([a-zа-яё][a-zа-яё0-9_-]*)$/u);
@@ -5977,8 +6014,7 @@ def parse_max_group_media(
                                 if (pollVoteCount!=null && pollVoteCount>0 && flatTwoChoiceSequence) {
                                     recoveredLabels=flatTwoChoiceSequence.slice(1);
                                     recoveredVotes=[0,pollVoteCount];
-                                } else if ((pollVoteCount==null || pollVoteCount===0) &&
-                                    /no\s+answers\s+yet/i.test(rawPollText) && flatThreeZeroVoteChoices) {
+                                } else if ((pollVoteCount==null || pollVoteCount===0) && flatThreeZeroVoteChoices) {
                                     recoveredLabels=flatThreeZeroVoteChoices.slice(1);
                                     recoveredVotes=recoveredLabels.map(()=>0);
                                 }
@@ -6222,7 +6258,7 @@ def parse_max_group_media(
                         const mediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("video,audio,source,button,[role='button'],[aria-label],[data-testid]")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')} ${el.tagName||''}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
                         const deepMediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("*")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
                         const callLike = /звонок|вызов|call|calling|ringing|incoming call|outgoing call/.test(`${fullRowText} ${mediaMeta}`.toLowerCase());
-                        const roundVideoHint = Array.from(bubble.querySelectorAll("video")).some(video => {
+                        const roundVideoHint = Array.from(bubble.querySelectorAll("video,canvas.videoCanvas,canvas")).some(video => {
                             try {
                                 const rect = video.getBoundingClientRect();
                                 if (!rect.width || !rect.height) return false;
@@ -6232,15 +6268,16 @@ def parse_max_group_media(
                                 let marker = false;
                                 for (let node = video, depth = 0; node && depth < 6; depth++, node = node.parentElement) {
                                     const style = getComputedStyle(node);
-                                    const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")}`;
+                                    const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")} ${safeAttr(node,"title")}`;
                                     if (/circle|round|video.?note|videonote|круж/i.test(meta)) marker = true;
+                                    if (video.tagName === "CANVAS" && /videoCanvas|videoMessage|video-note|videonote|roundVideo|круж/i.test(meta)) marker = true;
                                     if (/circle\(/i.test(style.clipPath || style.webkitClipPath || "")) circleStyle = true;
                                     const radii = [style.borderTopLeftRadius,style.borderTopRightRadius,style.borderBottomLeftRadius,style.borderBottomRightRadius];
                                     if (radii.some(value => String(value).includes("%") && parseFloat(value) >= 40)) circleStyle = true;
                                     const pxRadius = Math.min(rect.width,rect.height) / 2 - 2;
                                     if (radii.some(value => !String(value).includes("%") && parseFloat(value) >= pxRadius)) circleStyle = true;
                                 }
-                                return marker || circleStyle;
+                                return video.tagName === "CANVAS" ? marker : (marker || circleStyle);
                             } catch(e) { return false; }
                         });
                         const animatedEmojiHint = Array.from(bubble.querySelectorAll(
@@ -6249,19 +6286,21 @@ def parse_max_group_media(
                             let meta = "";
                             let explicitAnimated = false;
                             for (let node = el, depth = 0; node && depth < 6; depth++, node = node.parentElement) {
-                                meta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"title")} ${safeAttr(node,"data-type")} ${safeAttr(node,"data-animated-emoji")} ${safeAttr(node,"data-custom-emoji")} ${safeAttr(node,"data-emoji-id")} ${safeAttr(node,"data-emoji-name")}`;
+                                meta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"alt")} ${safeAttr(node,"title")} ${safeAttr(node,"data-type")} ${safeAttr(node,"data-animated-emoji")} ${safeAttr(node,"data-custom-emoji")} ${safeAttr(node,"data-emoji-id")} ${safeAttr(node,"data-emoji-name")}`;
                                 for (const attr of ["data-animated-emoji","data-custom-emoji","data-emoji-id","data-emoji-name"]) {
                                     if (node.hasAttribute?.(attr)) meta += ` ${attr}`;
                                 }
                                 if (["data-animated-emoji","data-custom-emoji","data-emoji-id"].some(attr => node.hasAttribute?.(attr)) || /animated.?emoji|lottie/i.test(String(node.className||"") + " " + safeAttr(node,"data-testid"))) explicitAnimated = true;
                             }
-                            if (/sticker|стикер/i.test(meta) || !/emoji|эмодзи|emoticon|smiley/i.test(meta)) return false;
+                            const glyphEmoji = /\\p{Extended_Pictographic}/u.test(meta);
+                            if (/sticker|стикер/i.test(meta) || (!/emoji|эмодзи|emoticon|smiley/i.test(meta) && !glyphEmoji)) return false;
                             const tag = String(el.tagName||"").toLowerCase();
                             let src = String(el.currentSrc||el.src||safeAttr(el,"src")||safeAttr(el,"data-src")||safeAttr(el,"data-animation-url")||"");
                             try { if (!src) { const bg=getComputedStyle(el).backgroundImage||""; const match=bg.match(/url\(["']?(.*?)["']?\)/i); if(match) src=match[1]; } } catch(e) {}
                             let cssAnimated = false;
                             try { const style=getComputedStyle(el); cssAnimated=parseFloat(style.animationDuration||"0")>0 && style.animationName!=="none"; } catch(e) {}
-                            return tag==="video" || tag==="canvas" || explicitAnimated || cssAnimated || /\.(?:gif|webp)(?:[?#]|$)/i.test(src);
+                            const inlineSvgAnimated = tag==="svg" && Boolean(el.querySelector("animate,animateTransform,set"));
+                            return tag==="video" || tag==="canvas" || explicitAnimated || cssAnimated || inlineSvgAnimated || (glyphEmoji && (/^blob:/i.test(src) || /^data:image\/(?:gif|webp)/i.test(src))) || /\.(?:gif|webp)(?:[?#]|$)/i.test(src);
                         });
                         // time в шапке .item — время сообщения, а не длительность
                         // вложения. Берём длительность только из самой bubbleContent.
@@ -6975,6 +7014,11 @@ def parse_max_group_media(
                     _activate_media_card(page, msg, chat_id=chat_id)
                     page.wait_for_timeout(500)
                     media_files.extend(_extract_live_rich_media(page, msg, chat_id=chat_id))
+                if msg.get("video_note_hint") and not has_expected_rich_media():
+                    # Some MAX builds draw circular video messages into a canvas
+                    # and expose no downloadable <video> URL. Record that exact
+                    # card as a Telegram video note instead of dropping it.
+                    media_files.extend(_capture_video_canvas(page, msg, chat_id=chat_id))
             if msg.get("download_click_id") and not media_files:
                 click_type = msg.get("download_click_type") or "document"
                 media = _download_document_from_message_card(
@@ -7476,21 +7520,38 @@ def send_message_to_max(
 
         composer = page.locator('[data-max-parser-send-composer="true"]').first
 
-        def photo_upload_failed():
-            if not has_photo_upload:
+        def media_upload_error():
+            if not upload_payload:
                 return False
             try:
-                return bool(page.evaluate("""() => {
-                    const pattern = /не получилось отправить (?:фотографию|фото)|не удалось отправить (?:фотографию|фото)|could not send (?:the )?(?:photo|image)|failed to upload (?:the )?(?:photo|image)/i;
+                return page.evaluate("""() => {
+                    const pattern = /не получилось отправить|не удалось отправить|не удалось загрузить|ошибка загрузки|could not send|failed to upload|upload failed|не получилось загрузить/i;
                     const selectors = '[role="alert"],[aria-live],[class*="toast" i],[class*="notification" i],[class*="error" i]';
-                    return [...document.querySelectorAll(selectors)].some(el => {
+                    return [...document.querySelectorAll(selectors)].map(el => {
                         const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-                        if (!r.width || !r.height || s.display === 'none' || s.visibility === 'hidden') return false;
-                        return pattern.test(String(el.innerText || el.textContent || '').trim());
+                        if (!r.width || !r.height || s.display === 'none' || s.visibility === 'hidden') return '';
+                        const text=String(el.innerText || el.textContent || '').trim();
+                        return pattern.test(text) ? text.slice(0,240) : '';
+                    }).find(Boolean) || '';
+                }""")
+            except Exception:
+                return False
+
+        def chat_tail_snapshot():
+            try:
+                return tuple(page.evaluate("""() => {
+                    let rows=[...document.querySelectorAll('.item')];
+                    if (!rows.length) rows=[...document.querySelectorAll('[data-message-id],[data-mid]')];
+                    const visibleRows=rows.length>10 ? [...rows.slice(0,5),...rows.slice(-5)] : rows;
+                    return visibleRows.map(row=>{
+                        const id=row.getAttribute('data-message-id')||row.getAttribute('data-mid')||row.getAttribute('data-id')||row.getAttribute('data-index')||'';
+                        const text=String(row.innerText||row.textContent||'').replace(/\\s+/g,' ').trim().slice(0,240);
+                        const media=row.querySelectorAll('img,video,audio,canvas,[class*="attachment" i],[class*="file" i]').length;
+                        return `${id}|${text}|${media}`;
                     });
                 }"""))
             except Exception:
-                return False
+                return ()
 
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
@@ -7572,8 +7633,9 @@ def send_message_to_max(
                 raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
             # Let MAX finish rendering the selected file(s) in the composer.
             page.wait_for_timeout(2200)
-            if photo_upload_failed():
-                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
+            upload_error = media_upload_error()
+            if upload_error:
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
 
         # Fill in one operation to preserve Unicode and the exact order of characters.
         if str(text or "").strip():
@@ -7596,8 +7658,9 @@ def send_message_to_max(
         send_button = None
         attempts = 32 if upload_payload else 1
         for attempt in range(attempts):
-            if photo_upload_failed():
-                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
+            upload_error = media_upload_error()
+            if upload_error:
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
             for index in reversed(range(send_buttons.count())):
                 candidate = send_buttons.nth(index)
                 try:
@@ -7616,6 +7679,7 @@ def send_message_to_max(
             page.wait_for_timeout(250)
         if upload_payload and send_button is None:
             raise RuntimeError("MAX_UPLOAD_NOT_READY")
+        before_tail = chat_tail_snapshot() if upload_payload else ()
         if on_before_send:
             on_before_send(normalized_media_hashes)
         if send_button is not None:
@@ -7625,21 +7689,36 @@ def send_message_to_max(
             # MAX's usual Enter shortcut instead of retrying after a click timeout.
             composer.press("Enter", timeout=2500)
 
-        for _ in range(24):
+        send_confirmed = False
+        for _ in range(48):
+            upload_error = media_upload_error()
+            if upload_error:
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
             try:
                 remaining = composer.input_value(timeout=300) if composer.evaluate("el => el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'") else composer.inner_text(timeout=300)
             except Exception:
                 remaining = ""
             if not str(remaining or "").strip():
-                if has_photo_upload:
-                    page.wait_for_timeout(1200)
-                if photo_upload_failed():
-                    raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
-                return
+                if not upload_payload:
+                    send_confirmed = True
+                    break
+                if chat_tail_snapshot() != before_tail:
+                    send_confirmed = True
+                    break
             page.wait_for_timeout(250)
-        if photo_upload_failed():
-            raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
-        raise RuntimeError("MAX_SEND_NOT_CONFIRMED")
+        if not send_confirmed:
+            upload_error = media_upload_error()
+            if upload_error:
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
+            raise RuntimeError("MAX_SEND_NOT_CONFIRMED")
+        # MAX may clear the composer optimistically before reporting an upload
+        # failure. Allow the asynchronous error toast to arrive before success.
+        if upload_payload:
+            page.wait_for_timeout(1200)
+            upload_error = media_upload_error()
+            if upload_error:
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
+        return
     except Exception as error:
         if isinstance(error, RuntimeError):
             raise

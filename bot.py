@@ -677,6 +677,7 @@ def _format_poll_message(poll: dict, comment: str = "", is_closed: bool = False)
     if re.match(r"^(?:poll ended|опрос заверш[её]н|total votes?|всего голосов?)\b", question, re.I):
         question = "Опрос"
     rows = []
+    discarded_meta_votes = 0
     for item in poll.get("options") or []:
         if isinstance(item, dict):
             label = str(item.get("text") or "").strip()
@@ -691,6 +692,15 @@ def _format_poll_message(poll: dict, comment: str = "", is_closed: bool = False)
             votes = max(0, int(raw_votes if raw_votes is not None else 0))
         except (TypeError, ValueError):
             votes = 0
+        voter_meta = re.fullmatch(
+            r"(?:(\d+)\s+voted|voted\s+(\d+)|(\d+)\s+(?:person|people)\s+voted)(?:\s*:\s*(\d+))?",
+            label,
+            re.I,
+        )
+        if voter_meta:
+            votes = max(votes, *(int(value or 0) for value in voter_meta.groups()))
+            discarded_meta_votes += votes
+            continue
         suffix = re.match(r"^(.*?)(?:\s*[.,]\s*|\s+)(\d+)\s*(?:votes?|голос(?:а|ов)?)$", label, re.I)
         if suffix:
             label = suffix.group(1).strip()
@@ -704,9 +714,22 @@ def _format_poll_message(poll: dict, comment: str = "", is_closed: bool = False)
             continue
         rows.append((label, votes))
 
+    # Some MAX builds flatten three zero-vote options into one text node.
+    # Recover the observed single-word shape without splitting ordinary phrases.
+    if not is_closed and len(rows) == 1 and rows[0][1] == 0:
+        flat = rows[0][0]
+        split_choices = re.fullmatch(
+            r"([a-zа-яё][a-zа-яё0-9_-]*)\s+([a-zа-яё][a-zа-яё0-9_-]*)\s+([a-zа-яё][a-zа-яё0-9_-]*)",
+            flat,
+            re.I,
+        )
+        if split_choices:
+            rows = [(label, 0) for label in split_choices.groups()]
+
     total_votes = sum(votes for _, votes in rows)
     try:
-        total_votes = max(total_votes, int(poll.get("total_votes") or 0))
+        reported_total = max(0, int(poll.get("total_votes") or 0) - discarded_meta_votes)
+        total_votes = max(total_votes, reported_total)
     except (TypeError, ValueError):
         pass
     poll_title = "Завершенный опрос" if is_closed else "Опрос"
@@ -1328,10 +1351,23 @@ def _send_post_impl(chat_id: int, post: dict, destination_chat_id=None) -> None:
             print(f"⚠️ [{chat_id}] Ошибка отправки {media_type}: {error}")
             if media_type == "video":
                 raise
-            if media_type not in ("voice","video_note","image","sticker"):
+            if media_type in {"image", "sticker", "voice", "audio", "animation"}:
                 try:
                     obj.seek(0)
-                    _telegram_call(bot.send_document,destination_chat_id,obj,visible_file_name=filename)
+                    document_options = {"visible_file_name": filename}
+                    if media_type == "image" and caption_pending and len(msg_text) <= 1024:
+                        document_options.update(caption=msg_text, parse_mode="HTML")
+                    _telegram_call(bot.send_document, destination_chat_id, obj, **document_options)
+                    if media_type == "image" and caption_pending and len(msg_text) <= 1024:
+                        caption_pending = False
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Не отправилось медиа {media_type}; fallback send_document также завершился ошибкой: {fallback_error}"
+                    ) from error
+            elif media_type not in {"voice", "video_note", "image", "sticker"}:
+                try:
+                    obj.seek(0)
+                    _telegram_call(bot.send_document, destination_chat_id, obj, visible_file_name=filename)
                 except Exception as fallback_error:
                     raise RuntimeError(
                         f"Не отправилось медиа {media_type}; fallback send_document также завершился ошибкой: {fallback_error}"
@@ -6122,7 +6158,7 @@ def _latest_parser_send_anchor(chat_id, destination_chat_id):
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
-def _remove_max_send_button(chat_id):
+def _remove_max_send_button(chat_id, preserve_anchor=False):
     chat = get_chat_by_id(int(chat_id))
     if not chat or not chat.get("max_send_button_message_id"):
         return False
@@ -6130,7 +6166,8 @@ def _remove_max_send_button(chat_id):
     _clear_max_send_anchor(
         int(chat_id), destination_chat_id, int(chat["max_send_button_message_id"])
     )
-    set_max_send_button_message_id(int(chat_id), None)
+    if not preserve_anchor:
+        set_max_send_button_message_id(int(chat_id), None)
     return True
 
 
@@ -6174,8 +6211,10 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
         destination_chat_id or chat.get("destination_chat_id") or chat["chat_id"]
     )
     existing_id = chat.get("max_send_button_message_id")
-    anchor_message_id = anchor_message_id or _latest_parser_send_anchor(
-        int(chat_id), destination_chat_id
+    anchor_message_id = (
+        anchor_message_id
+        or _latest_parser_send_anchor(int(chat_id), destination_chat_id)
+        or existing_id
     )
     keyboard = _public_max_send_button_keyboard(chat_id)
     if anchor_message_id:
@@ -9996,7 +10035,7 @@ def admin_callbacks(call):
             if new_active:
                 _sync_max_send_button(target_id)
             else:
-                _remove_max_send_button(target_id)
+                _remove_max_send_button(target_id, preserve_anchor=True)
         show_chat_details(call.message.chat.id, call.message.message_id, target_id)
     elif action.startswith("admin_clear_chat_cache_"):
         target_id = int(action.split("_")[-1])
