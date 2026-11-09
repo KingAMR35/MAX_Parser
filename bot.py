@@ -6048,8 +6048,25 @@ def _send_max_payload_with_sender(
     )
 
 
+def _max_send_failure_text(error, heading=None):
+    detail = escape_html(log_preview(f"{type(error).__name__}: {error}", 700))
+    heading = heading or "⚠️ Не удалось отправить сообщение в MAX."
+    return f"{heading}\n\nДиагностика: <code>{detail}</code>"
+
+
+def _print_max_send_failure(context, source_chat_id, error):
+    formatted = traceback.format_exception(type(error), error, error.__traceback__)
+    safe_traceback = "\n".join(log_preview(line, 900) for line in formatted)
+    print(
+        f"{context} source_chat_id={source_chat_id} "
+        f"error_type={type(error).__name__} error={log_preview(error, 900)}\n"
+        f"{safe_traceback}",
+        flush=True,
+    )
+
+
 def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id):
-    result_text = "⚠️ Не удалось отправить сообщение в MAX. Проверьте подключение и попробуйте позже."
+    result_text = None
     result_keyboard = None
     try:
         with admin_max_send_flow_lock:
@@ -6128,39 +6145,42 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
         ))
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
     except Exception as error:
+        _print_max_send_failure("ADMIN_MAX_MESSAGE_SEND_FAILED", source_chat_id, error)
         debug_logger.warning(
             "ADMIN_MAX_MESSAGE_SEND_FAILED source_chat_id=%s error_type=%s error=%s",
-            source_chat_id, type(error).__name__, log_preview(error, 220),
+            source_chat_id, type(error).__name__, log_preview(error, 900),
         )
+        result_text = _max_send_failure_text(error)
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
-            result_text = "⚠️ Сессия MAX завершилась. Подключите аккаунт заново."
+            result_text = _max_send_failure_text(error, "⚠️ Сессия MAX завершилась. Подключите аккаунт заново.")
         elif "MAX_PHOTO_UPLOAD_FAILED" in str(error):
-            result_text = "⚠️ MAX не принял фотографию. Попробуйте отправить её как файл или уменьшите размер."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не принял фотографию. Попробуйте отправить её как файл или уменьшите размер.")
         elif "TELEGRAM_FILE_TOO_LARGE" in str(error):
-            result_text = "⚠️ Файл больше 20 МБ. Отправьте файл поменьше."
+            result_text = _max_send_failure_text(error, "⚠️ Файл больше 20 МБ. Отправьте файл поменьше.")
         elif "MAX_UPLOAD_CONTROL_NOT_FOUND" in str(error):
-            result_text = "⚠️ MAX не открыл загрузку этого типа файла. Попробуйте другой формат."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не открыл загрузку этого типа файла. Попробуйте другой формат.")
         elif "MAX_UPLOAD_NOT_READY" in str(error):
-            result_text = "⚠️ MAX не успел подготовить вложение. Попробуйте отправить файл ещё раз."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не успел подготовить вложение. Попробуйте отправить файл ещё раз.")
         elif "MAX_SEND_NOT_CONFIRMED" in str(error):
-            result_text = "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой.")
     finally:
         with admin_max_send_flow_lock:
             current = admin_max_send_flows.get(int(admin_id))
             if current and current.get("nonce") == nonce:
                 admin_max_send_flows.pop(int(admin_id), None)
-        try:
-            bot.edit_message_text(
-                result_text, int(admin_id), int(preview_message_id),
-                reply_markup=result_keyboard, **NO_PREVIEW
-            )
-        except Exception:
+        if result_text is not None:
             try:
-                bot.send_message(
-                    int(admin_id), result_text, reply_markup=result_keyboard, **NO_PREVIEW
+                bot.edit_message_text(
+                    result_text, int(admin_id), int(preview_message_id),
+                    reply_markup=result_keyboard, **NO_PREVIEW
                 )
             except Exception:
-                pass
+                try:
+                    bot.send_message(
+                        int(admin_id), result_text, reply_markup=result_keyboard, **NO_PREVIEW
+                    )
+                except Exception:
+                    pass
 
 
 def _finish_admin_max_send(admin_id, source_chat_id, nonce, preview_message_id):
@@ -6652,7 +6672,7 @@ def _is_public_max_file_oversize(file_size):
 
 
 def _send_public_max_message(flow_key, nonce, preview_message_id):
-    result_text = "⚠️ Не удалось отправить сообщение в MAX. Проверьте подключение и попробуйте позже."
+    result_text = None
     result_keyboard = None
     try:
         with public_max_send_flow_lock:
@@ -6725,39 +6745,42 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
         result_text = "✅ Сообщение отправлено в MAX."
         result_keyboard = _public_max_send_button_keyboard(source_chat_id)
     except Exception as error:
+        _print_max_send_failure("PUBLIC_MAX_SEND_FAILED", flow_key[0], error)
         debug_logger.warning(
             "PUBLIC_MAX_SEND_FAILED user_chat=%s error_type=%s error=%s",
-            flow_key, type(error).__name__, log_preview(error, 220),
+            flow_key, type(error).__name__, log_preview(error, 900),
         )
+        result_text = _max_send_failure_text(error)
         if "MAX_SOURCE_IS_CHANNEL" in str(error):
-            result_text = "⚠️ Это канал MAX. Отправлять туда сообщения нельзя; кнопка для этого источника скрыта."
+            result_text = _max_send_failure_text(error, "⚠️ Это канал MAX. Отправлять туда сообщения нельзя; кнопка для этого источника скрыта.")
         elif "MAX_PHOTO_UPLOAD_FAILED" in str(error):
-            result_text = "⚠️ MAX не принял фотографию. Попробуйте отправить её как файл или уменьшите размер."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не принял фотографию. Попробуйте отправить её как файл или уменьшите размер.")
         elif "TELEGRAM_FILE_TOO_LARGE" in str(error):
-            result_text = "⚠️ Файл больше 20 МБ. Отправьте файл поменьше."
+            result_text = _max_send_failure_text(error, "⚠️ Файл больше 20 МБ. Отправьте файл поменьше.")
         elif "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
-            result_text = "⚠️ Сессия MAX завершилась. Владелец подключения должен авторизовать аккаунт заново."
+            result_text = _max_send_failure_text(error, "⚠️ Сессия MAX завершилась. Владелец подключения должен авторизовать аккаунт заново.")
         elif "MAX_UPLOAD_CONTROL_NOT_FOUND" in str(error):
-            result_text = "⚠️ MAX не открыл загрузку этого типа файла. Попробуйте отправить его как документ или выберите другой формат."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не открыл загрузку этого типа файла. Попробуйте отправить его как документ или выберите другой формат.")
         elif "MAX_UPLOAD_NOT_READY" in str(error):
-            result_text = "⚠️ MAX не успел подготовить вложение. Проверьте чат MAX и попробуйте отправить файл ещё раз."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не успел подготовить вложение. Проверьте чат MAX и попробуйте отправить файл ещё раз.")
         elif "MAX_SEND_NOT_CONFIRMED" in str(error):
-            result_text = "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой."
+            result_text = _max_send_failure_text(error, "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой.")
     finally:
         with public_max_send_flow_lock:
             current = public_max_send_flows.get(flow_key)
             if current and current.get("nonce") == nonce:
                 public_max_send_flows.pop(flow_key, None)
-        try:
-            bot.edit_message_text(
-                result_text,
-                int(flow_key[0]),
-                int(preview_message_id),
-                reply_markup=result_keyboard,
-                **NO_PREVIEW,
-            )
-        except Exception:
-            pass
+        if result_text is not None:
+            try:
+                bot.edit_message_text(
+                    result_text,
+                    int(flow_key[0]),
+                    int(preview_message_id),
+                    reply_markup=result_keyboard,
+                    **NO_PREVIEW,
+                )
+            except Exception:
+                pass
 
 
 def _finish_public_max_send(flow_key, nonce, preview_message_id):
