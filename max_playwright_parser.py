@@ -4258,13 +4258,14 @@ def _resolve_contact_link_via_dialog(page, msg: dict, group_url: str, chat_id: i
         except Exception: pass
 
 def _detect_max_chat_source_type(page) -> str | None:
-    """Read only MAX's chat header signals; never classify from the user-provided URL."""
+    """Classify from MAX's visible chat signals, including a real group composer."""
     try:
-        header_text = page.evaluate("""() => {
+        signals = page.evaluate("""() => {
             const visible = el => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
-                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                    s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
             };
             const nodes = [...document.querySelectorAll('header,[role="banner"],[class*="header" i]')]
                 .filter(el => {
@@ -4283,16 +4284,44 @@ def _detect_max_chat_source_type(page) -> str | None:
                     if (label && label.length < 180) parts.push(label);
                 }
             }
-            return [...new Set(parts)].join(' | ').slice(0, 3000);
+            const composers = [...document.querySelectorAll(
+                'textarea,[contenteditable="true"],[role="textbox"]'
+            )].filter(el => {
+                if (!visible(el) || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                const r = el.getBoundingClientRect();
+                if (r.top < window.innerHeight * 0.58 || r.left < window.innerWidth * 0.20 ||
+                    r.width < 180 || r.height > 220) return false;
+                const label = [el.getAttribute('aria-label'), el.getAttribute('placeholder'),
+                    el.getAttribute('data-placeholder'), el.getAttribute('title')].filter(Boolean).join(' ');
+                return !/поиск|search|найти/i.test(label);
+            });
+            const composerLabels = composers.map(el => [
+                el.getAttribute('aria-label'), el.getAttribute('placeholder'),
+                el.getAttribute('data-placeholder'), el.getAttribute('title')
+            ].filter(Boolean).join(' ')).join(' | ');
+            return {
+                text: [...new Set(parts)].join(' | ').slice(0, 3000),
+                hasComposer: composers.length > 0,
+                composerLabels
+            };
         }""")
     except Exception:
         return None
-    text = re.sub(r"\s+", " ", str(header_text or "")).casefold()
+    if isinstance(signals, dict):
+        header_text = signals.get("text") or ""
+        has_composer = bool(signals.get("hasComposer"))
+        composer_labels = str(signals.get("composerLabels") or "")
+    else:
+        header_text = signals or ""
+        has_composer = False
+        composer_labels = ""
+    text = re.sub(r"\s+", " ", str(header_text)).casefold()
+    composer_text = re.sub(r"\s+", " ", composer_labels).casefold()
     channel_signal = bool(re.search(
         r"\b\d[\d\s.,]*\s*(?:подписчик\w*|subscribers?)\b|"
         r"\b(?:подписчик\w*|subscriber\w*|подписаться|subscribe)\b",
         text,
-    ))
+    )) or bool(re.search(r"комментар\w*|comment", composer_text))
     group_signal = bool(re.search(
         r"\b\d[\d\s.,]*\s*(?:участник\w*|участниц\w*|members?)\b|"
         r"\b(?:участник\w*|участниц\w*|member\w*)\b|\bпригласить участников\b",
@@ -4301,6 +4330,8 @@ def _detect_max_chat_source_type(page) -> str | None:
     if channel_signal and not group_signal:
         return "channel"
     if group_signal and not channel_signal:
+        return "group"
+    if has_composer:
         return "group"
     return None
 
@@ -7241,37 +7272,6 @@ def send_message_to_max(
         if detected_source_type == "channel":
             raise RuntimeError("MAX_SOURCE_IS_CHANNEL")
 
-        if upload_payload:
-            file_inputs = page.locator('input[type="file"]')
-            uploaded = False
-            for index in reversed(range(file_inputs.count())):
-                try:
-                    file_inputs.nth(index).set_input_files(upload_payload, timeout=5000)
-                    uploaded = True
-                    break
-                except Exception:
-                    continue
-            if not uploaded:
-                attach_buttons = page.get_by_role(
-                    "button", name=re.compile(r"прикреп|вложен|файл|медиа|attach|file|media", re.I)
-                )
-                for index in reversed(range(min(attach_buttons.count(), 12))):
-                    candidate = attach_buttons.nth(index)
-                    try:
-                        if not candidate.is_visible(timeout=200):
-                            continue
-                        with page.expect_file_chooser(timeout=1800) as chooser_info:
-                            candidate.click(timeout=1200)
-                        chooser_info.value.set_files(upload_payload, timeout=5000)
-                        uploaded = True
-                        break
-                    except Exception:
-                        continue
-            if not uploaded:
-                raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
-            # Wait for MAX to finish adding the selected file to its composer.
-            page.wait_for_timeout(900)
-
         composer_found = page.evaluate("""() => {
             const visible = el => {
                 const r = el.getBoundingClientRect();
@@ -7303,6 +7303,87 @@ def send_message_to_max(
             raise RuntimeError("MAX_COMPOSER_NOT_FOUND")
 
         composer = page.locator('[data-max-parser-send-composer="true"]').first
+        if upload_payload:
+            expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
+            uploaded = False
+
+            # Prefer the actual attachment control beside MAX's message composer.
+            # This avoids sending a file to an unrelated hidden input (for example,
+            # profile or chat search uploads) and then silently sending text only.
+            button_order = page.evaluate("""() => {
+                const visible = el => {
+                    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                        s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+                };
+                const composer = document.querySelector('[data-max-parser-send-composer="true"]');
+                if (!composer) return [];
+                const cr = composer.getBoundingClientRect();
+                const controls = [...document.querySelectorAll('button,[role="button"],[aria-label],[title]')];
+                return controls.map((el, index) => {
+                    if (!visible(el)) return null;
+                    const r = el.getBoundingClientRect();
+                    const label = [el.innerText, el.getAttribute('aria-label'), el.title,
+                        el.getAttribute('data-testid'), el.className].filter(Boolean).join(' ').toLowerCase();
+                    if (!/(attach|file|media|photo|image|upload|прикреп|влож|файл|медиа|фото|изображ|скрепк)/i.test(label)) {
+                        return null;
+                    }
+                    if (r.top < window.innerHeight * 0.45 || Math.abs(r.top - cr.top) > 180) return null;
+                    const distance = Math.abs((r.left + r.width / 2) - cr.left);
+                    return {index, score: 100 - Math.min(distance, 100) + (r.top > window.innerHeight * 0.68 ? 15 : 0)};
+                }).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 8).map(x => x.index);
+            }""")
+            attach_controls = page.locator('button,[role="button"],[aria-label],[title]')
+            for index in button_order:
+                try:
+                    candidate = attach_controls.nth(int(index))
+                    with page.expect_file_chooser(timeout=1800) as chooser_info:
+                        candidate.click(timeout=1200)
+                    chooser_info.value.set_files(upload_payload, timeout=8000)
+                    uploaded = True
+                    break
+                except Exception:
+                    continue
+
+            if not uploaded:
+                file_order = page.evaluate("""() => {
+                    const inputs = [...document.querySelectorAll('input[type="file"]')];
+                    const composer = document.querySelector('[data-max-parser-send-composer="true"]');
+                    if (!composer) return inputs.map((_, index) => index);
+                    const cr = composer.getBoundingClientRect();
+                    return inputs.map((el, index) => {
+                        const r = el.getBoundingClientRect();
+                        const accept = (el.getAttribute('accept') || '').toLowerCase();
+                        const meta = [el.getAttribute('aria-label'), el.title, el.className,
+                            el.getAttribute('data-testid')].filter(Boolean).join(' ').toLowerCase();
+                        let score = 0;
+                        if (/image|video|audio|application|\\*/.test(accept)) score += 35;
+                        if (/attach|file|media|photo|upload|влож|файл|медиа|фото/i.test(meta)) score += 45;
+                        if (r.top > window.innerHeight * 0.45) score += 12;
+                        if (Math.abs(r.top - cr.top) < 220) score += 20;
+                        const parent = el.closest('form,[class*="composer" i],[class*="message" i]');
+                        if (parent && parent.contains(composer)) score += 60;
+                        return {index, score};
+                    }).sort((a, b) => b.score - a.score).slice(0, 12).map(x => x.index);
+                }""")
+                file_inputs = page.locator('input[type="file"]')
+                for index in file_order:
+                    try:
+                        candidate = file_inputs.nth(int(index))
+                        candidate.set_input_files(upload_payload, timeout=8000)
+                        received_count = candidate.evaluate(
+                            "el => el.files ? el.files.length : 0", timeout=1000
+                        )
+                        if int(received_count or 0) == expected_count:
+                            uploaded = True
+                            break
+                    except Exception:
+                        continue
+            if not uploaded:
+                raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
+            # Let MAX finish rendering the selected file(s) in the composer.
+            page.wait_for_timeout(1200)
+
         # Fill in one operation to preserve Unicode and the exact order of characters.
         if str(text or "").strip():
             composer.fill(str(text), timeout=5000)
@@ -7322,11 +7403,26 @@ def send_message_to_max(
 
         send_buttons = page.get_by_role("button", name=re.compile(r"отправить|send", re.I))
         send_button = None
-        for index in reversed(range(send_buttons.count())):
-            candidate = send_buttons.nth(index)
-            if candidate.is_visible(timeout=250):
-                send_button = candidate
+        attempts = 32 if upload_payload else 1
+        for attempt in range(attempts):
+            for index in reversed(range(send_buttons.count())):
+                candidate = send_buttons.nth(index)
+                try:
+                    if candidate.is_visible(timeout=250) and candidate.is_enabled(timeout=250):
+                        send_button = candidate
+                        break
+                except Exception:
+                    continue
+            if send_button is not None:
                 break
+            if not upload_payload:
+                break
+            # MAX can keep the send control disabled while it is preparing a
+            # selected attachment. Do not fall back to Enter and accidentally
+            # send only the accompanying text.
+            page.wait_for_timeout(250)
+        if upload_payload and send_button is None:
+            raise RuntimeError("MAX_UPLOAD_NOT_READY")
         if on_before_send:
             on_before_send()
         if send_button is not None:
