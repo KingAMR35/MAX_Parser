@@ -672,6 +672,21 @@ def _poll_cache_key(chat_id: int, post: dict) -> str:
         source_id = hashlib.md5(stable.encode("utf-8")).hexdigest()
     return f"{int(chat_id)}:{source_id}"
 
+def _split_numbered_poll_choices(value: str) -> list[str]:
+    """Recover numbered choices when MAX exposes the whole list as one text node."""
+    text = str(value or "").strip()
+    markers = list(re.finditer(r"(?<!\S)(\d{1,2})[.)]?\s+", text))
+    if len(markers) < 3 or len(markers) > 30:
+        return []
+    numbers = [int(match.group(1)) for match in markers]
+    if numbers != list(range(1, len(numbers) + 1)):
+        return []
+    choices = [
+        text[match.start():markers[index + 1].start() if index + 1 < len(markers) else len(text)].strip()
+        for index, match in enumerate(markers)
+    ]
+    return choices if all(choices) else []
+
 def _format_poll_message(poll: dict, comment: str = "", is_closed: bool = False) -> str:
     question = str(poll.get("question") or "Опрос").strip()
     if re.match(r"^(?:poll ended|опрос заверш[её]н|total votes?|всего голосов?)\b", question, re.I):
@@ -710,9 +725,20 @@ def _format_poll_message(poll: dict, comment: str = "", is_closed: bool = False)
             label = result.group(1).strip()
             votes = max(votes, int(result.group(2)))
         label = re.sub(r"\s*[,;·|]?\s*\d+(?:[.,]\d+)?\s*%.*$", "", label).strip(" -–—.,;:")
+        inline_count = re.match(r"^(.*?)\s*:\s*(\d+)\s*$", label)
+        if inline_count:
+            label = inline_count.group(1).strip()
+            votes = max(votes, int(inline_count.group(2)))
         if not label or re.match(r"^(?:poll ended|опрос заверш[её]н|total votes?|всего голосов?)\b", label, re.I):
             continue
-        rows.append((label, votes))
+        numbered_choices = _split_numbered_poll_choices(label)
+        if numbered_choices:
+            rows.extend(
+                (choice, votes if index == len(numbered_choices) - 1 else 0)
+                for index, choice in enumerate(numbered_choices)
+            )
+        else:
+            rows.append((label, votes))
 
     # Some MAX builds flatten three zero-vote options into one text node.
     # Recover the observed single-word shape without splitting ordinary phrases.
@@ -1715,7 +1741,17 @@ def _process_posts(
         finally:
             _cleanup_post_media(post)
 
-    if new_count:
+    button_chat = get_chat_by_id(int(chat_id))
+    should_sync_button = bool(new_count)
+    if (
+        button_chat and not should_sync_button and button_chat.get("is_active")
+        and button_chat.get("max_source_type") in {"group", "private"}
+    ):
+        button_destination = int(button_chat.get("destination_chat_id") or chat_id)
+        latest_button_anchor = _latest_parser_send_anchor(int(chat_id), button_destination)
+        saved_button_anchor = int(button_chat.get("max_send_button_message_id") or 0)
+        should_sync_button = bool(latest_button_anchor and saved_button_anchor != int(latest_button_anchor))
+    if should_sync_button:
         try:
             _sync_max_send_button(
                 int(chat_id), destination_chat_id=destination_chat_id
@@ -6211,7 +6247,7 @@ def _remove_max_send_button(chat_id, preserve_anchor=False):
 def _public_max_send_button_keyboard(source_chat_id):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
-        "✉️ Отправить в MAX",
+        "✍️ Написать в MAX",
         callback_data=f"maxsend_start_{int(source_chat_id)}",
     ))
     return keyboard
@@ -6256,18 +6292,32 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
     keyboard = _public_max_send_button_keyboard(chat_id)
     if anchor_message_id:
         anchor_message_id = int(anchor_message_id)
-        if existing_id and int(existing_id) != anchor_message_id:
-            _clear_max_send_anchor(int(chat_id), destination_chat_id, int(existing_id))
         try:
             bot.edit_message_reply_markup(
                 destination_chat_id, anchor_message_id, reply_markup=keyboard
             )
+            if existing_id and int(existing_id) != anchor_message_id:
+                _clear_max_send_anchor(int(chat_id), destination_chat_id, int(existing_id))
             set_max_send_button_message_id(int(chat_id), anchor_message_id)
             return True
         except Exception as error:
             if existing_id and int(existing_id) == anchor_message_id and "message is not modified" in str(error).lower():
                 set_max_send_button_message_id(int(chat_id), anchor_message_id)
                 return True
+            if existing_id and int(existing_id) != anchor_message_id:
+                # Keep the previous working button until Telegram accepts the
+                # replacement. The next parse cycle retries because the saved
+                # anchor still differs from the latest parser message.
+                debug_logger.warning(
+                    "MAX_SEND_BUTTON_MOVE_FAILED chat_id=%s old_message_id=%s new_message_id=%s error=%s",
+                    chat_id, existing_id, anchor_message_id, log_preview(error, 180),
+                )
+                return False
+            debug_logger.warning(
+                "MAX_SEND_BUTTON_ATTACH_FAILED chat_id=%s message_id=%s error=%s",
+                chat_id, anchor_message_id, log_preview(error, 180),
+            )
+            return False
 
     if existing_id:
         existing_id = int(existing_id)

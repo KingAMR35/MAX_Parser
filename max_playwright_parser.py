@@ -3548,8 +3548,14 @@ def _refresh_emoji_texts(page, msg: dict, chat_id: int = 0) -> list[str]:
                 if(!/(emoji|эмодзи|animated.?emoji|custom.?emoji|emoticon|smiley)/i.test(meta) && !/^(img|canvas|video)$/i.test(el.tagName||'') && !el.hasAttribute?.('data-custom-emoji') && !el.hasAttribute?.('data-emoji-id') && !el.hasAttribute?.('data-emoji-name')) continue;
                 const attrs=['aria-label','alt','title','data-emoji','data-emoji-char','data-emoji-text','data-text','data-character','data-name','data-custom-emoji','data-emoji-name','data-emoji-alias'];
                 for(const a of attrs) add(el.getAttribute?.(a),nodeSeen);
-                for(const a of ['data-codepoint','data-codepoints','data-unicode','data-emoji-code','data-emoji-codepoint','data-code','data-custom-emoji']) cp(el.getAttribute?.(a),nodeSeen);
+                for(const a of ['data-codepoint','data-codepoints','data-unicode','data-emoji-code','data-emoji-codepoint','data-code','data-custom-emoji','data-emoji-id','data-emoji-name']) cp(el.getAttribute?.(a),nodeSeen);
                 add(el.textContent,nodeSeen);
+                for(const pseudo of ['::before','::after']){
+                    try{
+                        const pseudoText=String(getComputedStyle(el,pseudo).content||'').replace(/^["']|["']$/g,'');
+                        if(pseudoText&&pseudoText!=='none'&&pseudoText!=='normal')add(pseudoText,nodeSeen);
+                    }catch(e){}
+                }
                 try{cp(String(el.outerHTML||''),nodeSeen);}catch(e){}
             }
             return out;
@@ -5148,7 +5154,7 @@ def parse_max_group_media(
                 }
 
                 function getOwnContent(row) {
-                    const pollSelector = "[data-testid*='poll' i],[class*='poll' i],[data-type='poll'],[class*='survey' i]";
+                    const pollSelector = "[data-testid*='poll' i],[data-testid*='survey' i],[data-testid*='quiz' i],[class*='poll' i],[data-type*='poll' i],[class*='survey' i],[data-type*='survey' i],[class*='quiz' i],[data-poll],[data-poll-id],[aria-label*='poll' i],[aria-label*='опрос' i]";
                     try {
                         const bubble = row.querySelector(".bubbleContent");
                         if (!bubble) return {text:"", links:[], emojiTexts:[]};
@@ -5307,10 +5313,22 @@ def parse_max_group_media(
                                 const emeta = `${safeAttr(el,"class")} ${safeAttr(el,"data-type")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"title")} ${safeAttr(el,"data-custom-emoji")} ${safeAttr(el,"data-emoji-id")} ${safeAttr(el,"data-emoji-name")}`.toLowerCase();
                                 if (/sticker|стикер/.test(emeta)) return;
                                 add(safeAttr(el,"alt"),nodeSeen); add(safeAttr(el,"aria-label"),nodeSeen); add(safeAttr(el,"title"),nodeSeen);
-                                add(safeAttr(el,"data-emoji"),nodeSeen); add(safeAttr(el,"data-emoji-char"),nodeSeen); add(safeAttr(el,"data-emoji-text"),nodeSeen); add(safeAttr(el,"data-emoji-name"),nodeSeen); add(safeAttr(el,"data-emoji-alias"),nodeSeen); add(safeAttr(el,"data-custom-emoji"),nodeSeen); add(safeAttr(el,"data-text"),nodeSeen); addCodepoints(safeAttr(el,"data-codepoint"),nodeSeen); addCodepoints(safeAttr(el,"data-codepoints"),nodeSeen); addCodepoints(safeAttr(el,"data-unicode"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-code"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-codepoint"),nodeSeen); addCodepoints(safeAttr(el,"data-code"),nodeSeen); addCodepoints(safeAttr(el,"data-custom-emoji"),nodeSeen); add(el.textContent,nodeSeen);
+                                add(safeAttr(el,"data-emoji"),nodeSeen); add(safeAttr(el,"data-emoji-char"),nodeSeen); add(safeAttr(el,"data-emoji-text"),nodeSeen); add(safeAttr(el,"data-emoji-name"),nodeSeen); add(safeAttr(el,"data-emoji-alias"),nodeSeen); add(safeAttr(el,"data-custom-emoji"),nodeSeen); add(safeAttr(el,"data-text"),nodeSeen); addCodepoints(safeAttr(el,"data-codepoint"),nodeSeen); addCodepoints(safeAttr(el,"data-codepoints"),nodeSeen); addCodepoints(safeAttr(el,"data-unicode"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-code"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-codepoint"),nodeSeen); addCodepoints(safeAttr(el,"data-code"),nodeSeen); addCodepoints(safeAttr(el,"data-custom-emoji"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-id"),nodeSeen); addCodepoints(safeAttr(el,"data-emoji-name"),nodeSeen); add(el.textContent,nodeSeen);
+                                for (const pseudo of ["::before","::after"]) {
+                                    try {
+                                        const pseudoText=String(getComputedStyle(el,pseudo).content||"").replace(/^["']|["']$/g,"");
+                                        if (pseudoText&&pseudoText!=="none"&&pseudoText!=="normal") add(pseudoText,nodeSeen);
+                                    } catch(e) {}
+                                }
                                 const emeta2 = `${safeAttr(el,"class")} ${safeAttr(el,"data-type")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"role")} ${safeAttr(el,"data-name")} ${safeAttr(el,"data-icon")} ${safeAttr(el,"data-custom-emoji")} ${safeAttr(el,"data-emoji-id")} ${safeAttr(el,"data-emoji-name")}`.toLowerCase();
                                 if (/emoji|эмодзи|animated/.test(emeta2) || el.hasAttribute("data-custom-emoji") || el.hasAttribute("data-emoji-id") || el.hasAttribute("data-emoji-name")) {
                                     add(el.textContent,nodeSeen);
+                                    for (const pseudo of ["::before","::after"]) {
+                                        try {
+                                            const pseudoText=String(getComputedStyle(el,pseudo).content||"").replace(/^["']|["']$/g,"");
+                                            if (pseudoText&&pseudoText!=="none"&&pseudoText!=="normal") add(pseudoText,nodeSeen);
+                                        } catch(e) {}
+                                    }
                                     try {
                                         const html = String(el.outerHTML || "");
                                         add(html,nodeSeen);
@@ -5868,7 +5886,11 @@ def parse_max_group_media(
 
                     // Опрос. Название определяем отдельно от вариантов и служебных чисел MAX.
                     try {
-                        const poll = row.querySelector("[data-testid*='poll' i],[class*='poll' i],[data-type='poll'],[class*='survey' i]");
+                        const pollSelector = "[data-testid*='poll' i],[data-testid*='survey' i],[data-testid*='quiz' i],[class*='poll' i],[data-type*='poll' i],[class*='survey' i],[data-type*='survey' i],[class*='quiz' i],[data-poll],[data-poll-id],[aria-label*='poll' i],[aria-label*='опрос' i]";
+                        let poll = row.matches?.(pollSelector) ? row : row.querySelector(pollSelector);
+                        if (!poll && outerRow !== row) {
+                            poll = outerRow.matches?.(pollSelector) ? outerRow : outerRow.querySelector(pollSelector);
+                        }
                         if (poll) {
                             const cleanPollLine = s => clean(String(s || "")).replace(/^[⚪⚫▫•]+\s*/u, "").replace(/\s+/g, " ").trim();
                             const multiSelectMeta = /^(?:select one or multiple answers|select one or more answers|select multiple answers|выберите один или несколько (?:вариантов )?ответов)(?:\s*[:.]?\s*\d+)?$/i;
@@ -5896,9 +5918,9 @@ def parse_max_group_media(
                                 value = value.replace(/\s*[,;·|]?\s*\d+(?:[.,]\d+)?\s*%.*$/, "").trim();
                                 // Сначала явный формат "Название: 2" или "Название . 2 votes".
                                 let m = value.match(/^(.*?)\s*:\s*(\d+)\s*$/);
-                                if (votes == null && m) {
+                                if (m) {
                                     value = cleanPollLine(m[1]);
-                                    votes = Number(m[2]);
+                                    votes = Math.max(Number(votes) || 0, Number(m[2]));
                                 } else if (votes == null) {
                                     m = value.match(/^(.*?)[\s.,]+(\d+)\s*(?:votes?|голос(?:а|ов)?)$/i);
                                     if (m) {
@@ -5913,6 +5935,34 @@ def parse_max_group_media(
                                 value = value.replace(/[\s.,;:]+$/, "").trim();
                                 value = value.replace(/^\s*[-•▫]+\s*/, "").trim();
                                 if (!value || serviceOnly.test(value)) return;
+                                // Некоторые версии MAX отдают все варианты одной строкой:
+                                // "1 вариант 2 вариант ... 7 вариант: 0". Делим только
+                                // последовательную нумерацию от 1, чтобы не резать обычные фразы.
+                                const numberedPattern = /(?:^|\s)(\d{1,2})[.)]?\s+/g;
+                                const numberedMarkers = [];
+                                let numberedMatch;
+                                while ((numberedMatch = numberedPattern.exec(value)) !== null) {
+                                    numberedMarkers.push({
+                                        number:Number(numberedMatch[1]),
+                                        start:numberedMatch.index + numberedMatch[0].search(/\d/),
+                                    });
+                                }
+                                if (numberedMarkers.length >= 3 && numberedMarkers.length <= 30 &&
+                                    numberedMarkers.every((marker, index) => marker.number === index + 1)) {
+                                    numberedMarkers.forEach((marker, index) => {
+                                        const end = index + 1 < numberedMarkers.length ? numberedMarkers[index + 1].start : value.length;
+                                        const label = cleanPollLine(value.slice(marker.start, end)).replace(/[\s.,;:]+$/, "").trim();
+                                        if (!label) return;
+                                        const optionVotes = index === numberedMarkers.length - 1 && votes != null ? votes : 0;
+                                        const existing = options.find(x => String(x.text || "").toLowerCase() === label.toLowerCase());
+                                        if (!existing) options.push({text:label, votes:optionVotes, explicit:isExplicitOption});
+                                        else {
+                                            existing.votes = Math.max(Number(existing.votes) || 0, optionVotes);
+                                            existing.explicit = existing.explicit || isExplicitOption;
+                                        }
+                                    });
+                                    return;
+                                }
                                 const numberedAnswerSequence = value.match(/((?:(?:ответ|answer)\s+\d+)(?:\s+(?:ответ|answer)\s+\d+)+)$/i);
                                 if (numberedAnswerSequence) {
                                     const labels = numberedAnswerSequence[1].match(/(?:ответ|answer)\s+\d+/gi) || [];
@@ -5985,11 +6035,16 @@ def parse_max_group_media(
                                 safeAttr(el,"data-testid"), safeAttr(el,"aria-label"), safeAttr(el,"title")
                             ].join(" ")).join(" ");
                             // "Show results" is not a closed state; require an explicit end marker.
-                            const closedText = /(?:poll|survey)\s+(?:is\s+)?(?:closed|ended|finished)|(?:опрос\s+(?:закрыт|заверш[её]н)|голосование\s+(?:закрыто|завершено))/i
+                            const closedText = /(?:poll|survey)\s+(?:is\s+)?(?:closed|ended|finished|completed)|(?:опрос\s+(?:закрыт|заверш[её]н)|голосование\s+(?:закрыто|завершено))/i
                                 .test(`${rawPollText} ${outerRow.innerText || ""}`);
-                            const closedState = /(?:^|[\s_-])(?:closed|ended|finished|completed|закрыт|закрыто|заверш[её]н|завершено)(?:$|[\s_-])/i
+                            const closedState = /(?:^|[\s_-])(?:closed|ended|finished|completed|закрыт|закрыто|заверш[её]н|завершено)(?:$|[\s_-])|(?:is|poll)(?:closed|ended|finished|completed)/i
                                 .test(pollStateMetadata);
-                            const isClosed = closedText || closedState;
+                            const closedAttribute = pollStateNodes.some(el =>
+                                ["data-closed","data-ended","data-finished","data-completed"].some(attr =>
+                                    /^(?:true|1|yes)$/i.test(safeAttr(el, attr))
+                                )
+                            );
+                            const isClosed = closedText || closedState || closedAttribute;
                             const rawLines = rawPollText.split(/\n+/).map(cleanPollLine).filter(Boolean);
                             let aggregateVotes = null;
                             for (const line of rawLines) {
@@ -6343,7 +6398,7 @@ def parse_max_group_media(
                             } catch(e) { return false; }
                         });
                         const animatedEmojiHint = Array.from(bubble.querySelectorAll(
-                            "video,canvas,img,svg,[data-animated-emoji],[class*='emoji' i],[class*='animated' i],[data-custom-emoji],[data-emoji-id],[data-emoji-name]"
+                            "video,canvas,img,svg,[data-animated-emoji],[class*='emoji' i],[class*='animated' i],[data-custom-emoji],[data-emoji-id],[data-emoji-name],[data-emoji-code],[data-emoji-codepoint],[data-codepoint],[data-testid*='emoji' i],[data-type*='emoji' i],[aria-label*='emoji' i],[aria-label*='эмодзи' i]"
                         )).some(el => {
                             let meta = "";
                             let explicitAnimated = false;
@@ -6782,7 +6837,9 @@ def parse_max_group_media(
 
         human_posts = []
         for msg in all_messages:
-            if not (msg.get("emoji_texts") or "") and bool(msg.get("emoji_image_urls")):
+            if not (msg.get("emoji_texts") or "") and (
+                bool(msg.get("emoji_image_urls")) or bool(msg.get("animated_emoji_hint"))
+            ):
                 refreshed_emoji = _refresh_emoji_texts(page, msg, chat_id=chat_id)
                 if refreshed_emoji:
                     msg["emoji_texts"] = refreshed_emoji
@@ -7119,7 +7176,11 @@ def parse_max_group_media(
                         msg["_oversized_media"] = True
                     elif media and media.get("bytes"):
                         media_files.append(media)
-            if msg.get("animated_emoji_hint") and emoji_only:
+            if msg.get("animated_emoji_hint") and emoji_only and msg.get("emoji_texts"):
+                # MAX animates some standalone glyphs as media. Preserve their Unicode
+                # form so Telegram receives an ordinary emoji instead of a video/sticker.
+                msg["text"] = "".join(str(value) for value in msg.get("emoji_texts") or [])
+            elif msg.get("animated_emoji_hint") and emoji_only:
                 has_animation_payload = any(media.get("type") in {"video", "animation"} for media in media_files)
                 can_replace_still = not media_files or (
                     len(media_files) == 1 and media_files[0].get("type") in {"image", "sticker"}
