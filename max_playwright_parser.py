@@ -4331,6 +4331,12 @@ def _detect_max_chat_source_type(page) -> str | None:
         return "channel"
     if group_signal and not channel_signal:
         return "group"
+    direct_signal = bool(re.search(
+        r"\b(?:в сети|был(?:а|\(а\))? в сети|был(?:а|\(а\))? недавно|last seen|online)\b",
+        text,
+    ))
+    if direct_signal:
+        return "private"
     if has_composer:
         return "group"
     return None

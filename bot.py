@@ -1745,7 +1745,7 @@ def _get_payable_active_chats():
 
 
 def _update_detected_source_type(chat_id, source_type):
-    if source_type not in {"group", "channel"}:
+    if source_type not in {"group", "channel", "private"}:
         return
     try:
         chat = get_chat_by_id(int(chat_id))
@@ -5719,6 +5719,10 @@ def _start_admin_max_send(call, source_chat_id):
     except Exception:
         pass
     nonce = uuid.uuid4().hex[:8]
+    is_private_source = (
+        chat.get("max_source_type") == "private"
+        and bool(chat.get("max_source_type_verified"))
+    )
     with admin_max_send_flow_lock:
         current = admin_max_send_flows.get(admin_id)
         if current and current.get("stage") == "sending":
@@ -5727,11 +5731,14 @@ def _start_admin_max_send(call, source_chat_id):
         admin_max_send_flows[admin_id] = {
             "source_chat_id": source_chat_id,
             "nonce": nonce,
-            "stage": "name",
+            "stage": "body" if is_private_source else "name",
+            "sender_name": "",
             "expires_at": time.time() + 15 * 60,
         }
     bot.answer_callback_query(call.id)
-    _admin_max_send_prompt(admin_id, source_chat_id, nonce, "name")
+    _admin_max_send_prompt(
+        admin_id, source_chat_id, nonce, "body" if is_private_source else "name"
+    )
 
 
 def _admin_may_send_through_chat(chat):
@@ -5803,7 +5810,7 @@ def _admin_max_send_prompt(admin_id, source_chat_id, nonce, stage):
     prompt_text = (
         f"👤 Кто отправляет сообщение в MAX «{escape_html(chat.get('title') or 'Чат')}»?"
         if stage == "name" else
-        "✍️ Напишите текст сообщения для MAX."
+        "✍️ Отправьте текст, фото, видео, кружок, голосовое, стикер, файл, геопозицию или опрос для MAX."
     )
     prompt = bot.send_message(
         admin_id,
@@ -5857,18 +5864,44 @@ def _receive_admin_max_body(message, source_chat_id, nonce):
     flow = _valid_admin_max_input(message, source_chat_id, nonce, "body")
     if not flow:
         return
-    value = str(message.text or "").strip()
-    if not value or value.startswith("/") or len(value) > 3500:
-        bot.send_message(message.chat.id, "Введите текст длиной до 3500 символов.", **NO_PREVIEW)
+    payload = _public_max_input(message)
+    if not payload:
+        bot.send_message(
+            message.chat.id,
+            "Этот тип сообщения пока нельзя отправить в MAX. Пришлите текст, фото, видео, кружок, голосовое, стикер или файл.",
+            **NO_PREVIEW,
+        )
+        _admin_max_send_prompt(ADMIN_ID, source_chat_id, nonce, "body")
+        return
+    value = str(payload.get("body") or "").strip()
+    media = payload.get("media")
+    if (
+        (not value and not media)
+        or (message.content_type == "text" and value.startswith("/"))
+        or len(value) > 3500
+    ):
+        bot.send_message(
+            message.chat.id,
+            "Отправьте текст до 3500 символов или прикрепите медиафайл.",
+            **NO_PREVIEW,
+        )
         _admin_max_send_prompt(ADMIN_ID, source_chat_id, nonce, "body")
         return
     flow["body"] = value
+    flow["media"] = media
+    flow["payload_label"] = payload.get("label") or "Текст"
     flow["stage"] = "confirm"
     flow["expires_at"] = time.time() + 15 * 60
     chat = get_chat_by_id(source_chat_id) or {}
+    body_preview = escape_html(value) if value else f"<i>{escape_html(flow['payload_label'])}</i>"
+    sender_preview = (
+        f"<b>{escape_html(flow['sender_name'])}</b>\n\n"
+        if str(flow.get("sender_name") or "").strip()
+        else ""
+    )
     preview = (
         f"Проверьте сообщение для MAX «{escape_html(chat.get('title') or 'Чат')}»:\n\n"
-        f"<b>{escape_html(flow['sender_name'])}</b>\n\n{escape_html(value)}"
+        f"{sender_preview}{body_preview}"
     )
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.row(
@@ -5892,6 +5925,7 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 return
             name = str(flow.get("sender_name") or "").strip()
             body = str(flow.get("body") or "").strip()
+            media = flow.get("media") or None
         chat = get_chat_by_id(int(source_chat_id))
         if (
             not _admin_may_send_through_chat(chat)
@@ -5899,16 +5933,46 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             or not chat.get("max_url")
         ):
             raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
+        if media:
+            media_items = media if isinstance(media, list) else [media]
+            downloaded_items = []
+            total_size = 0
+            for item in media_items[:10]:
+                item = dict(item)
+                telegram_file = bot.get_file(item["file_id"])
+                if _is_public_max_file_oversize(getattr(telegram_file, "file_size", None)):
+                    raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
+                file_bytes = bot.download_file(telegram_file.file_path)
+                total_size += len(file_bytes)
+                if total_size > 20 * 1024 * 1024:
+                    raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
+                item["bytes"] = file_bytes
+                downloaded_items.append(item)
+            media = downloaded_items
+            if len(media) == 1:
+                media = media[0]
         source_lock = max_send_source_locks.setdefault(int(source_chat_id), threading.Lock())
-        message_text = f"{name}\n\n{body}"
-        fingerprint = _max_outbound_fingerprint(message_text)
+        message_text = f"{name}\n\n{body}".strip()
+        fingerprints = {
+            value for value in (
+                _max_outbound_fingerprint(message_text),
+                _max_outbound_fingerprint(body),
+                _max_outbound_fingerprint(name),
+            ) if value
+        }
+        media_items_for_hash = media if isinstance(media, list) else ([media] if media else [])
+        for item in media_items_for_hash:
+            raw_bytes = item.get("bytes") if isinstance(item, dict) else None
+            if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+                fingerprints.add(f"media:{get_media_hash(data=raw_bytes)}")
 
         def remember_outbound_echo():
-            if not fingerprint:
+            if not fingerprints:
                 return
             for candidate in get_all_chats():
                 if candidate.get("max_url") == chat.get("max_url"):
-                    _remember_max_outbound_echo(int(candidate["chat_id"]), fingerprint)
+                    for fingerprint in fingerprints:
+                        _remember_max_outbound_echo(int(candidate["chat_id"]), fingerprint)
 
         with source_lock:
             send_message_to_max(
@@ -5917,6 +5981,7 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 chat_id=int(source_chat_id),
                 session_path=_session_path_for_chat(chat),
                 on_before_send=remember_outbound_echo,
+                media=media,
             )
         result_text = "✅ Сообщение отправлено в MAX."
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
@@ -5927,6 +5992,12 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
         )
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             result_text = "⚠️ Сессия MAX завершилась. Подключите аккаунт заново."
+        elif "TELEGRAM_FILE_TOO_LARGE" in str(error):
+            result_text = "⚠️ Файл больше 20 МБ. Отправьте файл поменьше."
+        elif "MAX_UPLOAD_CONTROL_NOT_FOUND" in str(error):
+            result_text = "⚠️ MAX не открыл загрузку этого типа файла. Попробуйте другой формат."
+        elif "MAX_UPLOAD_NOT_READY" in str(error):
+            result_text = "⚠️ MAX не успел подготовить вложение. Попробуйте отправить файл ещё раз."
         elif "MAX_SEND_NOT_CONFIRMED" in str(error):
             result_text = "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой."
     finally:
@@ -6052,7 +6123,7 @@ def _max_send_button_is_eligible(chat):
         not chat
         or not chat.get("is_active")
         or not chat.get("max_url")
-        or chat.get("max_source_type") != "group"
+        or chat.get("max_source_type") not in {"group", "private"}
         or not bool(chat.get("max_source_type_verified"))
         or chat.get("destination_type") == "private"
         or not os.path.exists(_session_path_for_chat(chat))
@@ -6183,7 +6254,7 @@ def _start_public_max_send(call, source_chat_id):
         _remove_max_send_button(source_chat_id)
         bot.answer_callback_query(
             call.id,
-            "Отправка доступна только в подключённой MAX-группе.",
+            "Отправка доступна только в подключённом чате MAX.",
             show_alert=True,
         )
         return
@@ -6192,6 +6263,11 @@ def _start_public_max_send(call, source_chat_id):
         return
     flow_key = (destination_chat_id, int(user.id))
     nonce = uuid.uuid4().hex[:10]
+    is_private_source = (
+        chat.get("max_source_type") == "private"
+        and bool(chat.get("max_source_type_verified"))
+    )
+    initial_stage = "body" if is_private_source else "name"
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if current and float(current.get("expires_at") or 0) > time.time():
@@ -6202,14 +6278,19 @@ def _start_public_max_send(call, source_chat_id):
             "destination_chat_id": destination_chat_id,
             "user_id": int(user.id),
             "nonce": nonce,
-            "stage": "name",
+            "stage": initial_stage,
+            "sender_name": "",
             "expires_at": time.time() + 15 * 60,
         }
     bot.answer_callback_query(call.id)
     try:
         prompt = bot.send_message(
             destination_chat_id,
-            "👤 Кто отправляет сообщение? Ответьте на это сообщение своим именем.",
+            (
+                "💬 Отправьте сообщение для этого личного чата MAX."
+                if is_private_source
+                else "👤 Кто отправляет сообщение? Ответьте на это сообщение своим именем."
+            ),
             reply_to_message_id=int(call.message.message_id),
             reply_markup=_public_max_send_keyboard(nonce),
             **NO_PREVIEW,
@@ -7181,7 +7262,7 @@ def _verify_project_chat_access(
                 report("Проверка остановлена: подключение было удалено или изменено.")
                 return False
             toggle_chat(chat_id, True)
-            if detected_source_type in {"group", "channel"}:
+            if detected_source_type in {"group", "channel", "private"}:
                 update_chat_source_type(chat_id, detected_source_type, verified=True)
             current = get_chat_by_id(chat_id)
             if not current or not current.get("is_active"):
