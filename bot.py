@@ -5987,7 +5987,9 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
                 fingerprints.add(f"media:{get_media_hash(data=raw_bytes)}")
 
-        def remember_outbound_echo():
+        def remember_outbound_echo(normalized_media_hashes=None):
+            for media_hash in normalized_media_hashes or []:
+                fingerprints.add(f"media:{media_hash}")
             if not fingerprints:
                 return
             for candidate in get_all_chats():
@@ -6008,11 +6010,13 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
     except Exception as error:
         debug_logger.warning(
-            "ADMIN_MAX_MESSAGE_SEND_FAILED source_chat_id=%s error_type=%s",
-            source_chat_id, type(error).__name__,
+            "ADMIN_MAX_MESSAGE_SEND_FAILED source_chat_id=%s error_type=%s error=%s",
+            source_chat_id, type(error).__name__, log_preview(error, 220),
         )
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             result_text = "⚠️ Сессия MAX завершилась. Подключите аккаунт заново."
+        elif "MAX_PHOTO_UPLOAD_FAILED" in str(error):
+            result_text = "⚠️ MAX не принял фотографию. Попробуйте отправить её как файл или уменьшите размер."
         elif "TELEGRAM_FILE_TOO_LARGE" in str(error):
             result_text = "⚠️ Файл больше 20 МБ. Отправьте файл поменьше."
         elif "MAX_UPLOAD_CONTROL_NOT_FOUND" in str(error):
@@ -6324,7 +6328,7 @@ def _public_max_input(message):
         photo = max(photos, key=lambda item: int(getattr(item, "file_size", 0) or 0)) if any(
             getattr(item, "file_size", None) for item in photos
         ) else photos[-1]
-        media = {"file_id": photo.file_id, "filename": "photo.jpg", "mime_type": "image/jpeg"}
+        media = {"file_id": photo.file_id, "filename": "photo.jpg", "mime_type": "image/jpeg", "kind": "photo"}
         label = "Фото"
     elif content_type in {"video", "video_note", "animation"}:
         item = getattr(message, content_type, None)
@@ -6526,7 +6530,9 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
                 fingerprints.add(f"media:{get_media_hash(data=raw_bytes)}")
 
-        def remember_outbound_echo():
+        def remember_outbound_echo(normalized_media_hashes=None):
+            for media_hash in normalized_media_hashes or []:
+                fingerprints.add(f"media:{media_hash}")
             for candidate in get_all_chats():
                 if candidate.get("max_url") == chat.get("max_url"):
                     for fingerprint in fingerprints:
@@ -6546,11 +6552,13 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
         result_text = "✅ Сообщение отправлено в MAX."
     except Exception as error:
         debug_logger.warning(
-            "PUBLIC_MAX_SEND_FAILED user_chat=%s error_type=%s",
-            flow_key, type(error).__name__,
+            "PUBLIC_MAX_SEND_FAILED user_chat=%s error_type=%s error=%s",
+            flow_key, type(error).__name__, log_preview(error, 220),
         )
         if "MAX_SOURCE_IS_CHANNEL" in str(error):
             result_text = "⚠️ Это канал MAX. Отправлять туда сообщения нельзя; кнопка для этого источника скрыта."
+        elif "MAX_PHOTO_UPLOAD_FAILED" in str(error):
+            result_text = "⚠️ MAX не принял фотографию. Попробуйте отправить её как файл или уменьшите размер."
         elif "TELEGRAM_FILE_TOO_LARGE" in str(error):
             result_text = "⚠️ Файл больше 20 МБ. Отправьте файл поменьше."
         elif "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):

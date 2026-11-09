@@ -7321,6 +7321,46 @@ def parse_max_group_media(
             pass
 
 
+def _normalize_max_photo_upload(item: dict, chat_id: int) -> dict:
+    """Re-encode Telegram's photo variant as a plain JPEG/PNG for MAX's uploader."""
+    raw = item.get("bytes")
+    if not isinstance(raw, (bytes, bytearray)) or not raw:
+        return item
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(io.BytesIO(bytes(raw))) as opened:
+            if max(opened.size or (0, 0)) > 20000:
+                raise ValueError("image dimensions exceed safe upload limit")
+            opened.load()
+            image = ImageOps.exif_transpose(opened)
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+            image.thumbnail((4096, 4096), resampling)
+            has_alpha = "A" in image.getbands() or "transparency" in image.info
+            output = io.BytesIO()
+            if has_alpha:
+                image.convert("RGBA").save(output, format="PNG", optimize=True)
+                item["filename"] = "photo.png"
+                item["mime_type"] = "image/png"
+            else:
+                image.convert("RGB").save(
+                    output, format="JPEG", quality=92, optimize=True, progressive=False
+                )
+                item["filename"] = "photo.jpg"
+                item["mime_type"] = "image/jpeg"
+            item["bytes"] = output.getvalue()
+        debug_logger.info(
+            "MAX_PHOTO_NORMALIZED chat_id=%s bytes_before=%s bytes_after=%s type=%s",
+            chat_id, len(raw), len(item["bytes"]), item["mime_type"],
+        )
+    except Exception as error:
+        # Keep the original if Pillow cannot decode an uncommon but valid image.
+        debug_logger.warning(
+            "MAX_PHOTO_NORMALIZE_SKIPPED chat_id=%s error_type=%s detail=%s",
+            chat_id, type(error).__name__, log_preview(error, 160),
+        )
+    return item
+
+
 def send_message_to_max(
     group_url: str,
     text: str,
@@ -7337,18 +7377,28 @@ def send_message_to_max(
     if not str(group_url or "").strip() or (not str(text or "").strip() and not media):
         raise ValueError("MAX_URL_OR_MESSAGE_EMPTY")
     upload_payload = None
+    has_photo_upload = False
+    normalized_media_hashes = []
     if media:
         media_items = media if isinstance(media, (list, tuple)) else [media]
         upload_payload = []
         for item in media_items:
+            item = dict(item)
             raw_data = item.get("bytes")
             if not isinstance(raw_data, (bytes, bytearray)) or not raw_data:
                 raise ValueError("MAX_MEDIA_EMPTY")
+            if item.get("kind") == "photo":
+                item = _normalize_max_photo_upload(item, int(chat_id))
+                raw_data = item.get("bytes")
+                has_photo_upload = True
+                if len(raw_data) > 20 * 1024 * 1024:
+                    raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
             upload_payload.append({
                 "name": str(item.get("filename") or "attachment.bin")[:180],
                 "mimeType": str(item.get("mime_type") or "application/octet-stream")[:120],
                 "buffer": bytes(raw_data),
             })
+            normalized_media_hashes.append(get_media_hash(data=raw_data))
         if len(upload_payload) == 1:
             upload_payload = upload_payload[0]
 
@@ -7425,6 +7475,23 @@ def send_message_to_max(
             raise RuntimeError("MAX_COMPOSER_NOT_FOUND")
 
         composer = page.locator('[data-max-parser-send-composer="true"]').first
+
+        def photo_upload_failed():
+            if not has_photo_upload:
+                return False
+            try:
+                return bool(page.evaluate("""() => {
+                    const pattern = /не получилось отправить (?:фотографию|фото)|не удалось отправить (?:фотографию|фото)|could not send (?:the )?(?:photo|image)|failed to upload (?:the )?(?:photo|image)/i;
+                    const selectors = '[role="alert"],[aria-live],[class*="toast" i],[class*="notification" i],[class*="error" i]';
+                    return [...document.querySelectorAll(selectors)].some(el => {
+                        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                        if (!r.width || !r.height || s.display === 'none' || s.visibility === 'hidden') return false;
+                        return pattern.test(String(el.innerText || el.textContent || '').trim());
+                    });
+                }"""))
+            except Exception:
+                return False
+
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
             uploaded = False
@@ -7504,7 +7571,9 @@ def send_message_to_max(
             if not uploaded:
                 raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
             # Let MAX finish rendering the selected file(s) in the composer.
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(2200)
+            if photo_upload_failed():
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
 
         # Fill in one operation to preserve Unicode and the exact order of characters.
         if str(text or "").strip():
@@ -7527,6 +7596,8 @@ def send_message_to_max(
         send_button = None
         attempts = 32 if upload_payload else 1
         for attempt in range(attempts):
+            if photo_upload_failed():
+                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
             for index in reversed(range(send_buttons.count())):
                 candidate = send_buttons.nth(index)
                 try:
@@ -7546,7 +7617,7 @@ def send_message_to_max(
         if upload_payload and send_button is None:
             raise RuntimeError("MAX_UPLOAD_NOT_READY")
         if on_before_send:
-            on_before_send()
+            on_before_send(normalized_media_hashes)
         if send_button is not None:
             send_button.click(timeout=2500)
         else:
@@ -7560,8 +7631,14 @@ def send_message_to_max(
             except Exception:
                 remaining = ""
             if not str(remaining or "").strip():
+                if has_photo_upload:
+                    page.wait_for_timeout(1200)
+                if photo_upload_failed():
+                    raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
                 return
             page.wait_for_timeout(250)
+        if photo_upload_failed():
+            raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED")
         raise RuntimeError("MAX_SEND_NOT_CONFIRMED")
     except Exception as error:
         if isinstance(error, RuntimeError):
