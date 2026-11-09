@@ -2677,7 +2677,14 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0, media_kind: str
             const text=meta.join(' ').toLowerCase();
             const tag=String(el.tagName||'').toLowerCase();
             const sticker=/sticker|стикер/.test(text);
-            const emoji=/(?:^|[ _:-])emoji(?:[ _:-]|$)|animated.?emoji|custom.?emoji|эмодзи|emoticon|smiley/.test(text) || /\\p{Extended_Pictographic}/u.test(text);
+            const hasEmojiGlyph=value=>Array.from(String(value||'')).some(char=>{
+                const cp=char.codePointAt(0);
+                return (cp>=0x1F000&&cp<=0x1FAFF)||(cp>=0x2600&&cp<=0x27BF)||
+                    (cp>=0x2194&&cp<=0x21FF)||(cp>=0x2300&&cp<=0x23FF)||
+                    cp===0x00A9||cp===0x00AE||cp===0x203C||cp===0x2049||cp===0x2122||cp===0x2139||
+                    cp===0x24C2||cp===0x3030||cp===0x303D||cp===0x3297||cp===0x3299;
+            });
+            const emoji=/(?:^|[ _:-])emoji(?:[ _:-]|$)|animated.?emoji|custom.?emoji|эмодзи|emoticon|smiley/.test(text) || hasEmojiGlyph(text);
             let duration=tag==='video' && Number.isFinite(el.duration) ? el.duration : 0;
             let animated=['video','canvas'].includes(tag) || /animated|lottie|data-custom-emoji|data-emoji-id/.test(text);
             try {
@@ -3405,7 +3412,13 @@ def _refresh_card_image_urls(page, msg: dict, chat_id: int = 0) -> list[str]:
             const meta=[el.className||'',el.getAttribute?.('data-testid')||'',el.getAttribute?.('aria-label')||'',el.getAttribute?.('alt')||'',el.getAttribute?.('title')||'',el.getAttribute?.('data-type')||'',el.parentElement?.className||''].join(' ').toLowerCase();
             const onlyEmojiLabel=value=>{
                 const text=String(value||'').trim();
-                return Boolean(text&&/[\p{Extended_Pictographic}\p{Regional_Indicator}]/u.test(text)&&/^[\s\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}\uFE0E\uFE0F\u200D\u20E3#*0-9]+$/u.test(text));
+                const chars=Array.from(text);
+                const emojiPoint=cp=>(cp>=0x1F000&&cp<=0x1FAFF)||(cp>=0x2600&&cp<=0x27BF)||(cp>=0x2194&&cp<=0x21FF)||(cp>=0x2300&&cp<=0x23FF)||(cp>=0x2B00&&cp<=0x2BFF)||(cp>=0x1F1E6&&cp<=0x1F1FF)||[0x00A9,0x00AE,0x203C,0x2049,0x2122,0x2139,0x24C2,0x3030,0x303D,0x3297,0x3299].includes(cp);
+                const allowed=chars.every(char=>{
+                    const cp=char.codePointAt(0);
+                    return /\s/.test(char)||emojiPoint(cp)||(cp>=0x30&&cp<=0x39)||cp===0x23||cp===0x2A||cp===0xFE0E||cp===0xFE0F||cp===0x200D||cp===0x20E3||(cp>=0x1F3FB&&cp<=0x1F3FF);
+                });
+                return Boolean(text&&allowed&&chars.some(char=>emojiPoint(char.codePointAt(0))));
             };
             let emoji=false, sticker=false, node=el;
             for(let depth=0;node&&depth<8;depth++,node=node.parentElement){
@@ -3495,10 +3508,29 @@ def _refresh_emoji_texts(page, msg: dict, chat_id: int = 0) -> list[str]:
             pass
         values = card.evaluate("""card => {
             const out=[];
+            const emojiPoint=cp=>(cp>=0x1F000&&cp<=0x1FAFF)||(cp>=0x2600&&cp<=0x27BF)||(cp>=0x2194&&cp<=0x21FF)||(cp>=0x2300&&cp<=0x23FF)||(cp>=0x2B00&&cp<=0x2BFF)||(cp>=0x1F1E6&&cp<=0x1F1FF)||[0x00A9,0x00AE,0x203C,0x2049,0x2122,0x2139,0x24C2,0x3030,0x303D,0x3297,0x3299].includes(cp);
+            const emojiClusters=value=>{
+                const chars=Array.from(String(value||'')); const found=[];
+                for(let i=0;i<chars.length;){
+                    let cp=chars[i].codePointAt(0);
+                    if((cp>=0x30&&cp<=0x39)||cp===0x23||cp===0x2A){
+                        let j=i+1; if(chars[j]?.codePointAt(0)===0xFE0F)j++;
+                        if(chars[j]?.codePointAt(0)===0x20E3){found.push(chars.slice(i,j+1).join(''));i=j+1;continue;}
+                    }
+                    if(cp>=0x1F1E6&&cp<=0x1F1FF){let cluster=chars[i++];if(chars[i]&&chars[i].codePointAt(0)>=0x1F1E6&&chars[i].codePointAt(0)<=0x1F1FF)cluster+=chars[i++];found.push(cluster);continue;}
+                    if(!emojiPoint(cp)){i++;continue;}
+                    let cluster=chars[i++];
+                    const consumeModifiers=()=>{while(i<chars.length){const next=chars[i].codePointAt(0);if(next===0xFE0E||next===0xFE0F||(next>=0x1F3FB&&next<=0x1F3FF)){cluster+=chars[i++];}else break;}};
+                    consumeModifiers();
+                    while(i<chars.length&&chars[i].codePointAt(0)===0x200D){cluster+=chars[i++];if(i<chars.length){cluster+=chars[i++];consumeModifiers();}}
+                    while(i<chars.length&&chars[i].codePointAt(0)>=0xE0020&&chars[i].codePointAt(0)<=0xE007F)cluster+=chars[i++];
+                    found.push(cluster);
+                }
+                return found;
+            };
             const add=(s,nodeSeen)=>{
                 s=String(s||'').trim(); if(!s) return;
-                let ms=[]; try{ms=s.match(/[\\p{Extended_Pictographic}](?:\\uFE0F|\\u200D[\\p{Extended_Pictographic}])*/gu)||[];}catch(e){}
-                for(const x of ms){if(!nodeSeen.has(x)){nodeSeen.add(x);out.push(x);}}
+                for(const x of emojiClusters(s)){if(!nodeSeen.has(x)){nodeSeen.add(x);out.push(x);}}
             };
             const cp=(s,nodeSeen)=>{
                 const raw=String(s||'');
@@ -5021,20 +5053,50 @@ def parse_max_group_media(
                 function emojiClusters(value) {
                     const text = String(value || "");
                     const matches = [];
+                    const emojiPoint = cp => (cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x2194 && cp <= 0x21FF) || (cp >= 0x2300 && cp <= 0x23FF) || (cp >= 0x2B00 && cp <= 0x2BFF) || (cp >= 0x1F1E6 && cp <= 0x1F1FF) || [0x00A9,0x00AE,0x203C,0x2049,0x2122,0x2139,0x24C2,0x3030,0x303D,0x3297,0x3299].includes(cp);
                     try {
                         if (typeof Intl !== "undefined" && Intl.Segmenter) {
                             const segmenter = new Intl.Segmenter(undefined, {granularity:"grapheme"});
                             for (const part of segmenter.segment(text)) {
-                                if (/[\p{Extended_Pictographic}\p{Regional_Indicator}]/u.test(part.segment) || /[#*0-9]\uFE0F?\u20E3/u.test(part.segment)) {
+                                if (Array.from(part.segment).some(char => emojiPoint(char.codePointAt(0))) || /[#*0-9]\uFE0F?\u20E3/.test(part.segment)) {
                                     matches.push(part.segment);
                                 }
                             }
                             return matches;
                         }
                     } catch(e) {}
-                    try {
-                        return text.match(/(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier}|\u200D\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?)*)/gu) || [];
-                    } catch(e) { return []; }
+                    const chars = Array.from(text);
+                    for (let i = 0; i < chars.length;) {
+                        const cp = chars[i].codePointAt(0);
+                        if ((cp >= 0x30 && cp <= 0x39) || cp === 0x23 || cp === 0x2A) {
+                            let j = i + 1;
+                            if (chars[j]?.codePointAt(0) === 0xFE0F) j++;
+                            if (chars[j]?.codePointAt(0) === 0x20E3) { matches.push(chars.slice(i, j + 1).join("")); i = j + 1; continue; }
+                        }
+                        if (cp >= 0x1F1E6 && cp <= 0x1F1FF) {
+                            let flag = chars[i++];
+                            const next = chars[i]?.codePointAt(0);
+                            if (next >= 0x1F1E6 && next <= 0x1F1FF) flag += chars[i++];
+                            matches.push(flag); continue;
+                        }
+                        if (!emojiPoint(cp)) { i++; continue; }
+                        let cluster = chars[i++];
+                        const consumeModifiers = () => {
+                            while (i < chars.length) {
+                                const next = chars[i].codePointAt(0);
+                                if (next === 0xFE0E || next === 0xFE0F || (next >= 0x1F3FB && next <= 0x1F3FF)) cluster += chars[i++];
+                                else break;
+                            }
+                        };
+                        consumeModifiers();
+                        while (i < chars.length && chars[i].codePointAt(0) === 0x200D) {
+                            cluster += chars[i++];
+                            if (i < chars.length) { cluster += chars[i++]; consumeModifiers(); }
+                        }
+                        while (i < chars.length && chars[i].codePointAt(0) >= 0xE0020 && chars[i].codePointAt(0) <= 0xE007F) cluster += chars[i++];
+                        matches.push(cluster);
+                    }
+                    return matches;
                 }
 
                 function cleanMessageText(value) {
@@ -5905,7 +5967,7 @@ def parse_max_group_media(
                                 if (!ownText) return false;
                                 const semanticOption = node.matches("[data-option],[class*='option' i],[class*='answer' i],[data-testid*='option' i],[role='radio'],[role='option']");
                                 if (isPollMetaLine(ownText) || (!semanticOption && /^\d+(?:\s+(?:votes?|голос(?:а|ов)?))?$/i.test(ownText))) return false;
-                                if (!semanticOption && !/[\p{L}\p{Extended_Pictographic}]/u.test(ownText)) return false;
+                                if (!semanticOption && !/[^\s\d]/.test(ownText)) return false;
                                 // Prefer the innermost option node when MAX nests label spans
                                 // inside a clickable answer; this avoids parsing the same row twice.
                                 return !Array.from(node.querySelectorAll(optionSelector)).some(child =>
@@ -6292,7 +6354,7 @@ def parse_max_group_media(
                                 }
                                 if (["data-animated-emoji","data-custom-emoji","data-emoji-id"].some(attr => node.hasAttribute?.(attr)) || /animated.?emoji|lottie/i.test(String(node.className||"") + " " + safeAttr(node,"data-testid"))) explicitAnimated = true;
                             }
-                            const glyphEmoji = /\\p{Extended_Pictographic}/u.test(meta);
+                            const glyphEmoji = emojiClusters(meta).length > 0;
                             if (/sticker|стикер/i.test(meta) || (!/emoji|эмодзи|emoticon|smiley/i.test(meta) && !glyphEmoji)) return false;
                             const tag = String(el.tagName||"").toLowerCase();
                             let src = String(el.currentSrc||el.src||safeAttr(el,"src")||safeAttr(el,"data-src")||safeAttr(el,"data-animation-url")||"");
@@ -7413,6 +7475,7 @@ def send_message_to_max(
     on_before_send=None,
     media: dict = None,
     source_type_callback=None,
+    bold_first_line: bool = True,
 ) -> None:
     """Send one user-approved text or single attachment through the authenticated MAX UI."""
     session_file = session_path or f"{SESSIONS_DIR}/{chat_id}.json"
@@ -7644,7 +7707,7 @@ def send_message_to_max(
             supports_rich_text = bool(composer.evaluate("el => el.isContentEditable"))
         except Exception:
             supports_rich_text = False
-        if supports_rich_text:
+        if supports_rich_text and bold_first_line:
             try:
                 composer.press("Control+Home", timeout=1500)
                 composer.press("Shift+End", timeout=1500)

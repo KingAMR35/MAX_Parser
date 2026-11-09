@@ -5973,6 +5973,40 @@ def _receive_admin_max_body(message, source_chat_id, nonce):
     flow["preview_message_id"] = int(sent.message_id)
 
 
+def _send_max_payload_with_sender(
+    group_url,
+    body,
+    sender_name,
+    media,
+    chat_id,
+    session_path,
+    on_before_send=None,
+    source_type_callback=None,
+):
+    """Send sender attribution separately from media, inline with text-only posts."""
+    body = str(body or "").strip()
+    sender_name = str(sender_name or "").strip()
+    header = f"{sender_name} пишет" if sender_name else ""
+    common = {
+        "group_url": group_url,
+        "chat_id": int(chat_id),
+        "session_path": session_path,
+        "on_before_send": on_before_send,
+        "source_type_callback": source_type_callback,
+    }
+    if media and header:
+        send_message_to_max(text=header, media=None, **common)
+        send_message_to_max(
+            text=body,
+            media=media,
+            bold_first_line=False,
+            **common,
+        )
+        return
+    text = f"{header}\n\n{body}".strip() if header else body
+    send_message_to_max(text=text, media=media, bold_first_line=not bool(media), **common)
+
+
 def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id):
     result_text = "⚠️ Не удалось отправить сообщение в MAX. Проверьте подключение и попробуйте позже."
     try:
@@ -6009,10 +6043,12 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             if len(media) == 1:
                 media = media[0]
         source_lock = max_send_source_locks.setdefault(int(source_chat_id), threading.Lock())
-        message_text = f"{name}\n\n{body}".strip()
+        header_text = f"{name} пишет" if name else ""
+        message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         fingerprints = {
             value for value in (
                 _max_outbound_fingerprint(message_text),
+                _max_outbound_fingerprint(header_text),
                 _max_outbound_fingerprint(body),
                 _max_outbound_fingerprint(name),
             ) if value
@@ -6034,13 +6070,14 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                         _remember_max_outbound_echo(int(candidate["chat_id"]), fingerprint)
 
         with source_lock:
-            send_message_to_max(
+            _send_max_payload_with_sender(
                 group_url=chat["max_url"],
-                text=message_text,
+                body=body,
+                sender_name=name,
+                media=media,
                 chat_id=int(source_chat_id),
                 session_path=_session_path_for_chat(chat),
                 on_before_send=remember_outbound_echo,
-                media=media,
             )
         result_text = "✅ Сообщение отправлено в MAX."
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
@@ -6535,7 +6572,8 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
         body = str(flow.get("body") or "").strip()
         name = str(flow.get("sender_name") or "").strip()
-        message_text = f"{name}\n\n{body}".strip()
+        header_text = f"{name} пишет" if name else ""
+        message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         media = flow.get("media") or None
         if media:
             media_items = media if isinstance(media, list) else [media]
@@ -6559,6 +6597,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
         fingerprints = {
             value for value in (
                 _max_outbound_fingerprint(message_text),
+                _max_outbound_fingerprint(header_text),
                 _max_outbound_fingerprint(body),
                 _max_outbound_fingerprint(name),
             ) if value
@@ -6579,13 +6618,14 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
 
         source_lock = max_send_source_locks.setdefault(source_chat_id, threading.Lock())
         with source_lock:
-            send_message_to_max(
+            _send_max_payload_with_sender(
                 group_url=chat["max_url"],
-                text=message_text,
+                body=body,
+                sender_name=name,
+                media=media,
                 chat_id=source_chat_id,
                 session_path=_session_path_for_chat(chat),
                 on_before_send=remember_outbound_echo,
-                media=media,
                 source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
             )
         result_text = "✅ Сообщение отправлено в MAX."
