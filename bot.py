@@ -308,7 +308,7 @@ def _media_to_bytesio(media: dict) -> io.IOBase:
 
 def _media_already_sent(media: dict, chat_id: int) -> bool:
     data = media.get("bytes")
-    media_hash = media.get("hash") or get_media_hash(data=data)
+    media_hash = media.get("dedupe_hash") or media.get("hash") or get_media_hash(data=data)
     return not is_new_media(data=data, chat_id=chat_id, media_hash=media_hash)
 
 
@@ -362,7 +362,9 @@ def _post_media_hashes(post: dict) -> list[str]:
     for media in post.get("media_files", []) or []:
         if not isinstance(media, dict):
             continue
-        media_hash = str(media.get("hash") or media.get("content_hash") or "").strip()
+        media_hash = str(
+            media.get("dedupe_hash") or media.get("hash") or media.get("content_hash") or ""
+        ).strip()
         if not media_hash:
             data = media.get("bytes")
             if isinstance(data, (bytes, bytearray)) and data:
@@ -1235,7 +1237,26 @@ def _send_post_impl(chat_id: int, post: dict, destination_chat_id=None) -> None:
                 else:
                     _telegram_call(bot.send_photo,destination_chat_id,obj)
             elif media_type=="video_note":
-                _telegram_call(bot.send_video_note,destination_chat_id,obj)
+                try:
+                    _telegram_call(bot.send_video_note,destination_chat_id,obj)
+                except Exception as note_error:
+                    debug_logger.warning(
+                        "TELEGRAM_VIDEO_NOTE_FALLBACK source_id=%s error=%s",
+                        post.get("source_id") or post.get("idx") or "?",
+                        log_preview(note_error, 220),
+                    )
+                    obj.seek(0)
+                    try:
+                        _telegram_call(
+                            bot.send_video, destination_chat_id, obj,
+                            supports_streaming=True,
+                        )
+                    except Exception:
+                        obj.seek(0)
+                        _telegram_call(
+                            bot.send_document, destination_chat_id, obj,
+                            visible_file_name="video_note.mp4",
+                        )
                 caption_pending=False
             elif media_type=="video":
                 if _media_is_mp4_file(media):
@@ -6163,58 +6184,18 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
             )
             set_max_send_button_message_id(int(chat_id), anchor_message_id)
             return True
-        except Exception:
-            pass
+        except Exception as error:
+            if existing_id and int(existing_id) == anchor_message_id and "message is not modified" in str(error).lower():
+                set_max_send_button_message_id(int(chat_id), anchor_message_id)
+                return True
 
-    # Convert an old invisible marker into a visible button card if there is no
-    # parser message to anchor to yet. Old markers are never left blank.
     if existing_id:
         existing_id = int(existing_id)
-        if _max_send_anchor_is_parser_post(int(chat_id), existing_id):
-            try:
-                bot.edit_message_reply_markup(
-                    destination_chat_id, existing_id, reply_markup=keyboard
-                )
-                return True
-            except Exception:
-                pass
-        try:
-            sent = bot.edit_message_text(
-                "✉️ Чтобы написать в подключённый чат MAX, нажмите кнопку ниже.",
-                destination_chat_id,
-                existing_id,
-                reply_markup=keyboard,
-                **NO_PREVIEW,
-            )
-            set_max_send_button_message_id(int(chat_id), int(sent.message_id))
-            _record_bot_sent_group_messages(
-                destination_chat_id,
-                [sent.message_id],
-                "Кнопка отправки сообщения в MAX",
-            )
-            return True
-        except Exception:
-            _clear_max_send_anchor(int(chat_id), destination_chat_id, existing_id)
-    try:
-        sent = bot.send_message(
-            destination_chat_id,
-            "✉️ Чтобы написать в подключённый чат MAX, нажмите кнопку ниже.",
-            reply_markup=keyboard,
-            **NO_PREVIEW,
-        )
-        set_max_send_button_message_id(int(chat_id), int(sent.message_id))
-        _record_bot_sent_group_messages(
-            destination_chat_id,
-            [sent.message_id],
-            "Кнопка отправки сообщения в MAX",
-        )
-        return True
-    except Exception as error:
-        debug_logger.warning(
-            "MAX_SEND_BUTTON_CREATE_FAILED chat_id=%s error_type=%s",
-            chat_id, type(error).__name__,
-        )
-        return False
+        _clear_max_send_anchor(int(chat_id), destination_chat_id, existing_id)
+        set_max_send_button_message_id(int(chat_id), None)
+    # The action button belongs on a forwarded post only. If there is no post
+    # yet, wait for the parser's next message instead of creating a separate card.
+    return False
 
 
 def _cleanup_legacy_max_send_buttons():

@@ -1288,9 +1288,9 @@ def _has_media_independent_content(post: dict) -> bool:
 def _get_post_content_signature(post: dict) -> str:
     """Signature that also records media, retained for compatibility with existing caches."""
     media_keys = sorted(
-        str(item.get("hash") or item.get("content_hash") or item.get("url") or "")
+        str(item.get("dedupe_hash") or item.get("hash") or item.get("content_hash") or item.get("url") or "")
         for item in (post.get("media_files") or [])
-        if isinstance(item, dict) and (item.get("hash") or item.get("content_hash") or item.get("url"))
+        if isinstance(item, dict) and (item.get("dedupe_hash") or item.get("hash") or item.get("content_hash") or item.get("url"))
     )
     return _get_post_text_signature(post) + "|" + "|".join(media_keys)
 
@@ -1302,7 +1302,7 @@ def get_message_hash(post: dict) -> str:
     media = post.get("media_files", []) or []
     media_hashes = []
     for item in media:
-        value = item.get("hash") or item.get("content_hash") or item.get("url") or ""
+        value = item.get("dedupe_hash") or item.get("hash") or item.get("content_hash") or item.get("url") or ""
         if value:
             media_hashes.append(str(value))
     content = "|".join([name, text, msg_time, normalize_for_hash(post.get("date", "")), "|".join(sorted(media_hashes))])
@@ -1963,7 +1963,7 @@ def is_human_message(msg: dict) -> bool:
         msg.get("images") or msg.get("documents") or msg.get("attachments")
         or msg.get("emoji_image_urls") or msg.get("voice_hint")
         or msg.get("video_note_hint") or msg.get("emoji_texts")
-        or msg.get("sticker_hint")
+        or msg.get("sticker_hint") or msg.get("animated_emoji_hint")
     )
     has_special = bool(
         msg.get("location") or msg.get("poll") or msg.get("contact")
@@ -2112,6 +2112,50 @@ def _animated_image_kind(data: bytes) -> str:
     return ""
 
 
+def _is_emoji_only_message(text: str, emoji_texts) -> bool:
+    """True only when the visible message is made of emoji glyphs and spacing."""
+    value = str(text or "")
+    emojis = [str(item) for item in (emoji_texts or []) if str(item)]
+    if not emojis:
+        return False
+    for emoji in sorted(set(emojis), key=len, reverse=True):
+        value = value.replace(emoji, "")
+    value = re.sub(r"[\s\uFE0E\uFE0F\u200D\u20E3\u200B\u2060]", "", value)
+    return not value
+
+
+def _animated_frames_dedupe_hash(frames, media_kind: str) -> str:
+    """Build a stable identity from rendered frames, independent of MP4 metadata."""
+    signatures = set()
+    for frame in frames or []:
+        visual = _image_visual_hash(frame)
+        if visual:
+            signatures.add(f"{float(visual[0]):.3f}:{int(visual[1]):016x}")
+    if not signatures:
+        return ""
+    canonical = "|".join(sorted(signatures))
+    return hashlib.sha256(f"max-rendered-{media_kind}:{canonical}".encode("utf-8")).hexdigest()
+
+
+def _animated_media_dedupe_hash(frames, msg: dict, chat_id: int, media_kind: str) -> str:
+    """Prefer MAX's stable post ID; use rendered frames when only a DOM index exists."""
+    source_id = str(msg.get("source_id") or "").strip()
+    if source_id and not msg.get("source_id_is_index"):
+        identity = f"post:{int(chat_id)}:{source_id}:{media_kind}"
+    else:
+        frame_hash = _animated_frames_dedupe_hash(frames, media_kind)
+        identity = "|".join((
+            f"chat:{int(chat_id)}",
+            f"kind:{media_kind}",
+            f"author:{normalize_for_hash(msg.get('name') or '')}",
+            f"text:{normalize_for_hash(msg.get('text') or '')}",
+            f"date:{normalize_for_hash(msg.get('date') or '')}",
+            f"time:{normalize_for_hash(msg.get('time') or '')}",
+            f"frames:{frame_hash}",
+        ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def _prepare_static_emoji_image(media: dict, chat_id: int = 0) -> dict:
     """Use the first rendered frame as a photo when MAX exposes no emoji Unicode."""
     data = media.get("bytes")
@@ -2158,6 +2202,7 @@ def _prepare_static_sticker_image(media: dict, chat_id: int = 0) -> dict:
         return media
     try:
         from PIL import Image
+        original_hash = get_media_hash(data=data)
         with Image.open(io.BytesIO(bytes(data))) as source:
             source.seek(0)
             frame = source.convert("RGBA")
@@ -2168,6 +2213,7 @@ def _prepare_static_sticker_image(media: dict, chat_id: int = 0) -> dict:
         media["filename"] = "sticker.png"
         media["content_type"] = "image/png"
         media["hash"] = get_media_hash(data=media["bytes"])
+        media["dedupe_hash"] = original_hash
     except Exception as exc:
         debug_logger.warning("MAX_STICKER_CONVERSION_FAILED chat_id=%s error=%s", chat_id, log_preview(exc, 180))
     return media
@@ -2583,25 +2629,34 @@ def _capture_video_canvas(page, msg: dict, chat_id: int = 0) -> list[dict]:
     return []
 
 
-def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
-    """Record a rendered sticker when MAX exposes only its first PNG frame."""
+def _capture_animated_sticker(page, msg: dict, chat_id: int = 0, media_kind: str = "sticker") -> list[dict]:
+    """Record a rendered sticker/custom emoji when MAX hides its source animation."""
     try:
         card = _strict_message_card_locator(page, msg)
         if card.count() == 0:
             return []
-        selector = 'video,canvas,img,svg,[style*="background-image" i],[class*="sticker" i],[data-sticker],[data-testid*="sticker" i],[aria-label*="sticker" i],[aria-label*="стикер" i]'
+        if media_kind == "emoji":
+            selector = 'video,canvas,img,svg,[style*="background-image" i],[class*="emoji" i],[class*="animated" i],[data-animated-emoji],[data-custom-emoji],[data-emoji-id],[data-emoji-name]'
+        else:
+            selector = 'video,canvas,img,svg,[style*="background-image" i],[class*="sticker" i],[data-sticker],[data-testid*="sticker" i],[aria-label*="sticker" i],[aria-label*="стикер" i]'
         nodes = card.locator(selector)
         candidates = nodes.evaluate_all("""nodes => nodes.map((el,index) => {
             const r=el.getBoundingClientRect();
             const meta=[];
             for(let n=el,d=0;n&&d<5;n=n.parentElement,d++) {
                 meta.push(n.className||'',n.getAttribute?.('data-testid')||'',n.getAttribute?.('data-sticker')||'',
-                    n.getAttribute?.('aria-label')||'',n.getAttribute?.('data-type')||'');
+                    n.getAttribute?.('aria-label')||'',n.getAttribute?.('data-type')||'',
+                    n.hasAttribute?.('data-animated-emoji')?'data-animated-emoji':'',
+                    n.hasAttribute?.('data-custom-emoji')?'data-custom-emoji':'',
+                    n.hasAttribute?.('data-emoji-id')?'data-emoji-id':'',
+                    n.hasAttribute?.('data-emoji-name')?'data-emoji-name':'');
             }
             const text=meta.join(' ').toLowerCase();
             const tag=String(el.tagName||'').toLowerCase();
+            const sticker=/sticker|стикер/.test(text);
+            const emoji=/(?:^|[ _:-])emoji(?:[ _:-]|$)|animated.?emoji|custom.?emoji|эмодзи|emoticon|smiley/.test(text);
             let duration=tag==='video' && Number.isFinite(el.duration) ? el.duration : 0;
-            let animated=['video','canvas'].includes(tag) || /animated|lottie/.test(text);
+            let animated=['video','canvas'].includes(tag) || /animated|lottie|data-custom-emoji|data-emoji-id/.test(text);
             try {
                 const style=getComputedStyle(el);
                 const cssDurations=String(style.animationDuration||'').split(',').map(value=>{
@@ -2614,20 +2669,24 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
             } catch(e) {}
             const src=String(el.currentSrc||el.src||el.getAttribute?.('src')||'');
             if(/\\.(?:gif|webp)(?:[?#]|$)/i.test(src)) animated=true;
-            return {index,tag,meta:text,width:r.width||0,height:r.height||0,duration,animated};
+            return {index,tag,meta:text,width:r.width||0,height:r.height||0,duration,animated,sticker,emoji};
         })""")
         valid = [
             item for item in (candidates or [])
-            if re.search(r"sticker|стикер", str(item.get("meta") or ""), re.I)
+            if (
+                bool(item.get("emoji")) and not bool(item.get("sticker"))
+                if media_kind == "emoji" else bool(item.get("sticker"))
+            )
             and float(item.get("width") or 0) >= 20
             and float(item.get("height") or 0) >= 20
         ]
+        valid = [item for item in valid if item.get("animated")]
         if not valid:
             return []
         valid.sort(key=lambda item: (
             0 if item.get("animated") else 1,
+            -(float(item.get("width") or 0) * float(item.get("height") or 0)),
             0 if item.get("tag") in {"video", "canvas", "img", "svg"} else 1,
-            float(item.get("width") or 0) * float(item.get("height") or 0),
         ))
         chosen = valid[0]
         sticker = nodes.nth(int(chosen["index"]))
@@ -2645,9 +2704,9 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
         except Exception:
             pass
 
-        fps = 12
+        fps = 15
         duration = float(chosen.get("duration") or 0) or float(msg.get("media_duration_seconds") or 0) or 3.0
-        duration = min(10.0, max(1.0, duration))
+        duration = min(4.0, max(2.0, duration))
         frame_count = max(12, min(120, round(duration * fps)))
         frames = []
         distinct = []
@@ -2661,8 +2720,6 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
                 distinct.append(visual)
             elif visual is None and frame != (frames[-2] if len(frames) > 1 else None):
                 distinct.append((index,))
-            if index == min(frame_count - 1, fps - 1) and len(distinct) < 2:
-                return []
             if index + 1 < frame_count:
                 page.wait_for_timeout(round(1000 / fps))
         if len(distinct) < 2:
@@ -2676,7 +2733,7 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
             except Exception:
                 ffmpeg = None
         if not ffmpeg:
-            debug_logger.warning("MAX_STICKER_VIDEO_CAPTURE_FAILED chat_id=%s reason=ffmpeg_missing", chat_id)
+            debug_logger.warning("MAX_ANIMATED_MEDIA_CAPTURE_FAILED chat_id=%s kind=%s reason=ffmpeg_missing", chat_id, media_kind)
             return []
         try:
             from PIL import Image
@@ -2684,7 +2741,7 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
                 side = max(image.size)
         except Exception:
             side = max(int(chosen.get("width") or 0), int(chosen.get("height") or 0), 2)
-        side = max(2, side + side % 2)
+        side = min(512, max(2, side + side % 2))
         command = [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "image2pipe",
             "-vcodec", "png", "-framerate", str(fps), "-i", "pipe:0", "-an",
@@ -2699,29 +2756,30 @@ def _capture_animated_sticker(page, msg: dict, chat_id: int = 0) -> list[dict]:
         data = converted.stdout
         if converted.returncode != 0 or len(data) <= 500 or b"ftyp" not in data[:64]:
             debug_logger.warning(
-                "MAX_STICKER_VIDEO_CAPTURE_FAILED chat_id=%s source_id=%s detail=%s",
-                chat_id, msg.get("source_id") or msg.get("idx"),
+                "MAX_ANIMATED_MEDIA_CAPTURE_FAILED chat_id=%s kind=%s source_id=%s detail=%s",
+                chat_id, media_kind, msg.get("source_id") or msg.get("idx"),
                 log_preview(converted.stderr.decode("utf-8", "replace")[-240:], 160),
             )
             return []
         media = {
-            "url": "sticker-recording:max-sticker",
+            "url": f"{media_kind}-recording:max-rendered",
             "bytes": data,
             "type": "video",
-            "filename": "animated_sticker.mp4",
+            "filename": f"animated_{media_kind}.mp4",
             "content_type": "video/mp4",
             "hash": get_media_hash(data=data),
+            "dedupe_hash": _animated_media_dedupe_hash(frames, msg, chat_id, media_kind),
         }
         debug_logger.info(
-            "MAX_STICKER_VIDEO_CAPTURED chat_id=%s source_id=%s bytes=%s duration_seconds=%.2f frames=%s size=%sx%s",
-            chat_id, msg.get("source_id") or msg.get("idx"), len(data), duration,
+            "MAX_ANIMATED_MEDIA_CAPTURED chat_id=%s kind=%s source_id=%s bytes=%s duration_seconds=%.2f frames=%s size=%sx%s",
+            chat_id, media_kind, msg.get("source_id") or msg.get("idx"), len(data), duration,
             len(frames), side, side,
         )
         return [media]
     except Exception as exc:
         debug_logger.warning(
-            "MAX_STICKER_VIDEO_CAPTURE_FAILED chat_id=%s source_id=%s error=%s",
-            chat_id, msg.get("source_id") or msg.get("idx"), log_preview(exc, 180),
+            "MAX_ANIMATED_MEDIA_CAPTURE_FAILED chat_id=%s kind=%s source_id=%s error=%s",
+            chat_id, media_kind, msg.get("source_id") or msg.get("idx"), log_preview(exc, 180),
         )
         return []
 
@@ -2736,6 +2794,7 @@ def _record_animated_image_as_video(media: dict, chat_id: int = 0) -> dict:
     kind = _animated_image_kind(bytes(data))
     if not kind:
         return media
+    original_animation_hash = get_media_hash(data=data)
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -2760,6 +2819,7 @@ def _record_animated_image_as_video(media: dict, chat_id: int = 0) -> dict:
             media["filename"] = "animated_sticker.mp4"
             media["content_type"] = "video/mp4"
             media["hash"] = get_media_hash(data=output)
+            media["dedupe_hash"] = original_animation_hash
         return media
 
     command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
@@ -2788,6 +2848,7 @@ def _record_animated_image_as_video(media: dict, chat_id: int = 0) -> dict:
             media["filename"] = "animated_sticker.mp4"
             media["content_type"] = "video/mp4"
             media["hash"] = get_media_hash(data=output)
+            media["dedupe_hash"] = original_animation_hash
         else:
             detail = converted.stderr.decode("utf-8", "replace")[-500:]
             print(f"[{chat_id}] ⚠️ Не удалось записать анимированный стикер в MP4: {detail}")
@@ -2803,16 +2864,13 @@ def _record_animated_image_as_video(media: dict, chat_id: int = 0) -> dict:
 
 
 def _prepare_video_note_for_telegram(media: dict, chat_id: int = 0) -> dict:
-    """Telegram video notes need MP4; transcode MAX WebM circles when needed."""
+    """Telegram video notes need a square MP4; normalize MAX's source accordingly."""
     if media.get("type") != "video_note":
         return media
     data = media.get("bytes")
     if not isinstance(data, (bytes, bytearray)):
         return media
-    if len(data) > 12 and data[4:8] == b"ftyp":
-        media["filename"] = "video_note.mp4"
-        media["content_type"] = "video/mp4"
-        return media
+    media.setdefault("dedupe_hash", get_media_hash(data=data))
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         try:
@@ -2821,14 +2879,20 @@ def _prepare_video_note_for_telegram(media: dict, chat_id: int = 0) -> dict:
         except Exception:
             ffmpeg = None
     if not ffmpeg:
+        if len(data) > 12 and data[4:8] == b"ftyp":
+            media["filename"] = "video_note.mp4"
+            media["content_type"] = "video/mp4"
+            return media
         media["type"] = "video"
         media["filename"] = _media_filename("video_note.bin", media.get("url", ""), media.get("content_type", ""), bytes(data), "video")
         print(f"[{chat_id}] ⚠️ Для кружка MAX без MP4 нужен ffmpeg; отправляю исходное видео")
         return media
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-        "-map", "0:v:0", "-an", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", "scale=640:640:force_original_aspect_ratio=decrease,pad=640:640:(ow-iw)/2:(oh-ih)/2,setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4", "pipe:1",
     ]
@@ -6158,6 +6222,47 @@ def parse_max_group_media(
                         const mediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("video,audio,source,button,[role='button'],[aria-label],[data-testid]")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')} ${el.tagName||''}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
                         const deepMediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("*")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
                         const callLike = /звонок|вызов|call|calling|ringing|incoming call|outgoing call/.test(`${fullRowText} ${mediaMeta}`.toLowerCase());
+                        const roundVideoHint = Array.from(bubble.querySelectorAll("video")).some(video => {
+                            try {
+                                const rect = video.getBoundingClientRect();
+                                if (!rect.width || !rect.height) return false;
+                                const ratio = rect.width / rect.height;
+                                if (ratio < 0.78 || ratio > 1.28) return false;
+                                let circleStyle = false;
+                                let marker = false;
+                                for (let node = video, depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+                                    const style = getComputedStyle(node);
+                                    const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"data-type")}`;
+                                    if (/circle|round|video.?note|videonote|круж/i.test(meta)) marker = true;
+                                    if (/circle\(/i.test(style.clipPath || style.webkitClipPath || "")) circleStyle = true;
+                                    const radii = [style.borderTopLeftRadius,style.borderTopRightRadius,style.borderBottomLeftRadius,style.borderBottomRightRadius];
+                                    if (radii.some(value => String(value).includes("%") && parseFloat(value) >= 40)) circleStyle = true;
+                                    const pxRadius = Math.min(rect.width,rect.height) / 2 - 2;
+                                    if (radii.some(value => !String(value).includes("%") && parseFloat(value) >= pxRadius)) circleStyle = true;
+                                }
+                                return marker || circleStyle;
+                            } catch(e) { return false; }
+                        });
+                        const animatedEmojiHint = Array.from(bubble.querySelectorAll(
+                            "video,canvas,img,svg,[data-animated-emoji],[class*='emoji' i],[class*='animated' i],[data-custom-emoji],[data-emoji-id],[data-emoji-name]"
+                        )).some(el => {
+                            let meta = "";
+                            let explicitAnimated = false;
+                            for (let node = el, depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+                                meta += ` ${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"title")} ${safeAttr(node,"data-type")} ${safeAttr(node,"data-animated-emoji")} ${safeAttr(node,"data-custom-emoji")} ${safeAttr(node,"data-emoji-id")} ${safeAttr(node,"data-emoji-name")}`;
+                                for (const attr of ["data-animated-emoji","data-custom-emoji","data-emoji-id","data-emoji-name"]) {
+                                    if (node.hasAttribute?.(attr)) meta += ` ${attr}`;
+                                }
+                                if (["data-animated-emoji","data-custom-emoji","data-emoji-id"].some(attr => node.hasAttribute?.(attr)) || /animated.?emoji|lottie/i.test(String(node.className||"") + " " + safeAttr(node,"data-testid"))) explicitAnimated = true;
+                            }
+                            if (/sticker|стикер/i.test(meta) || !/emoji|эмодзи|emoticon|smiley/i.test(meta)) return false;
+                            const tag = String(el.tagName||"").toLowerCase();
+                            let src = String(el.currentSrc||el.src||safeAttr(el,"src")||safeAttr(el,"data-src")||safeAttr(el,"data-animation-url")||"");
+                            try { if (!src) { const bg=getComputedStyle(el).backgroundImage||""; const match=bg.match(/url\(["']?(.*?)["']?\)/i); if(match) src=match[1]; } } catch(e) {}
+                            let cssAnimated = false;
+                            try { const style=getComputedStyle(el); cssAnimated=parseFloat(style.animationDuration||"0")>0 && style.animationName!=="none"; } catch(e) {}
+                            return tag==="video" || tag==="canvas" || explicitAnimated || cssAnimated || /\.(?:gif|webp)(?:[?#]|$)/i.test(src);
+                        });
                         // time в шапке .item — время сообщения, а не длительность
                         // вложения. Берём длительность только из самой bubbleContent.
                         const bubbleText = clean(bubble.innerText);
@@ -6171,7 +6276,7 @@ def parse_max_group_media(
                             .map(el => Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 0)
                             .find(value => value > 0) || 0;
                         const mediaDurationSeconds = (durationMatch ? Number(durationMatch[1])*60 + Number(durationMatch[2]) : 0) || liveVideoDuration;
-                        let videoNoteHint = !callLike && (/video.?note|videonote|кружок|кружочек|round.?video|roundvideo/.test(mediaMeta) || richAttachments.some(a=>a.type==="video_note"));
+                        let videoNoteHint = !callLike && (/video.?note|videonote|кружок|кружочек|round.?video|roundvideo/.test(mediaMeta) || richAttachments.some(a=>a.type==="video_note") || roundVideoHint);
                         let voiceHint = !videoNoteHint && !callLike && (/(?:voice|voice.?message|voice_message|attach.?audio|waveform|голосов(?:ое|ая|ым|ого)(?:\s+(?:сообщение|запись|файл))?|аудиосообщ)/.test(deepMediaMeta) || richAttachments.some(a=>a.type==="voice") || bubble.querySelector('audio')!=null || (hasDuration && /audio|attach.?audio|waveform|голосов(?:ое|ая)/.test(deepMediaMeta)));
                         const special = getSpecialContent(bubble, row);
                         // Vote controls include the Russian word "голосовать"; they must
@@ -6305,7 +6410,7 @@ def parse_max_group_media(
                         }
 
                         const bareMediaCard = Boolean(bubble.querySelector("video,audio,canvas,[class*='voice' i],[class*='video-note' i],[class*='videonote' i],[class*='круж' i],[class*='голос' i]"));
-                        const hasSomething = Boolean(text || emojiTexts.length || emojiImageUrls.length || images.length || documents.length || richAttachments.length || stickerHint || special.location || special.poll || special.contact || filenameHint || downloadClickId || bareMediaCard);
+                        const hasSomething = Boolean(text || emojiTexts.length || emojiImageUrls.length || images.length || documents.length || richAttachments.length || stickerHint || animatedEmojiHint || special.location || special.poll || special.contact || filenameHint || downloadClickId || bareMediaCard);
                         if (!hasSomething) return;
 
                         // Защита от ситуации, когда MAX случайно записал текст сообщения в поле имени.
@@ -6346,6 +6451,7 @@ def parse_max_group_media(
                             image_candidate_count: imageCandidateCount,
                             photo_visual_hint: photoVisualHint,
                             emoji_texts: emojiTexts,
+                            animated_emoji_hint: animatedEmojiHint,
                             documents,
                             attachments: richAttachments,
                             sticker_hint: stickerHint,
@@ -6648,7 +6754,9 @@ def parse_max_group_media(
             # Captioned-photo is warmed up before reading its URL. A screenshot is a
             # fallback only: adding it alongside a successfully downloaded image creates
             # visually identical duplicates with different byte hashes.
-            emoji_only = bool(msg.get("emoji_texts")) and not bool((msg.get("text") or "").strip().replace(" ", ""))
+            emoji_only = _is_emoji_only_message(msg.get("text") or "", msg.get("emoji_texts") or []) or bool(
+                msg.get("animated_emoji_hint") and not str(msg.get("text") or "").strip()
+            )
             has_captioned_photo_hint = bool((msg.get("text") or "").strip()) and bool(
                 image_urls or (photo_visual_hint and not rich_media_hint)
             )
@@ -6905,12 +7013,20 @@ def parse_max_group_media(
                         msg["_oversized_media"] = True
                     elif media and media.get("bytes"):
                         media_files.append(media)
-            if msg.get("sticker_hint"):
-                has_animation_payload = any(
-                    media.get("type") in {"video", "animation"}
-                    or _animated_image_kind(bytes(media.get("bytes") or b""))
-                    for media in media_files
+            if msg.get("animated_emoji_hint") and emoji_only:
+                has_animation_payload = any(media.get("type") in {"video", "animation"} for media in media_files)
+                can_replace_still = not media_files or (
+                    len(media_files) == 1 and media_files[0].get("type") in {"image", "sticker"}
                 )
+                if not has_animation_payload and can_replace_still:
+                    animated_emoji = _capture_animated_sticker(
+                        page, msg, chat_id=chat_id, media_kind="emoji"
+                    )
+                    if animated_emoji:
+                        media_files = animated_emoji
+                        msg["_captured_animated_emoji"] = True
+            if msg.get("sticker_hint"):
+                has_animation_payload = any(media.get("type") in {"video", "animation"} for media in media_files)
                 can_replace_still = not media_files or (
                     len(media_files) == 1 and media_files[0].get("type") in {"image", "sticker"}
                 )
@@ -7006,7 +7122,7 @@ def parse_max_group_media(
                 media_identity = (
                     visual_cache_hash
                     if media.get("visual_fallback") and visual_cache_hash
-                    else media_hash
+                    else str(media.get("dedupe_hash") or media_hash)
                 )
                 if media_identity in seen_media_hashes:
                     duplicate_media_count += 1
@@ -7032,9 +7148,9 @@ def parse_max_group_media(
                 "mid": msg.get("mid", ""),
                 "data_id": msg.get("data_id", ""),
                 "name": msg.get("name", "Аноним"),
-                "text": msg.get("text", ""),
+                "text": "" if msg.get("_captured_animated_emoji") else msg.get("text", ""),
                 "inline_links": msg.get("inline_links", []),
-                "emoji_texts": msg.get("emoji_texts", []),
+                "emoji_texts": [] if msg.get("_captured_animated_emoji") else msg.get("emoji_texts", []),
                 "emoji_image_urls": sorted(emoji_image_urls),
                 "time": msg.get("time", ""),
                 "date": msg.get("date", ""),
