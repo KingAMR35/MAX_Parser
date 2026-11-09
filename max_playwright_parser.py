@@ -4257,6 +4257,54 @@ def _resolve_contact_link_via_dialog(page, msg: dict, group_url: str, chat_id: i
                 page.wait_for_timeout(1000)
         except Exception: pass
 
+def _detect_max_chat_source_type(page) -> str | None:
+    """Read only MAX's chat header signals; never classify from the user-provided URL."""
+    try:
+        header_text = page.evaluate("""() => {
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const nodes = [...document.querySelectorAll('header,[role="banner"],[class*="header" i]')]
+                .filter(el => {
+                    if (!visible(el)) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.top >= 0 && r.top < 300 && r.left > window.innerWidth * 0.22 &&
+                        r.width > 180 && r.height < 220;
+                });
+            const parts = [];
+            for (const el of nodes) {
+                const text = (el.innerText || '').trim();
+                if (text && text.length < 700) parts.push(text);
+                for (const control of el.querySelectorAll('button,[role="button"],[aria-label],[title]')) {
+                    const label = [control.innerText, control.getAttribute('aria-label'), control.title,
+                        control.getAttribute('data-testid')].filter(Boolean).join(' ').trim();
+                    if (label && label.length < 180) parts.push(label);
+                }
+            }
+            return [...new Set(parts)].join(' | ').slice(0, 3000);
+        }""")
+    except Exception:
+        return None
+    text = re.sub(r"\s+", " ", str(header_text or "")).casefold()
+    channel_signal = bool(re.search(
+        r"\b\d[\d\s.,]*\s*(?:подписчик\w*|subscribers?)\b|"
+        r"\b(?:подписчик\w*|subscriber\w*|подписаться|subscribe)\b",
+        text,
+    ))
+    group_signal = bool(re.search(
+        r"\b\d[\d\s.,]*\s*(?:участник\w*|участниц\w*|members?)\b|"
+        r"\b(?:участник\w*|участниц\w*|member\w*)\b|\bпригласить участников\b",
+        text,
+    ))
+    if channel_signal and not group_signal:
+        return "channel"
+    if group_signal and not channel_signal:
+        return "group"
+    return None
+
+
 def parse_max_group_media(
     group_url: str,
     chat_id: int,
@@ -4265,6 +4313,7 @@ def parse_max_group_media(
     navigation_timeout_ms: int = 60000,
     navigation_attempts: int = 4,
     post_callback=None,
+    source_type_callback=None,
 ) -> Union[List[Dict], Dict[str, object]]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
     debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
@@ -4324,6 +4373,15 @@ def parse_max_group_media(
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"EMPTY_PAGE|{debug_path}")
+        detected_source_type = _detect_max_chat_source_type(page)
+        if detected_source_type and source_type_callback:
+            try:
+                source_type_callback(detected_source_type)
+            except Exception as error:
+                debug_logger.warning(
+                    "MAX_SOURCE_TYPE_CALLBACK_FAILED chat_id=%s error_type=%s",
+                    chat_id, type(error).__name__,
+                )
         debug_logger.info("MAX_CHAT_OPENED chat_id=%s route=%s verify_only=%s", chat_id, urlparse(current_url).path, verify_only)
         if verify_only:
             message_cards = page.locator(".item")
@@ -4344,7 +4402,7 @@ def parse_max_group_media(
                 "MAX_CHAT_ACCESS_VERIFIED chat_id=%s visible_message_cards=%s",
                 chat_id, card_count,
             )
-            return {"message_cards": card_count}
+            return {"message_cards": card_count, "source_type": detected_source_type}
         print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
         try:
             page.keyboard.press("End")
@@ -7116,13 +7174,30 @@ def send_message_to_max(
     chat_id: int,
     session_path: str = None,
     on_before_send=None,
+    media: dict = None,
+    source_type_callback=None,
 ) -> None:
-    """Send one user-approved text through the already authenticated MAX Web UI."""
+    """Send one user-approved text or single attachment through the authenticated MAX UI."""
     session_file = session_path or f"{SESSIONS_DIR}/{chat_id}.json"
     if not os.path.exists(session_file):
         raise RuntimeError("NO_SESSION")
-    if not str(group_url or "").strip() or not str(text or "").strip():
+    if not str(group_url or "").strip() or (not str(text or "").strip() and not media):
         raise ValueError("MAX_URL_OR_MESSAGE_EMPTY")
+    upload_payload = None
+    if media:
+        media_items = media if isinstance(media, (list, tuple)) else [media]
+        upload_payload = []
+        for item in media_items:
+            raw_data = item.get("bytes")
+            if not isinstance(raw_data, (bytes, bytearray)) or not raw_data:
+                raise ValueError("MAX_MEDIA_EMPTY")
+            upload_payload.append({
+                "name": str(item.get("filename") or "attachment.bin")[:180],
+                "mimeType": str(item.get("mime_type") or "application/octet-stream")[:120],
+                "buffer": bytes(raw_data),
+            })
+        if len(upload_payload) == 1:
+            upload_payload = upload_payload[0]
 
     pw = browser = context = page = None
     try:
@@ -7160,6 +7235,43 @@ def send_message_to_max(
         if len(page.content()) < 1000:
             raise RuntimeError("MAX_CHAT_NOT_LOADED")
 
+        detected_source_type = _detect_max_chat_source_type(page)
+        if detected_source_type and source_type_callback:
+            source_type_callback(detected_source_type)
+        if detected_source_type == "channel":
+            raise RuntimeError("MAX_SOURCE_IS_CHANNEL")
+
+        if upload_payload:
+            file_inputs = page.locator('input[type="file"]')
+            uploaded = False
+            for index in reversed(range(file_inputs.count())):
+                try:
+                    file_inputs.nth(index).set_input_files(upload_payload, timeout=5000)
+                    uploaded = True
+                    break
+                except Exception:
+                    continue
+            if not uploaded:
+                attach_buttons = page.get_by_role(
+                    "button", name=re.compile(r"прикреп|вложен|файл|медиа|attach|file|media", re.I)
+                )
+                for index in reversed(range(min(attach_buttons.count(), 12))):
+                    candidate = attach_buttons.nth(index)
+                    try:
+                        if not candidate.is_visible(timeout=200):
+                            continue
+                        with page.expect_file_chooser(timeout=1800) as chooser_info:
+                            candidate.click(timeout=1200)
+                        chooser_info.value.set_files(upload_payload, timeout=5000)
+                        uploaded = True
+                        break
+                    except Exception:
+                        continue
+            if not uploaded:
+                raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
+            # Wait for MAX to finish adding the selected file to its composer.
+            page.wait_for_timeout(900)
+
         composer_found = page.evaluate("""() => {
             const visible = el => {
                 const r = el.getBoundingClientRect();
@@ -7192,7 +7304,8 @@ def send_message_to_max(
 
         composer = page.locator('[data-max-parser-send-composer="true"]').first
         # Fill in one operation to preserve Unicode and the exact order of characters.
-        composer.fill(str(text), timeout=5000)
+        if str(text or "").strip():
+            composer.fill(str(text), timeout=5000)
         try:
             supports_rich_text = bool(composer.evaluate("el => el.isContentEditable"))
         except Exception:

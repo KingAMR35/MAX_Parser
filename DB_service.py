@@ -79,6 +79,8 @@ def init_db():
             ADD COLUMN IF NOT EXISTS destination_type TEXT NOT NULL DEFAULT 'group'
         """)
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_send_button_message_id BIGINT")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type TEXT")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type_verified BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("""
             UPDATE chats SET destination_chat_id = chat_id
             WHERE destination_chat_id IS NULL
@@ -1115,7 +1117,8 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
                 UPDATE chats
                 SET title = %s, owner_id = %s, account_mode = %s, max_url = NULL,
                     phone = NULL, is_active = FALSE, destination_chat_id = %s,
-                    destination_type = 'group'
+                    destination_type = 'group', max_source_type = NULL,
+                    max_source_type_verified = FALSE, max_send_button_message_id = NULL
                 WHERE chat_id = %s
             """, (title, owner_id, account_mode, chat_id, chat_id))
             return True
@@ -1165,6 +1168,17 @@ def get_user_chats(owner_id: int):
 def update_chat_url(chat_id: int, max_url: str):
     with get_connection() as conn:
         conn.execute("UPDATE chats SET max_url = %s WHERE chat_id = %s", (max_url, chat_id))
+
+
+def update_chat_source_type(chat_id: int, source_type: str | None, verified: bool = False):
+    source_type = str(source_type or "").strip().lower()
+    if source_type not in {"group", "channel"}:
+        source_type = None
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE chats SET max_source_type = %s, max_source_type_verified = %s WHERE chat_id = %s",
+            (source_type, bool(verified) if source_type else False, int(chat_id)),
+        )
 
 
 def update_chat_phone(chat_id: int, phone: str):
