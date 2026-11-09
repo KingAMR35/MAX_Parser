@@ -7115,6 +7115,7 @@ def send_message_to_max(
     text: str,
     chat_id: int,
     session_path: str = None,
+    on_before_send=None,
 ) -> None:
     """Send one user-approved text through the already authenticated MAX Web UI."""
     session_file = session_path or f"{SESSIONS_DIR}/{chat_id}.json"
@@ -7213,6 +7214,8 @@ def send_message_to_max(
             if candidate.is_visible(timeout=250):
                 send_button = candidate
                 break
+        if on_before_send:
+            on_before_send()
         if send_button is not None:
             send_button.click(timeout=2500)
         else:

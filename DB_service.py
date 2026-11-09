@@ -83,6 +83,18 @@ def init_db():
             UPDATE chats SET destination_chat_id = chat_id
             WHERE destination_chat_id IS NULL
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS max_outbound_message_suppressions (
+                suppression_id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_max_outbound_suppressions_lookup
+            ON max_outbound_message_suppressions (chat_id, fingerprint, created_at)
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS referral_invites (
@@ -1165,12 +1177,58 @@ def update_chat_title(chat_id: int, title: str):
         conn.execute("UPDATE chats SET title = %s WHERE chat_id = %s", (title, chat_id))
 
 
-def set_max_send_button_message_id(chat_id: int, message_id: int):
+def set_max_send_button_message_id(chat_id: int, message_id: int | None):
     with get_connection() as conn:
         conn.execute(
             "UPDATE chats SET max_send_button_message_id = %s WHERE chat_id = %s",
-            (int(message_id), int(chat_id)),
+            (int(message_id) if message_id is not None else None, int(chat_id)),
         )
+
+
+def remember_max_outbound_message(chat_id: int, fingerprint: str):
+    fingerprint = str(fingerprint or "").strip()
+    if not fingerprint:
+        return
+    with get_connection() as conn:
+        conn.execute("""
+            DELETE FROM max_outbound_message_suppressions
+            WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '2 days'
+        """)
+        conn.execute("""
+            INSERT INTO max_outbound_message_suppressions (chat_id, fingerprint)
+            VALUES (%s, %s)
+        """, (int(chat_id), fingerprint))
+
+
+def consume_max_outbound_message(chat_id: int, fingerprint: str) -> bool:
+    fingerprint = str(fingerprint or "").strip()
+    if not fingerprint:
+        return False
+    with get_connection() as conn:
+        row = conn.execute("""
+            DELETE FROM max_outbound_message_suppressions
+            WHERE suppression_id = (
+                SELECT suppression_id
+                FROM max_outbound_message_suppressions
+                WHERE chat_id = %s AND fingerprint = %s
+                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '2 days'
+                ORDER BY created_at, suppression_id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING suppression_id
+        """, (int(chat_id), fingerprint)).fetchone()
+        return row is not None
+
+
+def get_pending_max_outbound_messages():
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT chat_id, fingerprint, created_at
+            FROM max_outbound_message_suppressions
+            WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '2 days'
+        """).fetchall()
+        return list(rows)
 
 
 def get_chat_by_id(chat_id: int):
