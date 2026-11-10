@@ -7778,21 +7778,91 @@ def send_message_to_max(
                 # If this MAX client has a different editor, send the text as entered.
                 pass
 
-        send_buttons = page.get_by_role("button", name=re.compile(r"отправить|send", re.I))
         send_button = None
         attempts = 32 if upload_payload else 1
+        if upload_payload:
+            # A file picker can leave MAX's attachment/sticker popover open.
+            # Dismiss it before finding the send control; otherwise its
+            # backdrop can intercept the click on the composer button.
+            try:
+                backdrops = page.locator(
+                    '[data-testid="popoverPortal"] [role="presentation"], '
+                    '.popoverPortal [role="presentation"]'
+                )
+                if any(backdrops.nth(index).is_visible(timeout=200) for index in range(backdrops.count())):
+                    for _ in range(2):
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(200)
+                        if not any(
+                            backdrops.nth(index).is_visible(timeout=200)
+                            for index in range(backdrops.count())
+                        ):
+                            break
+                    if any(
+                        backdrops.nth(index).is_visible(timeout=200)
+                        for index in range(backdrops.count())
+                    ):
+                        raise RuntimeError("MAX_SEND_POPOVER_BLOCKING")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+        send_controls = page.locator('button,[role="button"],input[type="submit"]')
         for attempt in range(attempts):
             upload_error = media_upload_error()
             if upload_error:
                 raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
-            for index in reversed(range(send_buttons.count())):
-                candidate = send_buttons.nth(index)
-                try:
-                    if candidate.is_visible(timeout=250) and candidate.is_enabled(timeout=250):
-                        send_button = candidate
-                        break
-                except Exception:
-                    continue
+            if upload_payload:
+                candidate_indices = page.evaluate("""() => {
+                    const composer = document.querySelector('[data-max-parser-send-composer="true"]');
+                    if (!composer) return [];
+                    const c = composer.getBoundingClientRect();
+                    const visible = el => {
+                        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                            s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
+                            !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                    };
+                    return [...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                        .map((el, index) => {
+                            if (!visible(el) || el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i]')) return null;
+                            const r = el.getBoundingClientRect();
+                            const label = [el.innerText, el.getAttribute('aria-label'), el.title,
+                                el.getAttribute('data-testid'), el.className, el.type]
+                                .filter(Boolean).join(' ').toLowerCase();
+                            if (!/(отправ|send|submit)/i.test(label)) return null;
+                            const verticalDistance = Math.abs((r.top + r.height / 2) - (c.top + c.height / 2));
+                            if (verticalDistance > 150 || r.left < c.left + c.width * 0.4) return null;
+                            const form = composer.closest('form');
+                            const inComposerForm = Boolean(form && form.contains(el));
+                            const score = (inComposerForm ? 100 : 0) +
+                                (el.type === 'submit' ? 80 : 0) +
+                                (/отправ|send|submit/i.test(label) ? 40 : 0) - verticalDistance;
+                            return {index, score};
+                        })
+                        .filter(Boolean)
+                        .sort((a, b) => b.score - a.score)
+                        .map(item => item.index);
+                }""")
+                for index in candidate_indices:
+                    candidate = send_controls.nth(int(index))
+                    try:
+                        if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
+                            send_button = candidate
+                            break
+                    except Exception:
+                        continue
+            else:
+                send_buttons = page.get_by_role("button", name=re.compile(r"отправить|send", re.I))
+                for index in reversed(range(send_buttons.count())):
+                    candidate = send_buttons.nth(index)
+                    try:
+                        if candidate.is_visible(timeout=250) and candidate.is_enabled(timeout=250):
+                            send_button = candidate
+                            break
+                    except Exception:
+                        continue
             if send_button is not None:
                 break
             if not upload_payload:
@@ -7801,48 +7871,6 @@ def send_message_to_max(
             # selected attachment. Do not fall back to Enter and accidentally
             # send only the accompanying text.
             page.wait_for_timeout(250)
-        if upload_payload and send_button is None:
-            # MAX sometimes renders the send control as an icon button without
-            # an accessible name, so get_by_role("button", name=...) cannot see
-            # it. Try only explicit submit/send controls next, and require that
-            # the control sits beside the message composer before clicking.
-            submit_selectors = (
-                "button[type='submit']",
-                "input[type='submit']",
-                "[data-testid*='send' i]",
-                "[data-testid*='submit' i]",
-                "button[aria-label*='отправ' i]",
-                "[role='button'][aria-label*='отправ' i]",
-                "button[aria-label*='send' i]",
-                "[role='button'][aria-label*='send' i]",
-                "button[title*='отправ' i]",
-                "button[title*='send' i]",
-                "button[class*='send' i]",
-                "[role='button'][class*='send' i]",
-            )
-            for selector in submit_selectors:
-                candidates = page.locator(selector)
-                for index in reversed(range(candidates.count())):
-                    candidate = candidates.nth(index)
-                    try:
-                        if not candidate.is_visible(timeout=250) or not candidate.is_enabled(timeout=250):
-                            continue
-                        beside_composer = candidate.evaluate("""el => {
-                            const composer = document.querySelector('[data-max-parser-send-composer="true"]');
-                            if (!composer) return false;
-                            const c = composer.getBoundingClientRect();
-                            const r = el.getBoundingClientRect();
-                            return r.width > 0 && r.height > 0 &&
-                                Math.abs(r.top - c.top) < 180 &&
-                                r.left >= c.left + c.width * 0.45;
-                        }""")
-                        if beside_composer:
-                            send_button = candidate
-                            break
-                    except Exception:
-                        continue
-                if send_button is not None:
-                    break
         if upload_payload and send_button is None:
             raise RuntimeError("MAX_UPLOAD_NOT_READY")
         before_tail = chat_tail_snapshot() if upload_payload else ()
