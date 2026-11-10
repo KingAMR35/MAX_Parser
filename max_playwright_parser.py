@@ -7547,6 +7547,7 @@ def send_message_to_max(
     upload_payload = None
     has_photo_upload = False
     normalized_media_hashes = []
+    upload_route = ""
     if media:
         media_items = media if isinstance(media, (list, tuple)) else [media]
         upload_payload = []
@@ -7731,6 +7732,7 @@ def send_message_to_max(
                         candidate.click(timeout=1200)
                     chooser_info.value.set_files(upload_payload, timeout=8000)
                     uploaded = True
+                    upload_route = f"chooser-control:{int(index)}"
                     break
                 except Exception:
                     continue
@@ -7766,6 +7768,14 @@ def send_message_to_max(
                         )
                         if int(received_count or 0) == expected_count:
                             uploaded = True
+                            try:
+                                upload_route = candidate.evaluate("""el => [
+                                    'file-input',el.getAttribute('accept')||'',
+                                    String(el.className||'').slice(0,70),
+                                    el.getAttribute('data-testid')||''
+                                ].join(':')""", timeout=500)
+                            except Exception:
+                                upload_route = "file-input:metadata-unavailable"
                             break
                     except Exception:
                         continue
@@ -7932,7 +7942,18 @@ def send_message_to_max(
         before_tail = chat_tail_snapshot() if upload_payload else ()
         if on_before_send:
             on_before_send(normalized_media_hashes)
+        send_mode = "button" if send_button is not None else "enter"
+        send_control_info = ""
         if send_button is not None:
+            try:
+                send_control_info = send_button.evaluate("""el => {
+                    const r=el.getBoundingClientRect();
+                    return [el.tagName,String(el.className||'').slice(0,70),
+                        String(el.getAttribute('aria-label')||el.title||'').slice(0,50),
+                        Math.round(r.left),Math.round(r.top)].join(':');
+                }""", timeout=500)
+            except Exception:
+                pass
             send_button.click(timeout=2500)
         else:
             # Some MAX versions render the send control as an unlabeled icon.
@@ -7962,7 +7983,55 @@ def send_message_to_max(
             upload_error = media_upload_error()
             if upload_error:
                 raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
-            raise RuntimeError("MAX_SEND_NOT_CONFIRMED")
+            try:
+                send_state = page.evaluate("""() => {
+                    const c=document.querySelector('[data-max-parser-send-composer="true"]');
+                    const visible=el=>{
+                        const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+                        return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';
+                    };
+                    const cr=c?c.getBoundingClientRect():null;
+                    const nearby=c?[...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                        .filter(el=>visible(el)&&!el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"]'))
+                        .map(el=>{
+                            const r=el.getBoundingClientRect();
+                            return {el,r,dy:Math.abs((r.top+r.height/2)-(cr.top+cr.height/2))};
+                        }).filter(x=>x.dy<110&&x.r.top>window.innerHeight*.5)
+                        .sort((a,b)=>a.r.left-b.r.left).slice(-6).map(x=>({
+                            tag:x.el.tagName,cls:String(x.el.className||'').slice(0,55),
+                            label:String(x.el.getAttribute('aria-label')||x.el.title||'').slice(0,35),
+                            disabled:Boolean(x.el.disabled)||x.el.getAttribute('aria-disabled')==='true',
+                            x:Math.round(x.r.left),y:Math.round(x.r.top)
+                        })):[];
+                    let root=c;
+                    for(let i=0;i<3&&root?.parentElement;i++) root=root.parentElement;
+                    const preview=root?[...root.querySelectorAll(
+                        'img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i]'
+                    )].filter(visible).length:0;
+                    const rows=[...document.querySelectorAll('.item')];
+                    const inputs=[...document.querySelectorAll('input[type="file"]')];
+                    return {
+                        composerFound:Boolean(c),composerChars:c?String(c.innerText||c.value||'').length:-1,
+                        composerFocused:Boolean(c&&c===document.activeElement),previewNodes:preview,
+                        selectedFiles:inputs.reduce((n,x)=>n+(x.files?.length||0),0),
+                        chatRows:rows.length,lastRowMedia:rows.length?rows[rows.length-1].querySelectorAll('img,video,audio,canvas').length:0,
+                        nearby
+                    };
+                }""")
+            except Exception as diagnostic_error:
+                send_state = {"diagnostic_error": type(diagnostic_error).__name__}
+            diagnostic = {
+                "upload": upload_route[:120],
+                "method": send_mode,
+                "control": send_control_info[:180],
+                "composer_empty": not bool(str(remaining or "").strip()),
+                "tail_changed": chat_tail_snapshot() != before_tail,
+                "state": send_state,
+            }
+            raise RuntimeError(
+                "MAX_SEND_NOT_CONFIRMED: " +
+                json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))[:850]
+            )
         # MAX may clear the composer optimistically before reporting an upload
         # failure. Allow the asynchronous error toast to arrive before success.
         if upload_payload:
