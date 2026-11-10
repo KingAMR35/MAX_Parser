@@ -7877,7 +7877,8 @@ def _new_max_upload_rows(rows, before_ids, before_signatures, upload_names,
             row.get("outgoing")
             and (not expected_kinds or str(row.get("media_kind") or "").casefold() in expected_kinds)
         )
-        if require_outgoing and not (matching_outgoing_media or named_upload):
+        named_outgoing_upload = bool(row.get("outgoing") and named_upload)
+        if require_outgoing and not (matching_outgoing_media or named_outgoing_upload):
             continue
         candidates.append(row)
     return candidates
@@ -8107,7 +8108,9 @@ def send_message_to_max(
                         else if (nodes.some(el => el.tagName === 'AUDIO' || /voice|audio|голос/i.test(String(el.className || '')))) mediaKind = 'audio';
                         else if (images.length || nodes.some(el => el.tagName === 'CANVAS' || /photo|image|sticker|изображ/i.test(String(el.className || '')))) mediaKind = 'image';
                         else if (nodes.length) mediaKind = 'document';
-                        const signature = String(id || index) + '|' + text + '|' + filename + '|' + mediaKind;
+                        // Do not use the row's array index as identity: a new
+                        // message can shift old rows and falsely look like a send.
+                        const signature = String(id || '') + '|' + time + '|' + text + '|' + filename + '|' + mediaKind;
                         return {id: String(id), text, time, filename, media: nodes.length > 0, mediaKind, outgoing, signature};
                     });
                 }""")
@@ -8150,11 +8153,14 @@ def send_message_to_max(
                 if not isinstance(item, dict):
                     continue
                 mime = str(item.get("mimeType") or "").lower()
+                filename = str(item.get("name") or "").lower()
                 expected_kinds.add(
                     "image" if mime.startswith("image/") else
                     "video" if mime.startswith("video/") else
                     "audio" if mime.startswith("audio/") else "document"
                 )
+                if filename.endswith((".mp4", ".mov", ".webm", ".m4v")):
+                    expected_kinds.update({"video", "document"})
             return _new_max_upload_rows(
                 rows, before_source_ids, before_row_signatures, names, expected_kinds,
                 require_outgoing=require_outgoing,

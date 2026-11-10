@@ -6655,66 +6655,6 @@ def _is_public_max_send_reply(message):
         return int(flow.get("input_chat_id") or flow.get("destination_chat_id") or 0) == int(message.chat.id)
 
 
-PUBLIC_MAX_SEND_BUTTON_TEXT = "✍️ Написать в MAX"
-
-
-def _is_public_max_send_button_text(message):
-    return bool(
-        message
-        and message.chat.type in {"group", "supergroup", "private"}
-        and str(getattr(message, "text", "") or "").strip() == PUBLIC_MAX_SEND_BUTTON_TEXT
-        and getattr(message, "from_user", None)
-        and not getattr(message.from_user, "is_bot", False)
-    )
-
-
-@bot.message_handler(func=_is_public_max_send_button_text, content_types=["text"])
-def handle_public_max_send_button_text(message):
-    """Keep ReplyKeyboard buttons from older bot versions functional."""
-    destination_id = int(message.chat.id)
-    candidates = []
-    for chat in get_active_chats():
-        try:
-            if int(chat.get("destination_chat_id") or chat.get("chat_id") or 0) != destination_id:
-                continue
-            if chat.get("max_source_type") not in {"group", "private"}:
-                continue
-            if _max_send_button_is_eligible(chat):
-                candidates.append(chat)
-        except Exception:
-            continue
-
-    if len(candidates) == 1:
-        _start_public_max_send(
-            SimpleNamespace(id=None, from_user=message.from_user, message=message),
-            int(candidates[0]["chat_id"]),
-        )
-        return
-
-    if candidates:
-        keyboard = types.InlineKeyboardMarkup(row_width=1)
-        for chat in candidates[:10]:
-            title = str(chat.get("title") or "Чат MAX").strip()[:48]
-            keyboard.add(types.InlineKeyboardButton(
-                f"✍️ {title}",
-                url=f"https://t.me/{BOT_PUBLIC_USERNAME}?start=maxsend_{int(chat['chat_id'])}",
-            ))
-        bot.send_message(
-            destination_id,
-            "Выберите подключённый чат MAX:",
-            reply_markup=keyboard,
-            **NO_PREVIEW,
-        )
-        return
-
-    # A ReplyKeyboard can remain visible after an older connection was stopped.
-    bot.send_message(
-        destination_id,
-        "В этом чате нет активного подключения MAX.",
-        **NO_PREVIEW,
-    )
-
-
 def _public_max_input(message):
     """Extract one Telegram text/media item while retaining its native file type."""
     content_type = str(getattr(message, "content_type", "") or "")
@@ -6739,10 +6679,10 @@ def _public_max_input(message):
             label = "Анимация"
             kind = "video"
         elif content_type == "video_note":
-            # MAX Web does not expose Telegram's round video-note message
-            # type. Upload the original clip as an ordinary MP4 video instead.
-            filename, mime_type, label = "video.mp4", "video/mp4", "Видеосообщение"
-            kind = "video"
+            # MAX Web has no round video-note composer. Use its generic file
+            # upload route so the original MP4 is delivered as an attachment.
+            filename, mime_type, label = "video.mp4", "application/octet-stream", "Видеосообщение"
+            kind = "document"
         else:
             filename = str(getattr(item, "file_name", None) or "video.mp4")
             mime_type = str(getattr(item, "mime_type", None) or "video/mp4")
@@ -8533,7 +8473,6 @@ def support_admin_reply(message):
                 message.chat.id,
                 f"✅ Ответ отправлен пользователю <code>{user_id}</code>.",
                 parse_mode="HTML",
-                reply_markup=admin_send_again_keyboard("support", user_id),
                 **NO_PREVIEW,
             )
         except Exception as error:
@@ -8591,7 +8530,6 @@ def process_support_admin_followup(message, user_id):
             message.chat.id,
             f"✅ Ответ отправлен пользователю <code>{user_id}</code>.",
             parse_mode="HTML",
-            reply_markup=admin_send_again_keyboard("support", user_id),
             **NO_PREVIEW,
         )
     except Exception as error:
