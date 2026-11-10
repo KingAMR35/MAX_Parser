@@ -6348,9 +6348,29 @@ def parse_max_group_media(
                             )).map(el=>safeAttr(el,"class"))
                         ].filter(Boolean).join(" ");
                         const bubbleRect = bubble.getBoundingClientRect();
+                        const composerCandidates = Array.from(document.querySelectorAll(
+                            'textarea,[contenteditable="true"],[role="textbox"]'
+                        )).filter(el => {
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 150 && rect.height > 0 &&
+                                rect.top > window.innerHeight * 0.55 &&
+                                style.display !== "none" && style.visibility !== "hidden";
+                        });
+                        const chatComposer = composerCandidates.sort((a, b) =>
+                            b.getBoundingClientRect().right - a.getBoundingClientRect().right
+                        )[0];
+                        const composerRect = chatComposer ? chatComposer.getBoundingClientRect() : null;
+                        const centerInChatPane = composerRect
+                            ? (bubbleRect.left + bubbleRect.width / 2 - composerRect.left) / composerRect.width
+                            : -1;
+                        const leftInChatPane = composerRect
+                            ? (bubbleRect.left - composerRect.left) / composerRect.width
+                            : -1;
                         const outgoingHint = /(outgoing|sent|mine|own|is-out|my-message|message--out)/i.test(directionMarker) ||
-                            (bubbleRect.width > 0 && bubbleRect.width < window.innerWidth * 0.78 &&
-                                bubbleRect.left + bubbleRect.width / 2 > window.innerWidth * 0.58);
+                            (composerRect && bubbleRect.width > 0 &&
+                                bubbleRect.width < composerRect.width * 0.9 &&
+                                centerInChatPane > 0.56 && leftInChatPane > 0.12);
 
                         const name = getAuthor(row);
                         const role = getRole(row, name);

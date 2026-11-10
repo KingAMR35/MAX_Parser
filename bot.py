@@ -1598,9 +1598,65 @@ def _max_outbound_post_fingerprints(post):
 def _outbound_video_time_fingerprint(value):
     """Stable one-use key for MAX's outgoing video when no message ID is exposed."""
     value = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
-    if not re.fullmatch(r"\d{1,2}:\d{2}(?:\s*(?:am|pm))?", value):
+    match = re.search(r"(?<!\d)(\d{1,2}:\d{2}(?:\s*(?:am|pm))?)(?!\d)", value)
+    if not match:
         return ""
-    return f"outgoing:video:{value}"
+    return f"outgoing:video:{match.group(1)}"
+
+
+MAX_OUTBOUND_KIND_ECHO_TTL = 10 * 60
+
+
+def _max_outbound_media_kind(item):
+    item = item if isinstance(item, dict) else {}
+    kind = str(item.get("kind") or item.get("type") or "").casefold()
+    aliases = {
+        "photo": "image", "sticker": "image", "sticker_image": "image",
+        "video_note": "video", "animation": "video", "voice": "audio",
+        "file": "document", "unknown": "document",
+    }
+    if kind:
+        return aliases.get(kind, kind)
+    mime = str(item.get("mime_type") or item.get("content_type") or "").casefold()
+    return (
+        "image" if mime.startswith("image/") else
+        "video" if mime.startswith("video/") else
+        "audio" if mime.startswith("audio/") else "document"
+    )
+
+
+def _remember_max_outbound_kind_echoes(chat_ids, media):
+    media_items = media if isinstance(media, list) else ([media] if media else [])
+    counts = {}
+    for item in media_items:
+        kind = _max_outbound_media_kind(item)
+        # MAX may re-encode a video note, so its downloaded bytes can differ
+        # from Telegram's original. Text and other media already have exact
+        # fingerprints; use this short-lived fallback for videos only.
+        if kind != "video":
+            continue
+        counts[kind] = counts.get(kind, 0) + 1
+    for chat_id in set(int(value) for value in chat_ids):
+        for kind, count in counts.items():
+            for _ in range(count):
+                marker = f"outgoing-kind:{kind}:{uuid.uuid4().hex}"
+                _remember_max_outbound_echo(
+                    chat_id, marker, ttl_seconds=MAX_OUTBOUND_KIND_ECHO_TTL
+                )
+
+
+def _max_outbound_post_media_kinds(post):
+    post = post if isinstance(post, dict) else {}
+    kinds = set()
+    if post.get("video_note_hint"):
+        kinds.add("video")
+    if post.get("voice_hint"):
+        kinds.add("audio")
+    for item in post.get("media_files") or []:
+        kind = _max_outbound_media_kind(item)
+        if kind:
+            kinds.add(kind)
+    return kinds
 
 
 def _load_max_outbound_suppressions():
@@ -1614,18 +1670,25 @@ def _load_max_outbound_suppressions():
         for row in rows:
             created_at = row.get("created_at")
             try:
-                expires_at = float(created_at.timestamp()) + 2 * 24 * 60 * 60
+                fingerprint = str(row["fingerprint"])
+                ttl_seconds = (
+                    MAX_OUTBOUND_KIND_ECHO_TTL
+                    if fingerprint.startswith("outgoing-kind:")
+                    else 2 * 24 * 60 * 60
+                )
+                expires_at = float(created_at.timestamp()) + ttl_seconds
                 if expires_at > now:
-                    max_outbound_suppressions[(int(row["chat_id"]), str(row["fingerprint"]))] = expires_at
+                    max_outbound_suppressions[(int(row["chat_id"]), fingerprint)] = expires_at
             except (AttributeError, TypeError, ValueError):
                 continue
 
 
-def _remember_max_outbound_echo(chat_id, fingerprint):
+def _remember_max_outbound_echo(chat_id, fingerprint, ttl_seconds=None):
     key = (int(chat_id), str(fingerprint))
     with max_outbound_suppressions_lock:
         remember_max_outbound_message(*key)
-        max_outbound_suppressions[key] = time.time() + 2 * 24 * 60 * 60
+        ttl_seconds = float(ttl_seconds or 2 * 24 * 60 * 60)
+        max_outbound_suppressions[key] = time.time() + ttl_seconds
 
 
 def _consume_max_outbound_echo(chat_id, fingerprint):
@@ -1636,6 +1699,37 @@ def _consume_max_outbound_echo(chat_id, fingerprint):
         if not expires_at or expires_at <= now:
             max_outbound_suppressions.pop(key, None)
             return False
+        max_outbound_suppressions.pop(key, None)
+        try:
+            consume_max_outbound_message(*key)
+        except Exception as error:
+            debug_logger.warning(
+                "MAX_OUTBOUND_SUPPRESSION_CONSUME_FAILED chat_id=%s error_type=%s",
+                chat_id, type(error).__name__,
+            )
+        return True
+
+
+def _consume_max_outbound_kind_echo(chat_id, kind):
+    prefix = f"outgoing-kind:{str(kind or '').casefold()}:"
+    now = time.time()
+    with max_outbound_suppressions_lock:
+        candidates = [
+            (key, expires_at)
+            for key, expires_at in max_outbound_suppressions.items()
+            if key[0] == int(chat_id) and key[1].startswith(prefix)
+        ]
+        expired_keys = [key for key, expires_at in candidates if expires_at <= now]
+        for expired_key in expired_keys:
+            max_outbound_suppressions.pop(expired_key, None)
+            try:
+                consume_max_outbound_message(*expired_key)
+            except Exception:
+                pass
+        candidates = [(key, expiry) for key, expiry in candidates if expiry > now]
+        if not candidates:
+            return False
+        key, _ = min(candidates, key=lambda item: item[1])
         max_outbound_suppressions.pop(key, None)
         try:
             consume_max_outbound_message(*key)
@@ -1692,7 +1786,16 @@ def _process_posts(
             outbound_video_time_echo = _consume_max_outbound_echo(
                 chat_id, _outbound_video_time_fingerprint(post.get("time"))
             )
-        if outbound_source_echo or outbound_text_echo or outbound_media_echo or outbound_video_time_echo:
+        outbound_kind_echo = False
+        if (
+            post.get("is_outgoing") or outbound_source_echo or outbound_text_echo
+            or outbound_media_echo or outbound_video_time_echo
+        ):
+            for media_kind in _max_outbound_post_media_kinds(post):
+                if _consume_max_outbound_kind_echo(chat_id, media_kind):
+                    outbound_kind_echo = True
+                    break
+        if outbound_source_echo or outbound_text_echo or outbound_media_echo or outbound_video_time_echo or outbound_kind_echo:
             _commit_successful_post(chat_id, post)
             _cleanup_post_media(post)
             skipped_count += 1
@@ -1801,15 +1904,14 @@ def _process_posts(
             _cleanup_post_media(post)
 
     button_chat = get_chat_by_id(int(chat_id))
-    should_sync_button = bool(new_count)
-    if (
-        button_chat and not should_sync_button and button_chat.get("is_active")
+    # Recheck the single inline action every parse cycle so it is restored if
+    # Telegram or another client removed the keyboard, and moved beside the
+    # newest parser post without leaving copies on older posts.
+    should_sync_button = bool(
+        button_chat
+        and button_chat.get("is_active")
         and button_chat.get("max_source_type") in {"group", "private"}
-    ):
-        button_destination = int(button_chat.get("destination_chat_id") or chat_id)
-        latest_button_anchor = _latest_parser_send_anchor(int(chat_id), button_destination)
-        saved_button_anchor = int(button_chat.get("max_send_button_message_id") or 0)
-        should_sync_button = bool(latest_button_anchor and saved_button_anchor != int(latest_button_anchor))
+    )
     if should_sync_button:
         try:
             _sync_max_send_button(
@@ -6185,8 +6287,6 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
         def remember_outbound_echo(normalized_media_hashes=None):
             for media_hash in normalized_media_hashes or []:
                 fingerprints.add(f"media:{media_hash}")
-            if not fingerprints:
-                return
             affected_chat_ids = {int(source_chat_id)}
             for candidate in get_all_chats():
                 if candidate.get("max_url") == chat.get("max_url"):
@@ -6194,6 +6294,7 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             for affected_chat_id in affected_chat_ids:
                 for fingerprint in fingerprints:
                     _remember_max_outbound_echo(affected_chat_id, fingerprint)
+            _remember_max_outbound_kind_echoes(affected_chat_ids, media)
 
         def remember_outbound_source(source_id, row=None):
             source_id = str(source_id or "").strip()
@@ -6392,28 +6493,27 @@ def _max_send_button_is_eligible(chat):
         or not chat.get("is_active")
         or not chat.get("max_url")
         or chat.get("max_source_type") not in {"group", "private"}
-        or not bool(chat.get("max_source_type_verified"))
         or not os.path.exists(_session_path_for_chat(chat))
     ):
         return False
     owner_id = int(chat.get("owner_id") or 0)
     if owner_id and _user_needs_subscription(owner_id, chat.get("account_mode") or "self"):
         return False
+    destination_type = str(chat.get("destination_type") or "group")
     try:
         destination_chat_id = int(chat.get("destination_chat_id") or chat["chat_id"])
-        telegram_chat = bot.get_chat(destination_chat_id)
-        destination_type = str(chat.get("destination_type") or "group")
-        actual_type = getattr(telegram_chat, "type", None)
-        if destination_type == "private":
-            owner_id = int(chat.get("owner_id") or 0)
-            return actual_type == "private" and (not owner_id or destination_chat_id == owner_id)
-        return actual_type in {"group", "supergroup"}
-    except Exception:
+    except (KeyError, TypeError, ValueError):
         return False
+    # The persisted destination type is established when the user connects the
+    # Telegram target. Avoid hiding the button when a transient getChat request
+    # fails; actual access is rechecked when the button is used.
+    if destination_type == "private":
+        return bool(owner_id and destination_chat_id == owner_id)
+    return destination_type in {"group", "supergroup"}
 
 
 def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=None):
-    """Keep one MAX-send link visible on a single parser post per connection."""
+    """Keep one MAX-send link beside the newest parser post for each connection."""
     chat = get_chat_by_id(int(chat_id))
     if not _max_send_button_is_eligible(chat):
         _remove_max_send_button(chat_id)
@@ -6424,50 +6524,41 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
     existing_id = chat.get("max_send_button_message_id")
     keyboard = _public_max_send_button_keyboard(chat_id)
 
-    # Keep the first valid anchor. Repositioning this control after every parse
-    # cycle made it appear under every new message and flooded the chat.
-    if existing_id:
+    target_id = anchor_message_id or _latest_parser_send_anchor(
+        int(chat_id), destination_chat_id
+    )
+    if not target_id:
+        return False
+    target_id = int(target_id)
+    if existing_id and int(existing_id) != target_id:
         existing_id = int(existing_id)
         try:
-            bot.edit_message_reply_markup(
-                destination_chat_id, existing_id, reply_markup=keyboard
-            )
-            return True
+            bot.edit_message_reply_markup(destination_chat_id, existing_id, reply_markup=None)
         except Exception as error:
             error_text = str(error).lower()
-            if "message is not modified" in error_text:
-                return True
-            if not any(marker in error_text for marker in (
+            if "message is not modified" not in error_text and not any(marker in error_text for marker in (
                 "message to edit not found", "message_id_invalid", "message can't be edited",
             )):
                 debug_logger.warning(
-                    "MAX_SEND_BUTTON_REFRESH_FAILED chat_id=%s message_id=%s error=%s",
+                    "MAX_SEND_BUTTON_MOVE_FAILED chat_id=%s message_id=%s error=%s",
                     chat_id, existing_id, log_preview(error, 180),
                 )
                 return False
-            _clear_max_send_anchor(int(chat_id), destination_chat_id, existing_id)
-            set_max_send_button_message_id(int(chat_id), None)
+        set_max_send_button_message_id(int(chat_id), None)
 
-    anchor_message_id = (
-        anchor_message_id
-        or _latest_parser_send_anchor(int(chat_id), destination_chat_id)
-    )
-    if not anchor_message_id:
-        return False
-    anchor_message_id = int(anchor_message_id)
     try:
         bot.edit_message_reply_markup(
-            destination_chat_id, anchor_message_id, reply_markup=keyboard
+            destination_chat_id, target_id, reply_markup=keyboard
         )
-        set_max_send_button_message_id(int(chat_id), anchor_message_id)
+        set_max_send_button_message_id(int(chat_id), target_id)
         return True
     except Exception as error:
         if "message is not modified" in str(error).lower():
-            set_max_send_button_message_id(int(chat_id), anchor_message_id)
+            set_max_send_button_message_id(int(chat_id), target_id)
             return True
         debug_logger.warning(
             "MAX_SEND_BUTTON_ATTACH_FAILED chat_id=%s message_id=%s error=%s",
-            chat_id, anchor_message_id, log_preview(error, 180),
+            chat_id, target_id, log_preview(error, 180),
         )
         return False
 
@@ -6995,6 +7086,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             for affected_chat_id in affected_chat_ids:
                 for fingerprint in fingerprints:
                     _remember_max_outbound_echo(affected_chat_id, fingerprint)
+            _remember_max_outbound_kind_echoes(affected_chat_ids, media)
 
         def remember_outbound_source(source_id, row=None):
             source_id = str(source_id or "").strip()
