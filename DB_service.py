@@ -157,15 +157,55 @@ def init_db():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_conversations (
+                conversation_id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                user_name TEXT NOT NULL DEFAULT '',
+                username TEXT,
+                assigned_admin_id BIGINT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_support_conversations_closed_started
+            ON support_conversations (closed_at, started_at DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_conversation_messages (
+                message_id BIGSERIAL PRIMARY KEY,
+                conversation_id BIGINT NOT NULL REFERENCES support_conversations(conversation_id) ON DELETE CASCADE,
+                sender_type TEXT NOT NULL CHECK (sender_type IN ('user', 'admin', 'system')),
+                sender_id BIGINT,
+                sender_name TEXT,
+                sender_username TEXT,
+                content_type TEXT NOT NULL DEFAULT 'text',
+                text_content TEXT NOT NULL DEFAULT '',
+                source_chat_id BIGINT,
+                source_message_id BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_support_conversation_messages_order
+            ON support_conversation_messages (conversation_id, created_at, message_id)
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS support_sessions (
                 user_id BIGINT PRIMARY KEY,
                 assigned_admin_id BIGINT,
+                pending_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 opened_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.execute("""
             ALTER TABLE support_sessions
             ADD COLUMN IF NOT EXISTS assigned_admin_id BIGINT
+        """)
+        conn.execute("""
+            ALTER TABLE support_sessions
+            ADD COLUMN IF NOT EXISTS pending_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE
         """)
 
         conn.execute("""
@@ -662,6 +702,141 @@ def open_support_session(user_id: int):
         )
 
 
+def create_support_conversation(user_id: int, user_name: str = "", username: str = "") -> int:
+    with get_connection() as conn:
+        row = conn.execute("""
+            INSERT INTO support_conversations (user_id, user_name, username)
+            VALUES (%s, %s, %s)
+            RETURNING conversation_id
+        """, (int(user_id), str(user_name or ""), str(username or "") or None)).fetchone()
+        return int(row["conversation_id"])
+
+
+def get_open_support_conversation_id(user_id: int):
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT conversation_id
+            FROM support_conversations
+            WHERE user_id = %s AND closed_at IS NULL
+            ORDER BY conversation_id DESC
+            LIMIT 1
+        """, (int(user_id),)).fetchone()
+        return int(row["conversation_id"]) if row else None
+
+
+def save_support_conversation_message(
+    user_id: int,
+    sender_type: str,
+    sender_id: int | None = None,
+    sender_name: str = "",
+    sender_username: str = "",
+    content_type: str = "text",
+    text_content: str = "",
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
+):
+    sender_type = str(sender_type or "").strip().lower()
+    if sender_type not in {"user", "admin", "system"}:
+        raise ValueError("Invalid support conversation sender_type")
+    with get_connection() as conn:
+        row = conn.execute("""
+            INSERT INTO support_conversation_messages (
+                conversation_id, sender_type, sender_id, sender_name,
+                sender_username, content_type, text_content,
+                source_chat_id, source_message_id
+            )
+            SELECT conversation_id, %s, %s, %s, %s, %s, %s, %s, %s
+            FROM support_conversations
+            WHERE user_id = %s AND closed_at IS NULL
+            ORDER BY conversation_id DESC
+            LIMIT 1
+            RETURNING message_id
+        """, (
+            sender_type,
+            int(sender_id) if sender_id is not None else None,
+            str(sender_name or ""), str(sender_username or ""),
+            str(content_type or "text"), str(text_content or ""),
+            int(source_chat_id) if source_chat_id is not None else None,
+            int(source_message_id) if source_message_id is not None else None,
+            int(user_id),
+        )).fetchone()
+        return int(row["message_id"]) if row else None
+
+
+def list_support_conversations(page: int = 0, page_size: int = 8):
+    page = max(0, int(page))
+    page_size = max(1, min(int(page_size), 10))
+    offset = page * page_size
+    with get_connection() as conn:
+        total = int(conn.execute(
+            "SELECT COUNT(*) AS count FROM support_conversations WHERE closed_at IS NOT NULL"
+        ).fetchone()["count"])
+        rows = conn.execute("""
+            SELECT conversation_id, user_id, user_name, username,
+                   assigned_admin_id, started_at, closed_at
+            FROM support_conversations
+            WHERE closed_at IS NOT NULL
+            ORDER BY closed_at DESC, conversation_id DESC
+            LIMIT %s OFFSET %s
+        """, (page_size, offset)).fetchall()
+        return {"items": list(rows), "total": total, "page": page, "page_size": page_size}
+
+
+def get_support_conversation(conversation_id: int):
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT conversation_id, user_id, user_name, username,
+                   assigned_admin_id, started_at, closed_at
+            FROM support_conversations
+            WHERE conversation_id = %s AND closed_at IS NOT NULL
+        """, (int(conversation_id),)).fetchone()
+
+
+def get_support_conversation_messages(conversation_id: int):
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT message_id, sender_type, sender_id, sender_name,
+                   sender_username, content_type, text_content,
+                   source_chat_id, source_message_id, created_at
+            FROM support_conversation_messages
+            WHERE conversation_id = %s
+            ORDER BY created_at, message_id
+        """, (int(conversation_id),)).fetchall()
+        return list(rows)
+
+
+def enable_support_pending_reply(user_id: int):
+    with get_connection() as conn:
+        row = conn.execute("""
+            UPDATE support_sessions
+            SET pending_reply_enabled = TRUE
+            WHERE user_id = %s AND assigned_admin_id IS NULL
+            RETURNING user_id
+        """, (int(user_id),)).fetchone()
+        return row is not None
+
+
+def consume_support_pending_reply(user_id: int):
+    """Consume the one-message pre-accept reply permission atomically."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            UPDATE support_sessions
+            SET pending_reply_enabled = FALSE
+            WHERE user_id = %s AND assigned_admin_id IS NULL
+              AND pending_reply_enabled = TRUE
+            RETURNING user_id
+        """, (int(user_id),)).fetchone()
+        return row is not None
+
+
+def clear_support_pending_reply(user_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE support_sessions SET pending_reply_enabled = FALSE WHERE user_id = %s",
+            (int(user_id),),
+        )
+
+
 def get_open_support_sessions():
     with get_connection() as conn:
         rows = conn.execute("SELECT user_id FROM support_sessions").fetchall()
@@ -673,11 +848,16 @@ def claim_support_session(user_id: int, admin_id: int):
     with get_connection() as conn:
         row = conn.execute("""
             UPDATE support_sessions
-            SET assigned_admin_id = %s
+            SET assigned_admin_id = %s, pending_reply_enabled = FALSE
             WHERE user_id = %s AND assigned_admin_id IS NULL
             RETURNING assigned_admin_id
         """, (int(admin_id), int(user_id))).fetchone()
         if row:
+            conn.execute("""
+                UPDATE support_conversations
+                SET assigned_admin_id = %s
+                WHERE user_id = %s AND closed_at IS NULL
+            """, (int(admin_id), int(user_id)))
             return {"claimed": True, "admin_id": int(row["assigned_admin_id"])}
         row = conn.execute(
             "SELECT assigned_admin_id FROM support_sessions WHERE user_id = %s",
@@ -760,6 +940,11 @@ def close_support_session(user_id: int):
         conn.execute("DELETE FROM support_request_notifications WHERE user_id = %s", (user_id,))
         conn.execute("DELETE FROM support_sessions WHERE user_id = %s", (user_id,))
         conn.execute("DELETE FROM support_message_routes WHERE user_id = %s", (user_id,))
+        conn.execute("""
+            UPDATE support_conversations
+            SET closed_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND closed_at IS NULL
+        """, (int(user_id),))
 
 
 def select_users():

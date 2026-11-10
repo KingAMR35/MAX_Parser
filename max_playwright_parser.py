@@ -4413,13 +4413,17 @@ def _detect_max_chat_source_type(page) -> str | None:
                         r.width > 180 && r.height < 220;
                 });
             const parts = [];
+            let hasDirectCallControl = false;
             for (const el of nodes) {
                 const text = (el.innerText || '').trim();
                 if (text && text.length < 700) parts.push(text);
                 for (const control of el.querySelectorAll('button,[role="button"],[aria-label],[title]')) {
                     const label = [control.innerText, control.getAttribute('aria-label'), control.title,
-                        control.getAttribute('data-testid')].filter(Boolean).join(' ').trim();
+                        control.getAttribute('data-testid'), control.className].filter(Boolean).join(' ').trim();
                     if (label && label.length < 180) parts.push(label);
+                    if (/audio.?call|video.?call|call|звон|телефон|позвон/i.test(label)) {
+                        hasDirectCallControl = true;
+                    }
                 }
             }
             const composers = [...document.querySelectorAll(
@@ -4440,7 +4444,8 @@ def _detect_max_chat_source_type(page) -> str | None:
             return {
                 text: [...new Set(parts)].join(' | ').slice(0, 3000),
                 hasComposer: composers.length > 0,
-                composerLabels
+                composerLabels,
+                hasDirectCallControl
             };
         }""")
     except Exception:
@@ -4449,10 +4454,12 @@ def _detect_max_chat_source_type(page) -> str | None:
         header_text = signals.get("text") or ""
         has_composer = bool(signals.get("hasComposer"))
         composer_labels = str(signals.get("composerLabels") or "")
+        has_direct_call_control = bool(signals.get("hasDirectCallControl"))
     else:
         header_text = signals or ""
         has_composer = False
         composer_labels = ""
+        has_direct_call_control = False
     text = re.sub(r"\s+", " ", str(header_text)).casefold()
     composer_text = re.sub(r"\s+", " ", composer_labels).casefold()
     channel_signal = bool(re.search(
@@ -4473,7 +4480,7 @@ def _detect_max_chat_source_type(page) -> str | None:
         r"\b(?:в сети|был(?:а|\(а\))? в сети|был(?:а|\(а\))? недавно|last seen|online)\b",
         text,
     ))
-    if direct_signal:
+    if direct_signal or has_direct_call_control:
         return "private"
     if has_composer:
         return "group"
@@ -7694,6 +7701,60 @@ def send_message_to_max(
             except Exception:
                 return ()
 
+        def send_debug_state():
+            try:
+                return page.evaluate("""() => {
+                    const c=document.querySelector('[data-max-parser-send-composer="true"]');
+                    const visible=el=>{
+                        const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+                        return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';
+                    };
+                    const cr=c?c.getBoundingClientRect():null;
+                    const shell=c&&(c.closest('form,[class*="composer" i],[class*="message" i]')||c.parentElement);
+                    const nearby=c?[...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                        .filter(el=>visible(el)&&!el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"]'))
+                        .map(el=>{
+                            const r=el.getBoundingClientRect();
+                            return {el,r,dy:Math.abs((r.top+r.height/2)-(cr.top+cr.height/2))};
+                        }).filter(x=>x.dy<110&&x.r.top>window.innerHeight*.5)
+                        .sort((a,b)=>a.r.left-b.r.left).slice(-4).map(x=>({
+                            cls:String(x.el.className||'').slice(0,18),
+                            label:String(x.el.getAttribute('aria-label')||x.el.title||x.el.innerText||'').slice(0,18),
+                            disabled:Boolean(x.el.disabled)||x.el.getAttribute('aria-disabled')==='true',
+                            x:Math.round(x.r.left)
+                        })) : [];
+                    const inputs=[...document.querySelectorAll('input[type="file"]')].slice(0,3).map(el=>({
+                        accept:el.getAttribute('accept')||'',cls:String(el.className||'').slice(0,16),
+                        parent:String(el.parentElement?.className||'').slice(0,18),
+                        related:Boolean(shell&&shell.contains(el)),
+                        files:el.files?.length||0
+                    }));
+                    const rows=[...document.querySelectorAll('.item')];
+                    const globalPreview=[...document.querySelectorAll(
+                        'img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i]'
+                    )].filter(visible).length;
+                    let composerRoot=c;
+                    for(let i=0;i<3&&composerRoot?.parentElement;i++) composerRoot=composerRoot.parentElement;
+                    const previewSelector='img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i]';
+                    const composerPreview=composerRoot?[...composerRoot.querySelectorAll(previewSelector)].filter(visible).length:0;
+                    const nearComposerMedia=c?[...document.querySelectorAll(previewSelector)]
+                        .filter(el=>visible(el)&&!el.closest('.item')).filter(el=>{
+                            const r=el.getBoundingClientRect();
+                            return r.top>cr.top-220&&r.top<window.innerHeight;
+                        }).length:0;
+                    return {
+                        composerFound:Boolean(c),composerChars:c?String(c.innerText||c.value||'').length:-1,
+                        composerBox:cr?[Math.round(cr.x),Math.round(cr.y),Math.round(cr.width),Math.round(cr.height)]:null,
+                        focused:Boolean(c&&c===document.activeElement),
+                        globalPreview,composerPreview,nearComposerMedia,
+                        selectedFiles:inputs.reduce((n,x)=>n+x.files,0),inputs,
+                        chatRows:rows.length,lastRowMedia:rows.length?rows[rows.length-1].querySelectorAll('img,video,audio,canvas').length:0,
+                        nearby
+                    };
+                }""")
+            except Exception as error:
+                return {"diagnostic_error": type(error).__name__}
+
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
             uploaded = False
@@ -7769,11 +7830,18 @@ def send_message_to_max(
                         if int(received_count or 0) == expected_count:
                             uploaded = True
                             try:
-                                upload_route = candidate.evaluate("""el => [
-                                    'file-input',el.getAttribute('accept')||'',
-                                    String(el.className||'').slice(0,70),
-                                    el.getAttribute('data-testid')||''
-                                ].join(':')""", timeout=500)
+                                upload_route = candidate.evaluate("""el => {
+                                    const p=el.parentElement;
+                                    const c=document.querySelector('[data-max-parser-send-composer="true"]');
+                                    const shell=el.closest('form,[class*="composer" i],[class*="message" i]');
+                                    return [
+                                        'file-input',el.getAttribute('accept')||'',
+                                        String(el.className||'').slice(0,70),
+                                        el.getAttribute('data-testid')||'',
+                                        p?.tagName||'',String(p?.className||'').slice(0,35),
+                                        Boolean(shell&&c&&shell.contains(c))
+                                    ].join(':');
+                                }""", timeout=500)
                             except Exception:
                                 upload_route = "file-input:metadata-unavailable"
                             break
@@ -7936,14 +8004,24 @@ def send_message_to_max(
             if not upload_payload:
                 break
             # MAX can keep the send control disabled while it is preparing a
-            # selected attachment. Wait for it to become available before the
-            # one-shot Enter fallback below is considered.
+            # selected attachment. Wait before deciding that no send control
+            # became available.
             page.wait_for_timeout(250)
         before_tail = chat_tail_snapshot() if upload_payload else ()
-        if on_before_send:
-            on_before_send(normalized_media_hashes)
         send_mode = "button" if send_button is not None else "enter"
         send_control_info = ""
+        if upload_payload and send_button is None:
+            diagnostic = {
+                "upload": upload_route[:120],
+                "method": "no-send-control",
+                "state": send_debug_state(),
+            }
+            raise RuntimeError(
+                "MAX_SEND_CONTROL_NOT_FOUND: " +
+                json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))[:850]
+            )
+        if on_before_send:
+            on_before_send(normalized_media_hashes)
         if send_button is not None:
             try:
                 send_control_info = send_button.evaluate("""el => {
@@ -7956,9 +8034,8 @@ def send_message_to_max(
                 pass
             send_button.click(timeout=2500)
         else:
-            # Some MAX versions render the send control as an unlabeled icon.
-            # If the upload is already selected, Enter is the same single send
-            # action and avoids falsely failing just because the icon has no label.
+            # Enter is only a fallback for text-only messages. Media messages
+            # must use an actual send control, or this can insert a newline.
             composer.press("Enter", timeout=2500)
 
         send_confirmed = False

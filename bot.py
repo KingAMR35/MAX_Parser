@@ -196,6 +196,8 @@ def _telegram_media_input(media: dict, post: dict, caption: str = ""):
     )
 support_message_routes = get_support_message_routes()
 support_state_lock = threading.RLock()
+support_delivery_locks = {}
+support_delivery_locks_guard = threading.Lock()
 PARSE_DIAGNOSTICS = {}
 PARSE_DIAGNOSTICS_LOCK = threading.RLock()
 CHAT_LIFECYCLE_LOCK = threading.RLock()
@@ -217,6 +219,7 @@ awaiting_review_text = {}
 remote_auth_monitors = set()
 remote_auth_monitor_lock = threading.Lock()
 SUPPORT_END_TEXT = "✅ Завершить чат с поддержкой"
+SUPPORT_REPLY_NOW_TEXT = "💬 Ответить не дожидаясь"
 MAX_PROJECT_ACCOUNT_PHONE = "+7 939 752 85 95"
 try:
     MAX_CONCURRENT_CHAT_PARSERS = max(
@@ -2643,6 +2646,7 @@ def show_admin_menu(chat_id):
     kb.add(types.InlineKeyboardButton("📊 Статус парсинга", callback_data="admin_parse_status"))
     kb.add(types.InlineKeyboardButton("🧪 Последний разбор сообщений", callback_data="admin_parse_diagnostics"))
     kb.add(types.InlineKeyboardButton("🗑 Удалить сообщения бота", callback_data="admin_sent_messages"))
+    kb.add(types.InlineKeyboardButton("🗂 История обращений", callback_data="support_history_page_0"))
     kb.row(
         types.InlineKeyboardButton("👑 Админы", callback_data="admin_admins"),
         types.InlineKeyboardButton("👤 Пользователи", callback_data="admin_users")
@@ -4586,8 +4590,10 @@ def _send_review_for_moderation(review_id, user_id, review_text):
     )
 
 
-def _support_keyboard():
+def _support_keyboard(waiting=False):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    if waiting:
+        keyboard.add(types.KeyboardButton(SUPPORT_REPLY_NOW_TEXT))
     keyboard.add(types.KeyboardButton(SUPPORT_END_TEXT))
     return keyboard
 
@@ -4632,6 +4638,165 @@ def _support_admin_ids():
             "SUPPORT_ADMIN_LIST_FAILED error_type=%s", type(error).__name__
         )
     return sorted(admin_ids)
+
+
+def _support_delivery_lock(user_id):
+    """Serialize acceptance and message routing for one support conversation."""
+    user_id = int(user_id)
+    with support_delivery_locks_guard:
+        return support_delivery_locks.setdefault(user_id, threading.RLock())
+
+
+def _support_message_body(message):
+    text = str(getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if text:
+        return text
+    content_type = str(getattr(message, "content_type", "") or "message")
+    return {
+        "photo": "[Фото]", "video": "[Видео]", "document": "[Файл]",
+        "audio": "[Аудио]", "voice": "[Голосовое сообщение]",
+        "animation": "[Анимация]", "sticker": "[Стикер]",
+        "video_note": "[Видеосообщение]", "location": "[Геопозиция]",
+        "contact": "[Контакт]", "venue": "[Место]", "poll": "[Опрос]",
+    }.get(content_type, f"[{content_type}]")
+
+
+def _save_support_history_message(user_id, message, sender_type):
+    actor = getattr(message, "from_user", None)
+    sender_name = " ".join(
+        part for part in (getattr(actor, "first_name", None), getattr(actor, "last_name", None)) if part
+    ).strip()
+    try:
+        return save_support_conversation_message(
+            user_id=int(user_id),
+            sender_type=sender_type,
+            sender_id=int(actor.id) if actor else None,
+            sender_name=sender_name,
+            sender_username=str(getattr(actor, "username", None) or ""),
+            content_type=str(getattr(message, "content_type", "text") or "text"),
+            text_content=_support_message_body(message),
+            source_chat_id=int(message.chat.id),
+            source_message_id=int(message.message_id),
+        )
+    except Exception as error:
+        debug_logger.warning(
+            "SUPPORT_HISTORY_MESSAGE_SAVE_FAILED user_id=%s sender=%s error_type=%s",
+            user_id, sender_type, type(error).__name__,
+        )
+        return None
+
+
+def _support_history_date(value):
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone().strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "время неизвестно"
+
+
+def _support_history_keyboard(page, total, page_size):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    result = list_support_conversations(page, page_size)
+    for item in result["items"]:
+        name = str(item.get("user_name") or "Пользователь").strip() or "Пользователь"
+        stamp = _support_history_date(item.get("closed_at"))
+        keyboard.add(types.InlineKeyboardButton(
+            f"{stamp} · {name[:24]} · ID {int(item['user_id'])}",
+            callback_data=f"support_history_open_{int(item['conversation_id'])}",
+        ))
+    navigation = []
+    if page > 0:
+        navigation.append(types.InlineKeyboardButton("◀️ Новее", callback_data=f"support_history_page_{page - 1}"))
+    if (page + 1) * page_size < total:
+        navigation.append(types.InlineKeyboardButton("Старее ▶️", callback_data=f"support_history_page_{page + 1}"))
+    if navigation:
+        keyboard.row(*navigation)
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    return keyboard
+
+
+def _show_support_history(admin_id, page=0, message_id=None):
+    if not is_admin(int(admin_id)):
+        return
+    page_size = 8
+    result = list_support_conversations(page, page_size)
+    if result["total"]:
+        text = (
+            "🗂 <b>История обращений</b>\n\n"
+            f"Завершённых диалогов: <b>{result['total']}</b>. Выберите обращение, чтобы просмотреть переписку."
+        )
+    else:
+        text = "🗂 <b>История обращений</b>\n\nЗавершённых диалогов пока нет."
+    keyboard = _support_history_keyboard(int(page), result["total"], page_size)
+    if message_id:
+        safe_edit_message(text, admin_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+    else:
+        bot.send_message(admin_id, text, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def _show_support_conversation_history(admin_id, conversation_id):
+    if not is_admin(int(admin_id)):
+        return
+    conversation = get_support_conversation(int(conversation_id))
+    if not conversation:
+        bot.send_message(admin_id, "Эта история уже недоступна.", **NO_PREVIEW)
+        return
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("🔙 К обращениям", callback_data="support_history_page_0"))
+    opened = _support_history_date(conversation.get("started_at"))
+    closed = _support_history_date(conversation.get("closed_at"))
+    name = escape_html(conversation.get("user_name") or "Имя не указано")
+    username = f"@{escape_html(conversation['username'])}" if conversation.get("username") else "не указан"
+    text = (
+        "🗂 <b>История обращения</b>\n"
+        f"👤 {name}\n🔎 Никнейм: {username}\n"
+        f"🆔 ID: <code>{int(conversation['user_id'])}</code>\n"
+        f"🕐 Начало: {opened}\n🏁 Завершено: {closed}"
+    )
+    bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=keyboard, **NO_PREVIEW)
+    for item in get_support_conversation_messages(int(conversation_id)):
+        sender_type = item.get("sender_type")
+        if sender_type == "system":
+            bot.send_message(
+                admin_id,
+                f"ℹ️ <b>{escape_html(item.get('text_content') or 'Событие')}</b> · {_support_history_date(item.get('created_at'))}",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
+            continue
+        sender_label = "Пользователь" if sender_type == "user" else "Администратор"
+        sender_name = str(item.get("sender_name") or "").strip()
+        if sender_name:
+            sender_label += f" · {sender_name}"
+        if item.get("sender_username"):
+            sender_label += f" (@{item['sender_username']})"
+        bot.send_message(
+            admin_id,
+            f"<b>{escape_html(sender_label)}</b> · {_support_history_date(item.get('created_at'))}",
+            parse_mode="HTML",
+            **NO_PREVIEW,
+        )
+        source_chat_id = item.get("source_chat_id")
+        source_message_id = item.get("source_message_id")
+        copied = False
+        if source_chat_id and source_message_id:
+            try:
+                bot.copy_message(admin_id, int(source_chat_id), int(source_message_id))
+                copied = True
+            except Exception as error:
+                debug_logger.info(
+                    "SUPPORT_HISTORY_COPY_FAILED conversation_id=%s message_id=%s error_type=%s",
+                    conversation_id, item.get("message_id"), type(error).__name__,
+                )
+        if not copied:
+            fallback = str(item.get("text_content") or "[Сообщение недоступно]")
+            bot.send_message(
+                admin_id,
+                f"<blockquote>{escape_html(fallback[:3500])}</blockquote>",
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
 
 
 def _support_claim_status_text(user_id, admin):
@@ -4716,6 +4881,55 @@ def _broadcast_support_claim(user_id, admin):
                     pass
     if delivered == 0:
         raise RuntimeError("Не удалось сообщить администраторам о принятом обращении")
+
+
+def _notify_support_user_accepted(user_id, admin):
+    admin_name, admin_username = _support_user_label(admin)
+    sent = bot.send_message(
+        int(user_id),
+        "✅ <b>Администратор принял ваше обращение</b>\n\n"
+        f"👤 {admin_name}\n🔎 Никнейм: {admin_username}\n\n"
+        "Теперь вы переписываетесь напрямую с этим администратором.",
+        parse_mode="HTML",
+        reply_markup=_support_keyboard(waiting=False),
+        **NO_PREVIEW,
+    )
+    try:
+        save_support_conversation_message(
+            user_id=int(user_id),
+            sender_type="system",
+            sender_id=int(admin.id),
+            sender_name="Обращение принято",
+            content_type="system",
+            text_content=f"Администратор {admin_name} принял обращение",
+            source_chat_id=int(user_id),
+            source_message_id=int(sent.message_id),
+        )
+    except Exception as error:
+        debug_logger.warning(
+            "SUPPORT_ACCEPT_EVENT_SAVE_FAILED user_id=%s error_type=%s",
+            user_id, type(error).__name__,
+        )
+
+
+def _save_support_system_event(user_id, text, actor_id=None, source_chat_id=None, source_message_id=None):
+    try:
+        return save_support_conversation_message(
+            user_id=int(user_id),
+            sender_type="system",
+            sender_id=int(actor_id) if actor_id is not None else None,
+            sender_name="Событие",
+            content_type="system",
+            text_content=str(text or ""),
+            source_chat_id=int(source_chat_id) if source_chat_id is not None else None,
+            source_message_id=int(source_message_id) if source_message_id is not None else None,
+        )
+    except Exception as error:
+        debug_logger.warning(
+            "SUPPORT_HISTORY_EVENT_SAVE_FAILED user_id=%s error_type=%s",
+            user_id, type(error).__name__,
+        )
+        return None
 
 
 def _notify_support_admin_one(admin_id, user, body_message=None):
@@ -4865,7 +5079,7 @@ def _notify_support_admin(user, body_message=None):
         raise RuntimeError("Не удалось доставить обращение ни одному администратору")
 
 
-def start_support(chat_id, user):
+def start_support(chat_id, user, source_message=None):
     if chat_id != user.id:
         bot.send_message(
             chat_id,
@@ -4879,6 +5093,35 @@ def start_support(chat_id, user):
         if not already_open:
             support_sessions.add(user.id)
             open_support_session(user.id)
+            user_name = " ".join(part for part in (user.first_name, user.last_name) if part).strip()
+            try:
+                create_support_conversation(user.id, user_name, user.username or "")
+            except Exception as error:
+                debug_logger.warning(
+                    "SUPPORT_HISTORY_START_FAILED user_id=%s error_type=%s",
+                    user.id, type(error).__name__,
+                )
+    if already_open:
+        try:
+            with support_state_lock:
+                if get_open_support_conversation_id(user.id) is None:
+                    user_name = " ".join(
+                        part for part in (user.first_name, user.last_name) if part
+                    ).strip()
+                    create_support_conversation(user.id, user_name, user.username or "")
+                    if source_message and getattr(source_message, "content_type", None) == "text":
+                        _save_support_history_message(user.id, source_message, "user")
+                    _save_support_system_event(
+                        user.id,
+                        "Продолжено ранее открытое обращение",
+                        source_chat_id=chat_id,
+                        source_message_id=getattr(source_message, "message_id", None),
+                    )
+        except Exception as error:
+            debug_logger.warning(
+                "SUPPORT_HISTORY_RESUME_FAILED user_id=%s error_type=%s",
+                user.id, type(error).__name__,
+            )
     if already_open:
         assigned_admin_id = None
         try:
@@ -4897,22 +5140,31 @@ def start_support(chat_id, user):
                 "Чтобы завершить чат, нажмите кнопку ниже."
                 if assigned_admin_id is not None
                 else "🕐 Обращение ожидает ответа администратора. Пожалуйста, подождите — "
-                "администратор скоро его примет. Пока ждёте, можете отправить дополнительные сообщения."
+                "администратор скоро его примет. Если нужно отправить сообщение до принятия, "
+                f"нажмите «{SUPPORT_REPLY_NOW_TEXT}»."
             ),
-            reply_markup=_support_keyboard(),
+            reply_markup=_support_keyboard(waiting=assigned_admin_id is None),
             **NO_PREVIEW,
         )
         return
     try:
-        bot.send_message(
+        opening_message = bot.send_message(
             chat_id,
             "🆘 <b>Обращение отправлено</b>\n\n"
-            "Пожалуйста, подождите — администратор скоро его примет. Пока ждёте, "
-            "можете отправить дополнительные сообщения: их увидят все администраторы.\n\n"
+            "Пожалуйста, подождите — администратор скоро его примет. Чтобы отправить сообщение до принятия, "
+            f"нажмите «{SUPPORT_REPLY_NOW_TEXT}».\n\n"
             "После принятия переписка продолжится с администратором, который взял обращение.",
             parse_mode="HTML",
-            reply_markup=_support_keyboard(),
+            reply_markup=_support_keyboard(waiting=True),
             **NO_PREVIEW,
+        )
+        if source_message and getattr(source_message, "content_type", None) == "text":
+            _save_support_history_message(user.id, source_message, "user")
+        _save_support_system_event(
+            user.id,
+            "Обращение отправлено и ожидает принятия администратором",
+            source_chat_id=chat_id,
+            source_message_id=opening_message.message_id,
         )
         _notify_support_admin(user)
     except Exception as error:
@@ -4927,10 +5179,13 @@ def start_support(chat_id, user):
         )
 
 
-def _close_support(user_id, notify_user=True):
+def _close_support(user_id, notify_user=True, closed_by_id=None):
     with support_state_lock:
         was_open = user_id in support_sessions
+        if was_open:
+            _save_support_system_event(user_id, "Чат с техподдержкой завершён", actor_id=closed_by_id)
         support_sessions.discard(user_id)
+        clear_support_pending_reply(user_id)
         for route_key, routed_user_id in list(support_message_routes.items()):
             if routed_user_id == user_id:
                 support_message_routes.pop(route_key, None)
@@ -5224,7 +5479,7 @@ def referral_program_command(message):
 
 @bot.message_handler(commands=['help', 'help1'])
 def help_command(message):
-    start_support(message.chat.id, message.from_user)
+    start_support(message.chat.id, message.from_user, source_message=message)
 
 
 @bot.message_handler(commands=['subscription'])
@@ -5789,6 +6044,14 @@ def _customer_source_url_prompt(owner_id, chat_id):
     return text, keyboard
 
 
+def _max_source_is_private(chat):
+    return bool(
+        chat
+        and chat.get("max_source_type") == "private"
+        and chat.get("max_source_type_verified")
+    )
+
+
 def _start_admin_max_send(call, source_chat_id):
     admin_id = int(call.from_user.id)
     if admin_id != ADMIN_ID or call.message.chat.type != "private" or int(call.message.chat.id) != ADMIN_ID:
@@ -5812,10 +6075,7 @@ def _start_admin_max_send(call, source_chat_id):
     except Exception:
         pass
     nonce = uuid.uuid4().hex[:8]
-    is_private_source = (
-        chat.get("max_source_type") == "private"
-        and bool(chat.get("max_source_type_verified"))
-    )
+    is_private_source = _max_source_is_private(chat)
     with admin_max_send_flow_lock:
         current = admin_max_send_flows.get(admin_id)
         if current and current.get("stage") == "sending":
@@ -5988,7 +6248,7 @@ def _receive_admin_max_body(message, source_chat_id, nonce):
     chat = get_chat_by_id(source_chat_id) or {}
     body_preview = escape_html(value) if value else f"<i>{escape_html(flow['payload_label'])}</i>"
     sender_preview = (
-        f"<b>{escape_html(flow['sender_name'])}</b>\n\n"
+        f"<b>{escape_html(flow['sender_name'])} пишет</b>:\n\n"
         if str(flow.get("sender_name") or "").strip()
         else ""
     )
@@ -6022,7 +6282,7 @@ def _send_max_payload_with_sender(
     """Send sender attribution separately from media, inline with text-only posts."""
     body = str(body or "").strip()
     sender_name = str(sender_name or "").strip()
-    header = f"{sender_name} пишет" if sender_name else ""
+    header = f"{sender_name} пишет:" if sender_name else ""
     common = {
         "group_url": group_url,
         "chat_id": int(chat_id),
@@ -6031,7 +6291,7 @@ def _send_max_payload_with_sender(
         "source_type_callback": source_type_callback,
     }
     if media and header:
-        send_message_to_max(text=header, media=None, **common)
+        send_message_to_max(text=header, media=None, bold_first_line=True, **common)
         send_message_to_max(
             text=body,
             media=media,
@@ -6419,10 +6679,7 @@ def _start_public_max_send(call, source_chat_id):
         return
     flow_key = (destination_chat_id, int(user.id))
     nonce = uuid.uuid4().hex[:10]
-    is_private_source = (
-        chat.get("max_source_type") == "private"
-        and bool(chat.get("max_source_type_verified"))
-    )
+    is_private_source = _max_source_is_private(chat)
     initial_stage = "body" if is_private_source else "name"
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
@@ -6434,7 +6691,6 @@ def _start_public_max_send(call, source_chat_id):
             "destination_chat_id": destination_chat_id,
             "user_id": int(user.id),
             "destination_type": str(chat.get("destination_type") or "group"),
-            "source_is_private": is_private_source,
             "nonce": nonce,
             "stage": initial_stage,
             "sender_name": "",
@@ -6446,9 +6702,9 @@ def _start_public_max_send(call, source_chat_id):
             "reply_markup": _public_max_send_keyboard(nonce),
             **NO_PREVIEW,
         }
-        # In a private conversation (or for a private MAX source), use a
-        # standalone prompt instead of replying to the parser post.
-        if call.message.chat.type in {"group", "supergroup"} and not is_private_source:
+        # In group destinations, tie the flow to this user's exact prompt even
+        # when the source in MAX is a private conversation.
+        if call.message.chat.type in {"group", "supergroup"}:
             prompt_options["reply_to_message_id"] = int(call.message.message_id)
         prompt = bot.send_message(
             destination_chat_id,
@@ -6494,9 +6750,11 @@ def _is_public_max_send_reply(message):
             return False
         if message.chat.type == "private":
             return flow.get("destination_type") == "private"
-        if flow.get("source_is_private"):
-            return True
-        if getattr(message, "reply_to_message", None) and int(flow.get("prompt_message_id") or 0) == int(message.reply_to_message.message_id):
+        # The flow key binds this conversation to the person who pressed the
+        # MAX button. Requiring a Telegram reply made the group flow silently
+        # ignore ordinary messages from that person. Other members have a
+        # different flow key, so their messages are never captured.
+        if message.chat.type in {"group", "supergroup"}:
             return True
         media_group_id = getattr(message, "media_group_id", None)
         album = public_max_send_albums.get((key, str(media_group_id))) if media_group_id else None
@@ -6650,7 +6908,8 @@ def _public_max_preview_text(flow):
     description = body[:1800] if body else f"<i>{label}</i>"
     if len(body) > 1800:
         description += "…"
-    return f"Проверьте сообщение для MAX:\n\n<b>{name}</b>\n\n{description}"
+    sender_line = f"<b>{name} пишет</b>:\n\n" if name else ""
+    return f"Проверьте сообщение для MAX:\n\n{sender_line}{description}"
 
 
 def _public_max_send_confirm_keyboard(source_chat_id, nonce):
@@ -7956,7 +8215,7 @@ def customer_source_url(message):
 
 @bot.message_handler(func=lambda m: m.chat.type == "private" and m.text == SUPPORT_END_TEXT)
 def end_support_button(message):
-    if _close_support(message.from_user.id):
+    if _close_support(message.from_user.id, closed_by_id=message.from_user.id):
         bot.send_message(message.chat.id, "Спасибо за обращение!", **NO_PREVIEW)
     else:
         bot.send_message(message.chat.id, "Чат с поддержкой сейчас не открыт.", reply_markup=types.ReplyKeyboardRemove(), **NO_PREVIEW)
@@ -8125,7 +8384,7 @@ def support_admin_reply(message):
         bot.reply_to(message, "Это обращение уже ведёт другой администратор.")
         return
     if message.content_type == "text" and message.text.strip().lower() == "/close":
-        if _close_support(user_id):
+        if _close_support(user_id, closed_by_id=message.from_user.id):
             bot.reply_to(message, "Диалог завершён. Пользователь получил уведомление.")
         else:
             bot.reply_to(message, "Этот диалог уже закрыт.")
@@ -8159,6 +8418,7 @@ def _send_support_admin_message(user_id, message):
             parse_mode="HTML",
             **NO_PREVIEW,
         )
+        _save_support_history_message(user_id, message, "admin")
         return
     bot.send_message(
         user_id,
@@ -8167,6 +8427,7 @@ def _send_support_admin_message(user_id, message):
         **NO_PREVIEW,
     )
     bot.copy_message(user_id, message.chat.id, message.message_id)
+    _save_support_history_message(user_id, message, "admin")
 
 
 def process_support_admin_followup(message, user_id):
@@ -8176,7 +8437,7 @@ def process_support_admin_followup(message, user_id):
         return
     if message.content_type == "text" and (message.text or "").strip().startswith("/"):
         if (message.text or "").strip().lower() == "/close":
-            if get_support_session_assignee(user_id) == admin_id and _close_support(user_id):
+            if get_support_session_assignee(user_id) == admin_id and _close_support(user_id, closed_by_id=admin_id):
                 bot.send_message(message.chat.id, "✅ Чат с пользователем завершён.", **NO_PREVIEW)
             else:
                 bot.send_message(message.chat.id, "Этот диалог уже закрыт.", **NO_PREVIEW)
@@ -8220,11 +8481,68 @@ def process_support_admin_followup(message, user_id):
     content_types=["text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "location", "contact", "venue", "poll"],
 )
 def support_user_message(message):
+    user_id = int(message.from_user.id)
+    with _support_delivery_lock(user_id):
+        return _support_user_message_locked(message)
+
+
+def _support_user_message_locked(message):
     if message.content_type == "text" and message.text.startswith("/"):
         return
+    user_id = int(message.from_user.id)
+    assigned_admin_id = get_support_session_assignee(user_id)
+    if message.content_type == "text" and (message.text or "").strip() == SUPPORT_REPLY_NOW_TEXT:
+        if assigned_admin_id is not None:
+            bot.send_message(
+                message.chat.id,
+                "Администратор уже принял обращение. Напишите ему сообщение обычным сообщением.",
+                reply_markup=_support_keyboard(waiting=False),
+                **NO_PREVIEW,
+            )
+            return
+        if enable_support_pending_reply(user_id):
+            bot.send_message(
+                message.chat.id,
+                "Отправьте одно сообщение — его увидят все администраторы. Чтобы отправить ещё одно до принятия, нажмите кнопку снова.",
+                reply_markup=_support_keyboard(waiting=True),
+                **NO_PREVIEW,
+            )
+        else:
+            # Acceptance may have raced with this button press.
+            assigned_admin_id = get_support_session_assignee(user_id)
+            if assigned_admin_id is not None:
+                bot.send_message(
+                    message.chat.id,
+                    "Администратор уже принял обращение. Напишите ему сообщение обычным сообщением.",
+                    reply_markup=_support_keyboard(waiting=False),
+                    **NO_PREVIEW,
+                )
+        return
     try:
+        if assigned_admin_id is None and not consume_support_pending_reply(user_id):
+            # If an admin accepted between the first read and consuming the
+            # one-message permission, route this message to that admin.
+            assigned_admin_id = get_support_session_assignee(user_id)
+            if assigned_admin_id is None:
+                bot.send_message(
+                    message.chat.id,
+                    f"Обращение пока ожидает администратора. Чтобы передать сообщение сейчас, нажмите «{SUPPORT_REPLY_NOW_TEXT}».",
+                    reply_markup=_support_keyboard(waiting=True),
+                    **NO_PREVIEW,
+                )
+                return
         _notify_support_admin(message.from_user, message)
+        _save_support_history_message(user_id, message, "user")
+        if assigned_admin_id is None:
+            bot.send_message(
+                message.chat.id,
+                "✅ Сообщение отправлено администраторам.",
+                reply_markup=_support_keyboard(waiting=True),
+                **NO_PREVIEW,
+            )
     except Exception as error:
+        if assigned_admin_id is None:
+            enable_support_pending_reply(user_id)
         bot.send_message(message.chat.id, f"Не удалось доставить сообщение в поддержку: {escape_html(str(error)[:200])}", **NO_PREVIEW)
 
 @bot.message_handler(commands=['login'])
@@ -8490,10 +8808,35 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("maxsend_") or call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data.startswith("connectdest_") or call.data.startswith("customer_source_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("maxsend_") or call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("support_history_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data.startswith("connectdest_") or call.data.startswith("customer_source_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
+    if action.startswith("support_history_page_"):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
+            return
+        try:
+            page = max(0, int(action.rsplit("_", 1)[1]))
+        except (ValueError, IndexError):
+            page = 0
+        bot.answer_callback_query(call.id)
+        _show_support_history(
+            call.message.chat.id, page, message_id=call.message.message_id
+        )
+        return
+    if action.startswith("support_history_open_"):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав", show_alert=True)
+            return
+        try:
+            conversation_id = int(action.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Не удалось открыть историю", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        _show_support_conversation_history(call.message.chat.id, conversation_id)
+        return
     if action.startswith("maxsend_start_"):
         try:
             source_chat_id = int(action[len("maxsend_start_"):])
@@ -9001,7 +9344,8 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "Не удалось определить обращение", show_alert=True)
             return
         try:
-            claim_result = claim_support_session(user_id, call.from_user.id)
+            with _support_delivery_lock(user_id):
+                claim_result = claim_support_session(user_id, call.from_user.id)
         except Exception as error:
             debug_logger.warning(
                 "SUPPORT_CLAIM_FAILED user_id=%s admin_id=%s error_type=%s",
@@ -9021,6 +9365,30 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, message, show_alert=True)
             return
         bot.answer_callback_query(call.id, "Вы приняли обращение")
+        try:
+            # Tell the user immediately after assignment, then update the
+            # admin cards. The conversation is already routed only to this
+            # admin in the database.
+            _notify_support_user_accepted(user_id, call.from_user)
+        except Exception as error:
+            _save_support_system_event(
+                user_id,
+                "Администратор принял обращение, уведомление пользователю не доставлено",
+                actor_id=call.from_user.id,
+            )
+            debug_logger.warning(
+                "SUPPORT_USER_ACCEPT_NOTICE_FAILED user_id=%s admin_id=%s error_type=%s",
+                user_id, call.from_user.id, type(error).__name__,
+            )
+            try:
+                bot.send_message(
+                    call.from_user.id,
+                    f"⚠️ Обращение принято, но уведомление пользователю доставить не удалось. Его ID: <code>{user_id}</code>.",
+                    parse_mode="HTML",
+                    **NO_PREVIEW,
+                )
+            except Exception:
+                pass
         try:
             _broadcast_support_claim(user_id, call.from_user)
         except Exception as error:
@@ -9055,7 +9423,7 @@ def admin_callbacks(call):
                 show_alert=True,
             )
             return
-        if _close_support(user_id):
+        if _close_support(user_id, closed_by_id=call.from_user.id):
             bot.answer_callback_query(call.id, "Диалог завершён")
             bot.send_message(call.message.chat.id, "✅ Чат с пользователем завершён.", **NO_PREVIEW)
         else:
