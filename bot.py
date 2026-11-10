@@ -6182,8 +6182,12 @@ def _admin_may_send_through_chat(chat):
     return owner_id is None or int(owner_id) == ADMIN_ID
 
 
-def _admin_max_send_keyboard(chat_id, nonce):
+def _admin_max_send_keyboard(chat_id, nonce, include_skip=False):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if include_skip:
+        keyboard.add(types.InlineKeyboardButton(
+            "⏭️ Пропустить этот шаг", callback_data=f"admin_max_skipname_{nonce}"
+        ))
     keyboard.add(types.InlineKeyboardButton(
         "❌ Отмена", callback_data=f"admin_max_cancel_{nonce}"
     ))
@@ -6244,8 +6248,10 @@ def _admin_max_send_prompt(admin_id, source_chat_id, nonce, stage):
     )
     prompt = bot.send_message(
         admin_id,
-        prompt_text,
-        reply_markup=_admin_max_send_keyboard(source_chat_id, nonce),
+        prompt_text if stage != "name" else prompt_text + "\n\nИли пропустите этот шаг.",
+        reply_markup=_admin_max_send_keyboard(
+            source_chat_id, nonce, include_skip=(stage == "name")
+        ),
         **NO_PREVIEW,
     )
     flow["prompt_message_id"] = int(prompt.message_id)
@@ -6325,7 +6331,7 @@ def _receive_admin_max_body(message, source_chat_id, nonce):
     chat = get_chat_by_id(source_chat_id) or {}
     body_preview = escape_html(value) if value else f"<i>{escape_html(flow['payload_label'])}</i>"
     sender_preview = (
-        f"<b>{escape_html(flow['sender_name'])} пишет</b>:\n\n"
+        f"<b>{escape_html(flow['sender_name'])}</b> пишет\n\n"
         if str(flow.get("sender_name") or "").strip()
         else ""
     )
@@ -6357,10 +6363,10 @@ def _send_max_payload_with_sender(
     on_send_confirmed=None,
     source_type_callback=None,
 ):
-    """Send sender attribution as text or as the first line of a media caption."""
+    """Send sender attribution with captionable media, or immediately before other media."""
     body = str(body or "").strip()
     sender_name = str(sender_name or "").strip()
-    header = f"{sender_name} пишет:" if sender_name else ""
+    header = f"{sender_name} пишет" if sender_name else ""
     common = {
         "group_url": group_url,
         "chat_id": int(chat_id),
@@ -6369,11 +6375,34 @@ def _send_max_payload_with_sender(
         "on_send_confirmed": on_send_confirmed,
         "source_type_callback": source_type_callback,
     }
+    media_items = media if isinstance(media, (list, tuple)) else ([media] if media else [])
+    captionable = all(
+        str(item.get("kind") or "") in {"photo", "video", "sticker_image"}
+        for item in media_items
+    )
+    if media_items and not captionable and header:
+        send_message_to_max(
+            text=header,
+            media=None,
+            bold_sender_name=sender_name,
+            bold_first_line=False,
+            **common,
+        )
+        send_message_to_max(
+            text=body,
+            media=media,
+            bold_sender_name="",
+            bold_first_line=False,
+            **common,
+        )
+        return
+
     text = f"{header}\n\n{body}".strip() if header else body
     send_message_to_max(
         text=text,
         media=media,
-        bold_first_line=bool(header),
+        bold_sender_name=sender_name if header else "",
+        bold_first_line=False,
         **common,
     )
 
@@ -6427,12 +6456,13 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 if total_size > 20 * 1024 * 1024:
                     raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
                 item["bytes"] = file_bytes
+                item = _prepare_public_max_media(item)
                 downloaded_items.append(item)
             media = downloaded_items
             if len(media) == 1:
                 media = media[0]
         source_lock = max_send_source_locks.setdefault(int(source_chat_id), threading.Lock())
-        header_text = f"{name} пишет:" if name else ""
+        header_text = f"{name} пишет" if name else ""
         message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         fingerprints = {
             value for value in (
@@ -6721,8 +6751,12 @@ def _cleanup_legacy_max_send_buttons():
             )
 
 
-def _public_max_send_keyboard(nonce):
+def _public_max_send_keyboard(nonce, include_skip=False):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if include_skip:
+        keyboard.add(types.InlineKeyboardButton(
+            "⏭️ Пропустить этот шаг", callback_data=f"maxsend_skipname_{nonce}"
+        ))
     keyboard.add(types.InlineKeyboardButton(
         "❌ Отмена", callback_data=f"maxsend_cancel_{nonce}"
     ))
@@ -6782,19 +6816,19 @@ def _start_public_max_send(call, source_chat_id):
         }
     bot.answer_callback_query(call.id)
     try:
+        prompt_text = (
+            "💬 Ответьте на это сообщение текстом или вложением для этого личного чата MAX."
+            if is_private_source else
+            f"👤 Кто отправляет сообщение в MAX «{escape_html(chat.get('title') or 'Чат')}»?\n\n"
+            "Ответьте на это сообщение своим именем или нажмите «Пропустить этот шаг»."
+        )
         prompt_options = {
-            "reply_markup": _public_max_send_keyboard(nonce),
+            "reply_markup": _public_max_send_keyboard(
+                nonce, include_skip=(initial_stage == "name")
+            ),
             **NO_PREVIEW,
         }
-        prompt = bot.send_message(
-            destination_chat_id,
-            (
-                "💬 Отправьте сообщение для этого личного чата MAX."
-                if is_private_source
-                else "👤 Кто отправляет сообщение? Напишите имя отправителя."
-            ),
-            **prompt_options,
-        )
+        prompt = bot.send_message(destination_chat_id, prompt_text, **prompt_options)
     except Exception:
         with public_max_send_flow_lock:
             current = public_max_send_flows.get(flow_key)
@@ -6808,6 +6842,32 @@ def _start_public_max_send(call, source_chat_id):
         current = public_max_send_flows.get(flow_key)
         if current and current.get("nonce") == nonce:
             current["prompt_message_id"] = int(prompt.message_id)
+
+
+def _ask_public_max_body(flow_key, nonce):
+    with public_max_send_flow_lock:
+        flow = public_max_send_flows.get(flow_key)
+        if not flow or flow.get("nonce") != nonce or flow.get("stage") != "body":
+            return False
+        is_group = str(flow.get("destination_type") or "group") in {"group", "supergroup"}
+    text = (
+        "💬 Ответьте на это сообщение текстом или вложением для MAX."
+        if is_group else "💬 Отправьте текст или вложение для MAX."
+    )
+    prompt = bot.send_message(
+        int(flow_key[0]),
+        text,
+        reply_markup=_public_max_send_keyboard(nonce),
+        **NO_PREVIEW,
+    )
+    _record_bot_sent_group_messages(
+        int(flow_key[0]), [prompt.message_id], "Запрос сообщения для MAX"
+    )
+    with public_max_send_flow_lock:
+        current = public_max_send_flows.get(flow_key)
+        if current and current.get("nonce") == nonce and current.get("stage") == "body":
+            current["prompt_message_id"] = int(prompt.message_id)
+    return True
 
 
 def _is_public_max_send_reply(message):
@@ -6830,12 +6890,15 @@ def _is_public_max_send_reply(message):
             return False
         if message.chat.type == "private":
             return flow.get("destination_type") == "private"
-        # The flow key binds this conversation to the person who pressed the
-        # MAX button. Requiring a Telegram reply made the group flow silently
-        # ignore ordinary messages from that person. Other members have a
-        # different flow key, so their messages are never captured.
+        # In groups, require a reply to the current prompt. Telegram bots with
+        # privacy mode enabled only receive replies addressed to the bot.
         if message.chat.type in {"group", "supergroup"}:
-            return True
+            reply = getattr(message, "reply_to_message", None)
+            return bool(
+                reply
+                and int(getattr(reply, "message_id", 0) or 0)
+                == int(flow.get("prompt_message_id") or 0)
+            )
         media_group_id = getattr(message, "media_group_id", None)
         album = public_max_send_albums.get((key, str(media_group_id))) if media_group_id else None
         return bool(album and album.get("nonce") == flow.get("nonce") and flow.get("stage") == "body")
@@ -6863,35 +6926,60 @@ def _public_max_input(message):
             filename = str(getattr(item, "file_name", None) or "animation.mp4")
             mime_type = str(getattr(item, "mime_type", None) or "video/mp4")
             label = "Анимация"
+            kind = "video"
         elif content_type == "video_note":
             filename, mime_type, label = "video-note.mp4", "video/mp4", "Видеосообщение"
+            kind = "video_note"
         else:
             filename = str(getattr(item, "file_name", None) or "video.mp4")
             mime_type = str(getattr(item, "mime_type", None) or "video/mp4")
             label = "Видео"
-        media = {"file_id": item.file_id, "filename": filename, "mime_type": mime_type}
+            kind = "video"
+        media = {"file_id": item.file_id, "filename": filename, "mime_type": mime_type, "kind": kind}
     elif content_type in {"document", "audio", "voice", "sticker"}:
         item = getattr(message, content_type, None)
         if content_type == "sticker":
             if getattr(item, "is_video", False):
                 filename, mime_type = "sticker.webm", "video/webm"
+                kind = "video"
+                file_id = item.file_id
             elif getattr(item, "is_animated", False):
-                filename, mime_type = "sticker.tgs", "application/x-tgsticker"
+                thumbnail = getattr(item, "thumbnail", None) or getattr(item, "thumb", None)
+                emoji = str(getattr(item, "emoji", None) or "").strip()
+                if not thumbnail or not getattr(thumbnail, "file_id", None):
+                    return {
+                        "body": caption or emoji or "Стикер",
+                        "media": None,
+                        "label": f"Стикер {emoji}".strip(),
+                    }
+                filename, mime_type = "sticker.webp", "image/webp"
+                kind = "sticker_image"
+                file_id = thumbnail.file_id
             else:
                 filename, mime_type = "sticker.webp", "image/webp"
+                kind = "sticker_image"
+                file_id = item.file_id
             emoji = str(getattr(item, "emoji", None) or "").strip()
             label = f"Стикер {emoji}".strip()
         elif content_type == "voice":
             filename, mime_type, label = "voice.ogg", "audio/ogg", "Голосовое сообщение"
+            kind = "voice"
+            file_id = item.file_id
         elif content_type == "audio":
             filename = str(getattr(item, "file_name", None) or "audio.mp3")
             mime_type = str(getattr(item, "mime_type", None) or "audio/mpeg")
             label = "Аудио"
+            kind = "audio"
+            file_id = item.file_id
         else:
             filename = str(getattr(item, "file_name", None) or "document.bin")
             mime_type = str(getattr(item, "mime_type", None) or "application/octet-stream")
             label = "Файл"
-        media = {"file_id": item.file_id, "filename": filename, "mime_type": mime_type}
+            kind = "document"
+            file_id = item.file_id
+        if content_type == "sticker":
+            caption = caption or emoji
+        media = {"file_id": file_id, "filename": filename, "mime_type": mime_type, "kind": kind}
     elif content_type == "contact":
         contact = message.contact
         full_name = " ".join(filter(None, [contact.first_name, contact.last_name]))
@@ -6988,7 +7076,7 @@ def _public_max_preview_text(flow):
     description = body[:1800] if body else f"<i>{label}</i>"
     if len(body) > 1800:
         description += "…"
-    sender_line = f"<b>{name} пишет</b>:\n\n" if name else ""
+    sender_line = f"<b>{name}</b> пишет\n\n" if name else ""
     return f"Проверьте сообщение для MAX:\n\n{sender_line}{description}"
 
 
@@ -7010,6 +7098,88 @@ def _is_public_max_file_oversize(file_size):
         return False
 
 
+def _prepare_public_max_media(item):
+    """Use formats MAX Web can preview for Telegram stickers and voice notes."""
+    data = item.get("bytes")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return item
+    kind = str(item.get("kind") or "")
+    try:
+        if kind == "sticker_image":
+            from PIL import Image
+            with Image.open(io.BytesIO(bytes(data))) as source:
+                source.seek(0)
+                converted = io.BytesIO()
+                source.convert("RGBA").save(converted, format="PNG", optimize=True)
+            item["bytes"] = converted.getvalue()
+            item["filename"] = "sticker.png"
+            item["mime_type"] = "image/png"
+            item["kind"] = "photo"
+            return item
+    except Exception as error:
+        debug_logger.warning(
+            "PUBLIC_MAX_STICKER_IMAGE_CONVERSION_FAILED error_type=%s",
+            type(error).__name__,
+        )
+
+    needs_video_conversion = kind == "video" and str(item.get("filename") or "").lower().endswith(".webm")
+    needs_voice_conversion = kind == "voice" and (
+        str(item.get("mime_type") or "").lower().startswith("audio/ogg")
+        or bytes(data).startswith(b"OggS")
+    )
+    if not (needs_video_conversion or needs_voice_conversion):
+        return item
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    if not ffmpeg:
+        return item
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0"]
+    if needs_video_conversion:
+        command += [
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-pix_fmt", "yuv420p", "-movflags", "+frag_keyframe+empty_moov", "-f", "mp4", "pipe:1",
+        ]
+    else:
+        command += [
+            "-vn", "-c:a", "aac", "-b:a", "96k", "-movflags",
+            "+frag_keyframe+empty_moov", "-f", "mp4", "pipe:1",
+        ]
+    try:
+        converted = subprocess.run(
+            command,
+            input=bytes(data),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=25,
+            check=False,
+        )
+        output = converted.stdout
+        valid_container = (
+            b"ftyp" in output[:64]
+            if needs_video_conversion
+            else output[:8].startswith(b"\x00\x00\x00") or b"ftyp" in output[:64]
+        )
+        if converted.returncode == 0 and output and valid_container:
+            item["bytes"] = output
+            if needs_video_conversion:
+                item["filename"] = "sticker.mp4"
+                item["mime_type"] = "video/mp4"
+            else:
+                item["filename"] = "voice.m4a"
+                item["mime_type"] = "audio/mp4"
+    except Exception as error:
+        debug_logger.warning(
+            "PUBLIC_MAX_MEDIA_CONVERSION_FAILED kind=%s error_type=%s",
+            kind, type(error).__name__,
+        )
+    return item
+
+
 def _send_public_max_message(flow_key, nonce, preview_message_id):
     result_text = None
     result_keyboard = None
@@ -7025,7 +7195,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
         body = str(flow.get("body") or "").strip()
         name = str(flow.get("sender_name") or "").strip()
-        header_text = f"{name} пишет:" if name else ""
+        header_text = f"{name} пишет" if name else ""
         message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         media = flow.get("media") or None
         if media:
@@ -7042,6 +7212,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 if total_size > 20 * 1024 * 1024:
                     raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
                 item["bytes"] = file_bytes
+                item = _prepare_public_max_media(item)
                 downloaded_items.append(item)
             media = downloaded_items
             if len(media) == 1:
@@ -7228,8 +7399,8 @@ def handle_public_max_send_reply(message):
         if message.content_type != "text":
             sent = bot.send_message(
                 message.chat.id,
-                "Сначала отправьте имя текстом. Нажмите «❌ Отмена», чтобы завершить отправку.",
-                reply_markup=_public_max_send_keyboard(flow["nonce"]),
+                "Сначала отправьте имя текстом или нажмите «⏭️ Пропустить этот шаг». Ответьте на это сообщение.",
+                reply_markup=_public_max_send_keyboard(flow["nonce"], include_skip=True),
                 **NO_PREVIEW,
             )
             _record_bot_sent_group_messages(
@@ -7241,11 +7412,13 @@ def handle_public_max_send_reply(message):
                     current["prompt_message_id"] = int(sent.message_id)
             return
         sender_name = str(message.text or "").strip()
-        if not sender_name or len(sender_name) > 80:
+        if sender_name == "⏭️ Пропустить этот шаг":
+            sender_name = ""
+        elif not sender_name or sender_name.startswith("/") or len(sender_name) > 80:
             sent = bot.send_message(
                 message.chat.id,
-                "Укажите имя длиной до 80 символов.",
-                reply_markup=_public_max_send_keyboard(flow["nonce"]),
+                "Укажите имя длиной до 80 символов или нажмите «⏭️ Пропустить этот шаг». Ответьте на это сообщение.",
+                reply_markup=_public_max_send_keyboard(flow["nonce"], include_skip=True),
                 **NO_PREVIEW,
             )
             _record_bot_sent_group_messages(
@@ -7262,19 +7435,7 @@ def handle_public_max_send_reply(message):
                 return
             current["sender_name"] = sender_name
             current["stage"] = "body"
-        prompt = bot.send_message(
-            message.chat.id,
-            "💬 Отправьте текст или вложение для MAX: фото, видео, кружок, голосовое, стикер, файл, геопозицию, место, контакт или опрос.",
-            reply_markup=_public_max_send_keyboard(flow["nonce"]),
-            **NO_PREVIEW,
-        )
-        _record_bot_sent_group_messages(
-            message.chat.id, [prompt.message_id], "Запрос сообщения для MAX"
-        )
-        with public_max_send_flow_lock:
-            current = public_max_send_flows.get(flow_key)
-            if current and current.get("nonce") == flow.get("nonce"):
-                current["prompt_message_id"] = int(prompt.message_id)
+        _ask_public_max_body(flow_key, flow["nonce"])
         return
 
     media_group_id = getattr(message, "media_group_id", None)
@@ -8970,6 +9131,43 @@ def admin_callbacks(call):
             return
         _start_public_max_send(call, source_chat_id)
         return
+    if action.startswith("maxsend_skipname_"):
+        nonce = action[len("maxsend_skipname_"):]
+        flow_key = (int(call.message.chat.id), int(call.from_user.id))
+        with public_max_send_flow_lock:
+            flow = public_max_send_flows.get(flow_key)
+            if (
+                not flow
+                or flow.get("nonce") != nonce
+                or flow.get("stage") != "name"
+                or int(flow.get("prompt_message_id") or 0) != int(call.message.message_id)
+            ):
+                flow = None
+            else:
+                flow["sender_name"] = ""
+                flow["stage"] = "body"
+        if not flow:
+            bot.answer_callback_query(call.id, "Эта кнопка уже не действует.")
+            return
+        bot.answer_callback_query(call.id, "Имя пропущено")
+        try:
+            bot.edit_message_text(
+                "Имя отправителя пропущено.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+                **NO_PREVIEW,
+            )
+        except Exception:
+            pass
+        try:
+            _ask_public_max_body(flow_key, nonce)
+        except Exception as error:
+            debug_logger.warning(
+                "PUBLIC_MAX_BODY_PROMPT_FAILED user=%s error_type=%s",
+                call.from_user.id, type(error).__name__,
+            )
+        return
     if action.startswith("maxsend_cancel_"):
         nonce = action[len("maxsend_cancel_"):]
         flow_key = (int(call.message.chat.id), int(call.from_user.id))
@@ -9161,6 +9359,39 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "Не удалось определить чат MAX.", show_alert=True)
             return
         _start_admin_max_send(call, source_chat_id)
+        return
+    if action.startswith("admin_max_skipname_"):
+        if int(call.from_user.id) != ADMIN_ID or call.message.chat.type != "private" or int(call.message.chat.id) != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Эта функция доступна только владельцу.", show_alert=True)
+            return
+        nonce = action[len("admin_max_skipname_"):]
+        with admin_max_send_flow_lock:
+            flow = admin_max_send_flows.get(ADMIN_ID)
+            if not flow or flow.get("nonce") != nonce or flow.get("stage") != "name":
+                flow = None
+            else:
+                flow["sender_name"] = ""
+                flow["stage"] = "body"
+                source_chat_id = int(flow["source_chat_id"])
+        if not flow:
+            bot.answer_callback_query(call.id, "Эта кнопка уже не действует.")
+            return
+        try:
+            bot.clear_step_handler_by_chat_id(ADMIN_ID)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Имя пропущено")
+        try:
+            bot.edit_message_text(
+                "Имя отправителя пропущено.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+                **NO_PREVIEW,
+            )
+        except Exception:
+            pass
+        _admin_max_send_prompt(ADMIN_ID, source_chat_id, nonce, "body")
         return
     if action.startswith("admin_max_cancel"):
         if int(call.from_user.id) != ADMIN_ID or call.message.chat.type != "private" or int(call.message.chat.id) != ADMIN_ID:

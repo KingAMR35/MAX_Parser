@@ -7538,6 +7538,15 @@ def _normalize_max_photo_upload(item: dict, chat_id: int) -> dict:
 
 def _select_max_composer_upload(page, upload_payload, expected_count: int) -> str:
     """Attach files through MAX's visible composer control or its own wrapper."""
+    payload_items = upload_payload if isinstance(upload_payload, (list, tuple)) else [upload_payload]
+    mime_types = [str(item.get("mimeType") or "").lower() for item in payload_items if isinstance(item, dict)]
+    if any(mime.startswith(("image/", "video/")) for mime in mime_types):
+        menu_kind = "photo_video"
+    elif any(mime.startswith("audio/") for mime in mime_types):
+        menu_kind = "audio"
+    else:
+        menu_kind = "file"
+
     def choose_from_open_upload_menu() -> bool:
         """Handle MAX variants where Upload file first opens a small media menu."""
         try:
@@ -7552,18 +7561,32 @@ def _select_max_composer_upload(page, upload_payload, expected_count: int) -> st
                 entries = menu.locator(
                     '[role="menuitem"], [role="option"], button, [role="button"], li'
                 )
+                candidates = []
                 for entry_index in range(min(entries.count(), 12)):
                     entry = entries.nth(entry_index)
                     try:
                         if not entry.is_visible(timeout=150):
                             continue
                         label = " ".join((entry.inner_text(timeout=200) or "").split())
-                        if not re.search(
-                            r"photo|video|file|media|gallery|фото|видео|файл|медиа|галере",
-                            label,
-                            re.I,
-                        ):
+                        if not label:
                             continue
+                        if menu_kind == "photo_video":
+                            score = 100 if re.search(r"photo|video|gallery|camera|фото|видео|галере|камера", label, re.I) else 0
+                            if re.search(r"file|document|файл|документ", label, re.I):
+                                score -= 80
+                        elif menu_kind == "audio":
+                            score = 100 if re.search(r"audio|voice|music|голос|аудио|музык", label, re.I) else 0
+                            if re.search(r"photo|video|image|фото|видео|изображ", label, re.I):
+                                score -= 80
+                        else:
+                            score = 100 if re.search(r"file|document|файл|документ", label, re.I) else 0
+                        if score <= 0:
+                            continue
+                        candidates.append((score, entry_index, entry))
+                    except Exception:
+                        continue
+                for _, entry_index, entry in sorted(candidates, key=lambda row: (-row[0], row[1])):
+                    try:
                         with page.expect_file_chooser(timeout=2500) as chooser_info:
                             entry.click(timeout=1000)
                         chooser_info.value.set_files(upload_payload, timeout=8000)
@@ -7700,6 +7723,62 @@ def _select_max_composer_upload(page, upload_payload, expected_count: int) -> st
     raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
 
 
+def _click_live_max_send_control(page, send_control, upload_payload, before_tail, tail_snapshot):
+    """Click a freshly ranked composer control if a global locator became stale."""
+    try:
+        send_control.click(timeout=2500)
+        return ""
+    except Exception as click_error:
+        if not upload_payload or tail_snapshot() != before_tail:
+            raise
+        clicked = page.evaluate("""() => {
+            const composer=document.querySelector('[data-max-parser-send-composer="true"]');
+            if(!composer)return null;
+            const c=composer.getBoundingClientRect();
+            const shell=composer.closest('form,[class*="composer" i],[class*="message" i]')||composer.parentElement?.parentElement;
+            const visible=el=>{
+                const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+                return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&
+                    Number(s.opacity||1)>0&&!el.disabled&&el.getAttribute('aria-disabled')!=='true';
+            };
+            const controls=[...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                .filter(el=>visible(el)&&!el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i],.item'));
+            const forbidden=/(attach|file|media|photo|image|upload|emoji|sticker|gif|voice|audio|microphone|record|call|camera|прикреп|влож|файл|медиа|фото|смайл|стикер|голос|запис|звон|камера)/i;
+            const label=el=>[el.innerText,el.getAttribute('aria-label'),el.title,el.getAttribute('data-testid'),el.className,el.type].filter(Boolean).join(' ').toLowerCase();
+            const primary=controls.map(el=>{
+                const r=el.getBoundingClientRect(),l=label(el);
+                if(!/(отправ|send|submit)/i.test(l))return null;
+                const inShell=Boolean(shell&&shell.contains(el));
+                const inDialog=Boolean(el.closest('[role="dialog"],[class*="modal" i],[class*="preview" i]'));
+                const dy=Math.abs((r.top+r.height/2)-(c.top+c.height/2));
+                if((!inShell&&!inDialog)||(inShell&&(dy>150||r.left<c.left+c.width*.4)))return null;
+                return {el,score:(inDialog?200:0)+(inShell?50:0)+(el.type==='submit'?80:0)-dy};
+            }).filter(Boolean).sort((a,b)=>b.score-a.score);
+            let target=primary[0]?.el;
+            if(!target){
+                target=controls.filter(el=>{
+                    const r=el.getBoundingClientRect(),l=label(el);
+                    const dy=Math.abs((r.top+r.height/2)-(c.top+c.height/2));
+                    return !el.hasAttribute('aria-haspopup')&&!forbidden.test(l)&&dy<=100&&
+                        r.top>=window.innerHeight*.55&&r.left+r.width/2>=c.left+c.width*.45;
+                }).sort((a,b)=>b.getBoundingClientRect().left-a.getBoundingClientRect().left)[0]||null;
+            }
+            if(!target)return null;
+            const r=target.getBoundingClientRect();
+            const info=[target.tagName,String(target.className||'').slice(0,70),
+                String(target.getAttribute('aria-label')||target.title||'').slice(0,50),
+                Math.round(r.left),Math.round(r.top)].join(':');
+            target.click();
+            return info;
+        }""")
+        if not clicked:
+            raise RuntimeError(
+                "MAX_SEND_CONTROL_NOT_FOUND_AFTER_RERENDER: "
+                + log_preview(click_error, 180)
+            ) from click_error
+        return f"js-rerender-fallback:{clicked}"
+
+
 def send_message_to_max(
     group_url: str,
     text: str,
@@ -7710,6 +7789,7 @@ def send_message_to_max(
     media: dict = None,
     source_type_callback=None,
     bold_first_line: bool = True,
+    bold_sender_name: str = "",
 ) -> None:
     """Send one user-approved text or single attachment through the authenticated MAX UI."""
     session_file = session_path or f"{SESSIONS_DIR}/{chat_id}.json"
@@ -7883,6 +7963,32 @@ def send_message_to_max(
             except Exception:
                 return set()
 
+        def chat_tail_source_rows():
+            """Return ordered IDs and media flags for recently rendered MAX rows."""
+            try:
+                rows = page.evaluate("""() => {
+                    let items=[...document.querySelectorAll('.item')];
+                    if (!items.length) items=[...document.querySelectorAll(
+                        '[data-message-id],[data-mid],[data-id]'
+                    )];
+                    return items.map(row=>({
+                        id:row.getAttribute('data-message-id')||row.getAttribute('data-mid')||
+                            row.getAttribute('data-id')||'',
+                        text:String(row.innerText||row.textContent||''),
+                        media:Boolean(row.querySelector(
+                            'img,video,audio,canvas,[class*="attachment" i],[class*="media" i],' +
+                            '[data-testid*="file" i],[data-testid*="audio" i],[data-testid*="video" i]'
+                        ))
+                    })).filter(row=>row.id);
+                }""")
+                return [
+                    {"id": str(row.get("id")), "text": str(row.get("text") or ""),
+                     "media": bool(row.get("media"))}
+                    for row in rows or []
+                ]
+            except Exception:
+                return []
+
         def chat_tail_source_ids_matching_text(expected_text):
             expected = re.sub(r"\s+", " ", str(expected_text or "")).strip().casefold()
             if len(expected) < 3:
@@ -7943,16 +8049,22 @@ def send_message_to_max(
                     }));
                     const rows=[...document.querySelectorAll('.item')];
                     const globalPreview=[...document.querySelectorAll(
-                        'img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i]'
+                        'img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i],[data-testid*="attachment" i]'
                     )].filter(visible).length;
-                    let composerRoot=c;
-                    for(let i=0;i<3&&composerRoot?.parentElement;i++) composerRoot=composerRoot.parentElement;
-                    const previewSelector='img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i]';
-                    const composerPreview=composerRoot?[...composerRoot.querySelectorAll(previewSelector)].filter(visible).length:0;
+                    let composerRoot=c.closest('form,[class*="composer" i],[data-testid*="composer" i]')||c;
+                    if(composerRoot===c) for(let i=0;i<4&&composerRoot?.parentElement;i++) composerRoot=composerRoot.parentElement;
+                    const previewSelector='img,video,audio,canvas,[class*="attachment" i],[class*="preview" i],[data-testid*="media" i],[data-testid*="attachment" i]';
+                    const composerPreview=composerRoot?[...composerRoot.querySelectorAll(previewSelector)]
+                        .filter(el=>visible(el)&&!el.closest('.item')).filter(el=>{
+                            const r=el.getBoundingClientRect();
+                            return r.bottom>cr.top-420&&r.top<cr.bottom+20&&
+                                r.right>=cr.left-40&&r.left<=cr.right+240;
+                        }).length:0;
                     const nearComposerMedia=c?[...document.querySelectorAll(previewSelector)]
                         .filter(el=>visible(el)&&!el.closest('.item')).filter(el=>{
                             const r=el.getBoundingClientRect();
-                            return r.top>cr.top-220&&r.top<window.innerHeight;
+                            return r.top>cr.top-420&&r.top<window.innerHeight&&
+                                r.right>=cr.left-40&&r.left<=cr.right+240;
                         }).length:0;
                     return {
                         composerFound:Boolean(c),composerChars:c?String(c.innerText||c.value||'').length:-1,
@@ -8012,7 +8124,28 @@ def send_message_to_max(
             supports_rich_text = bool(composer.evaluate("el => el.isContentEditable"))
         except Exception:
             supports_rich_text = False
-        if supports_rich_text and bold_first_line:
+        if supports_rich_text and str(bold_sender_name or "").strip():
+            try:
+                selected_name = composer.evaluate("""(el, name) => {
+                    const first = document.createTreeWalker(el, NodeFilter.SHOW_TEXT).nextNode();
+                    name=String(name||'');
+                    if (!first || !name || !first.data.startsWith(name)) return false;
+                    const range=document.createRange();
+                    range.setStart(first,0);
+                    range.setEnd(first,name.length);
+                    const selection=window.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    return true;
+                }""", str(bold_sender_name), timeout=1000)
+                if selected_name:
+                    composer.press("Control+B", timeout=1500)
+                    composer.press("Control+End", timeout=1500)
+            except Exception:
+                # Text delivery is more important than styling on MAX clients
+                # that do not expose a standard contenteditable text node.
+                pass
+        elif supports_rich_text and bold_first_line:
             try:
                 composer.press("Control+Home", timeout=1500)
                 composer.press("Shift+End", timeout=1500)
@@ -8021,6 +8154,17 @@ def send_message_to_max(
             except Exception:
                 # If this MAX client has a different editor, send the text as entered.
                 pass
+
+        def pin_send_control(candidate):
+            token = f"max-parser-send-{time.time_ns()}"
+            candidate.evaluate(
+                "(el, value) => el.setAttribute('data-max-parser-send-control', value)",
+                token,
+                timeout=500,
+            )
+            return page.locator(
+                f'[data-max-parser-send-control="{token}"]'
+            ).first
 
         send_button = None
         attempts = 80 if upload_payload else 1
@@ -8109,7 +8253,7 @@ def send_message_to_max(
                     candidate = send_controls.nth(int(index))
                     try:
                         if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
-                            send_button = candidate
+                            send_button = pin_send_control(candidate)
                             break
                     except Exception:
                         continue
@@ -8154,7 +8298,7 @@ def send_message_to_max(
                         candidate = fallback_controls.nth(int(index))
                         try:
                             if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
-                                send_button = candidate
+                                send_button = pin_send_control(candidate)
                                 break
                         except Exception:
                             continue
@@ -8164,7 +8308,7 @@ def send_message_to_max(
                     candidate = send_buttons.nth(index)
                     try:
                         if candidate.is_visible(timeout=250) and candidate.is_enabled(timeout=250):
-                            send_button = candidate
+                            send_button = pin_send_control(candidate)
                             break
                     except Exception:
                         continue
@@ -8202,7 +8346,9 @@ def send_message_to_max(
                 }""", timeout=500)
             except Exception:
                 pass
-            send_button.click(timeout=2500)
+            send_control_info = _click_live_max_send_control(
+                page, send_button, upload_payload, before_tail, chat_tail_snapshot
+            ) or send_control_info
         else:
             # Enter is only a fallback for text-only messages. Media messages
             # must use an actual send control, or this can insert a newline.
@@ -8290,12 +8436,34 @@ def send_message_to_max(
                 raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
         if on_send_confirmed:
             try:
-                new_source_ids = chat_tail_source_ids() - before_source_ids
-                matching_source_ids = (
-                    chat_tail_source_ids_matching_text(text) & new_source_ids
-                )
-                if len(matching_source_ids) == 1:
-                    on_send_confirmed(next(iter(matching_source_ids)))
+                new_rows = [
+                    row for row in chat_tail_source_rows()
+                    if row["id"] not in before_source_ids
+                ]
+                expected = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
+                matching_rows = [
+                    row for row in new_rows
+                    if len(expected) >= 3
+                    and expected[:80] in re.sub(
+                        r"\s+", " ", row["text"]
+                    ).strip().casefold()
+                ]
+                if matching_rows:
+                    source_ids_to_remember = [row["id"] for row in matching_rows]
+                elif upload_payload:
+                    media_rows = [row for row in new_rows if row["media"]]
+                    if media_rows:
+                        source_ids_to_remember = [media_rows[-1]["id"]]
+                    elif len(new_rows) == 1:
+                        source_ids_to_remember = [new_rows[0]["id"]]
+                    else:
+                        source_ids_to_remember = []
+                elif len(new_rows) == 1:
+                    source_ids_to_remember = [new_rows[0]["id"]]
+                else:
+                    source_ids_to_remember = []
+                for source_id in source_ids_to_remember:
+                    on_send_confirmed(source_id)
             except Exception:
                 # Content and media fingerprints remain the fallback if MAX
                 # does not expose a stable ID for the newly sent message.
