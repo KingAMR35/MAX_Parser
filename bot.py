@@ -6397,6 +6397,9 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 chat_id=int(source_chat_id),
                 session_path=_session_path_for_chat(chat),
                 on_before_send=remember_outbound_echo,
+                source_type_callback=lambda detected: _update_detected_source_type(
+                    source_chat_id, detected
+                ),
             )
         result_text = "✅ Сообщение отправлено в MAX."
         result_keyboard = types.InlineKeyboardMarkup(row_width=1)
@@ -6702,16 +6705,12 @@ def _start_public_max_send(call, source_chat_id):
             "reply_markup": _public_max_send_keyboard(nonce),
             **NO_PREVIEW,
         }
-        # In group destinations, tie the flow to this user's exact prompt even
-        # when the source in MAX is a private conversation.
-        if call.message.chat.type in {"group", "supergroup"}:
-            prompt_options["reply_to_message_id"] = int(call.message.message_id)
         prompt = bot.send_message(
             destination_chat_id,
             (
                 "💬 Отправьте сообщение для этого личного чата MAX."
                 if is_private_source
-                else "👤 Кто отправляет сообщение? Ответьте на это сообщение своим именем."
+                else "👤 Кто отправляет сообщение? Напишите имя отправителя."
             ),
             **prompt_options,
         )
@@ -7079,8 +7078,7 @@ def _finalize_public_max_album(flow_key, nonce, media_group_id):
     if len(body) + len(sender_name) + 2 > 3500:
         prompt = bot.send_message(
             int(flow_key[0]),
-            "Подпись к альбому слишком длинная. Ответьте на это сообщение более коротким текстом или отправьте альбом без подписи.",
-            reply_to_message_id=int(messages[-1].message_id),
+            "Подпись к альбому слишком длинная. Отправьте более короткий текст или альбом без подписи.",
             reply_markup=_public_max_send_keyboard(nonce),
             **NO_PREVIEW,
         )
@@ -7107,7 +7105,6 @@ def _finalize_public_max_album(flow_key, nonce, media_group_id):
         int(flow_key[0]),
         _public_max_preview_text(preview_flow),
         parse_mode="HTML",
-        reply_to_message_id=int(messages[-1].message_id),
         reply_markup=_public_max_send_confirm_keyboard(source_chat_id, nonce),
         **NO_PREVIEW,
     )
@@ -7140,7 +7137,6 @@ def handle_public_max_send_reply(message):
             sent = bot.send_message(
                 message.chat.id,
                 "Сначала отправьте имя текстом. Нажмите «❌ Отмена», чтобы завершить отправку.",
-                reply_to_message_id=message.message_id,
                 reply_markup=_public_max_send_keyboard(flow["nonce"]),
                 **NO_PREVIEW,
             )
@@ -7157,7 +7153,6 @@ def handle_public_max_send_reply(message):
             sent = bot.send_message(
                 message.chat.id,
                 "Укажите имя длиной до 80 символов.",
-                reply_to_message_id=message.message_id,
                 reply_markup=_public_max_send_keyboard(flow["nonce"]),
                 **NO_PREVIEW,
             )
@@ -7177,8 +7172,7 @@ def handle_public_max_send_reply(message):
             current["stage"] = "body"
         prompt = bot.send_message(
             message.chat.id,
-            "💬 Ответьте на это сообщение текстом или отправьте фото, видео, кружок, голосовое, стикер, файл, геопозицию, место, контакт или опрос для MAX.",
-            reply_to_message_id=message.message_id,
+            "💬 Отправьте текст или вложение для MAX: фото, видео, кружок, голосовое, стикер, файл, геопозицию, место, контакт или опрос.",
             reply_markup=_public_max_send_keyboard(flow["nonce"]),
             **NO_PREVIEW,
         )
@@ -7219,7 +7213,6 @@ def handle_public_max_send_reply(message):
         sent = bot.send_message(
             message.chat.id,
             "Этот тип сообщения пока не поддерживается. Пришлите текст, фото, видео, кружок, голосовое, стикер, файл, геопозицию, контакт или опрос.",
-            reply_to_message_id=message.message_id,
             reply_markup=_public_max_send_keyboard(flow["nonce"]),
             **NO_PREVIEW,
         )
@@ -7236,7 +7229,6 @@ def handle_public_max_send_reply(message):
         sent = bot.send_message(
             message.chat.id,
             "Текст слишком длинный. Отправьте текст до 3500 символов или прикрепите его как файл.",
-            reply_to_message_id=message.message_id,
             reply_markup=_public_max_send_keyboard(flow["nonce"]),
             **NO_PREVIEW,
         )
@@ -7263,7 +7255,6 @@ def handle_public_max_send_reply(message):
         message.chat.id,
         _public_max_preview_text(current),
         parse_mode="HTML",
-        reply_to_message_id=message.message_id,
         reply_markup=_public_max_send_confirm_keyboard(source_chat_id, nonce),
         **NO_PREVIEW,
     )

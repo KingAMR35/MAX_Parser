@@ -4413,17 +4413,13 @@ def _detect_max_chat_source_type(page) -> str | None:
                         r.width > 180 && r.height < 220;
                 });
             const parts = [];
-            let hasDirectCallControl = false;
             for (const el of nodes) {
                 const text = (el.innerText || '').trim();
                 if (text && text.length < 700) parts.push(text);
                 for (const control of el.querySelectorAll('button,[role="button"],[aria-label],[title]')) {
                     const label = [control.innerText, control.getAttribute('aria-label'), control.title,
-                        control.getAttribute('data-testid'), control.className].filter(Boolean).join(' ').trim();
+                        control.getAttribute('data-testid')].filter(Boolean).join(' ').trim();
                     if (label && label.length < 180) parts.push(label);
-                    if (/audio.?call|video.?call|call|звон|телефон|позвон/i.test(label)) {
-                        hasDirectCallControl = true;
-                    }
                 }
             }
             const composers = [...document.querySelectorAll(
@@ -4444,8 +4440,7 @@ def _detect_max_chat_source_type(page) -> str | None:
             return {
                 text: [...new Set(parts)].join(' | ').slice(0, 3000),
                 hasComposer: composers.length > 0,
-                composerLabels,
-                hasDirectCallControl
+                composerLabels
             };
         }""")
     except Exception:
@@ -4454,12 +4449,10 @@ def _detect_max_chat_source_type(page) -> str | None:
         header_text = signals.get("text") or ""
         has_composer = bool(signals.get("hasComposer"))
         composer_labels = str(signals.get("composerLabels") or "")
-        has_direct_call_control = bool(signals.get("hasDirectCallControl"))
     else:
         header_text = signals or ""
         has_composer = False
         composer_labels = ""
-        has_direct_call_control = False
     text = re.sub(r"\s+", " ", str(header_text)).casefold()
     composer_text = re.sub(r"\s+", " ", composer_labels).casefold()
     channel_signal = bool(re.search(
@@ -4480,7 +4473,9 @@ def _detect_max_chat_source_type(page) -> str | None:
         r"\b(?:в сети|был(?:а|\(а\))? в сети|был(?:а|\(а\))? недавно|last seen|online)\b",
         text,
     ))
-    if direct_signal or has_direct_call_control:
+    # MAX also shows call controls in group headers. Treat a chat as a private
+    # one-to-one conversation only when the header has a direct-contact status.
+    if direct_signal:
         return "private"
     if has_composer:
         return "group"
@@ -7711,7 +7706,9 @@ def send_message_to_max(
                     };
                     const cr=c?c.getBoundingClientRect():null;
                     const shell=c&&(c.closest('form,[class*="composer" i],[class*="message" i]')||c.parentElement);
-                    const nearby=c?[...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                    const nearby=c?[...document.querySelectorAll(
+                        'button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]'
+                    )]
                         .filter(el=>visible(el)&&!el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"]'))
                         .map(el=>{
                             const r=el.getBoundingClientRect();
@@ -7873,8 +7870,14 @@ def send_message_to_max(
                 pass
 
         send_button = None
-        attempts = 32 if upload_payload else 1
+        attempts = 80 if upload_payload else 1
         if upload_payload:
+            # Focus the message composer after the file picker closes. Some
+            # MAX layouts reveal the attachment send action only after focus.
+            try:
+                composer.click(timeout=1200)
+            except Exception:
+                pass
             # A file picker can leave MAX's attachment/sticker popover open.
             # Dismiss it before finding the send control; otherwise its
             # backdrop can intercept a click on the composer button.
@@ -7902,7 +7905,9 @@ def send_message_to_max(
             except Exception:
                 pass
 
-        send_controls = page.locator('button,[role="button"],input[type="submit"]')
+        send_controls = page.locator(
+            'button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]'
+        )
         for attempt in range(attempts):
             upload_error = media_upload_error()
             if upload_error:
@@ -7918,19 +7923,27 @@ def send_message_to_max(
                             s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
                             !el.disabled && el.getAttribute('aria-disabled') !== 'true';
                     };
-                    return [...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                    return [...document.querySelectorAll(
+                        'button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]'
+                    )]
                         .map((el, index) => {
                             if (!visible(el) || el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i]')) return null;
+                            if (el.closest('.item')) return null;
                             const r = el.getBoundingClientRect();
                             const label = [el.innerText, el.getAttribute('aria-label'), el.title,
                                 el.getAttribute('data-testid'), el.className, el.type]
                                 .filter(Boolean).join(' ').toLowerCase();
                             if (!/(отправ|send|submit)/i.test(label)) return null;
                             const verticalDistance = Math.abs((r.top + r.height / 2) - (c.top + c.height / 2));
-                            if (verticalDistance > 150 || r.left < c.left + c.width * 0.4) return null;
                             const form = composer.closest('form');
                             const inComposerForm = Boolean(form && form.contains(el));
-                            const score = (inComposerForm ? 100 : 0) +
+                            const composerShell = composer.closest('form,[class*="composer" i],[class*="message" i]') || composer.parentElement?.parentElement;
+                            const inComposerShell = Boolean(composerShell && composerShell.contains(el));
+                            const inDialog = Boolean(el.closest('[role="dialog"],[class*="modal" i],[class*="preview" i]'));
+                            if (!inComposerShell && !inDialog) return null;
+                            if (inComposerShell && (verticalDistance > 150 || r.left < c.left + c.width * 0.4)) return null;
+                            const score = (inDialog ? 200 : 0) + (inComposerForm ? 100 : 0) +
+                                (inComposerShell ? 50 : 0) +
                                 (el.type === 'submit' ? 80 : 0) +
                                 (/отправ|send|submit/i.test(label) ? 40 : 0) - verticalDistance;
                             return {index, score};
@@ -7981,8 +7994,11 @@ def send_message_to_max(
                                 return {index, score:(namedSend?10000:0)+(inShell?1000:0)+r.left};
                             }).filter(Boolean).sort((a,b)=>b.score-a.score).map(x=>x.index);
                     }""")
+                    fallback_controls = page.locator(
+                        'button,[role="button"],input[type="submit"]'
+                    )
                     for index in fallback_indices:
-                        candidate = send_controls.nth(int(index))
+                        candidate = fallback_controls.nth(int(index))
                         try:
                             if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
                                 send_button = candidate
@@ -8068,7 +8084,9 @@ def send_message_to_max(
                         return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';
                     };
                     const cr=c?c.getBoundingClientRect():null;
-                    const nearby=c?[...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                    const nearby=c?[...document.querySelectorAll(
+                        'button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]'
+                    )]
                         .filter(el=>visible(el)&&!el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"]'))
                         .map(el=>{
                             const r=el.getBoundingClientRect();
