@@ -211,6 +211,8 @@ admin_max_send_flow_lock = threading.RLock()
 public_max_send_flows = {}
 public_max_send_flow_lock = threading.RLock()
 public_max_send_albums = {}
+_send_to_max_command_menu_state = {}
+_send_to_max_command_menu_lock = threading.RLock()
 max_outbound_suppressions = {}
 max_outbound_suppressions_lock = threading.RLock()
 project_access_message_ids = {}
@@ -235,14 +237,30 @@ try:
 except (TypeError, ValueError):
     TELEGRAM_MIN_SEND_INTERVAL_SECONDS = 0.1
 
-bot.set_my_commands([
+_BASE_BOT_COMMANDS = [
     types.BotCommand("start", "Запустить бота"),
     types.BotCommand("help", "Связаться с тех поддержкой"),
     types.BotCommand("connect", "Подключить чат MAX"),
     types.BotCommand("mychats", "Мои группы парсинга"),
     types.BotCommand("subscription", "Подписка и продление"),
     types.BotCommand("admin", "Админ-панель")
-])
+]
+_SEND_TO_MAX_BOT_COMMAND = types.BotCommand("send_to_max", "Отправить сообщение в MAX")
+for _command_scope in (
+    None,
+    types.BotCommandScopeAllPrivateChats(),
+    types.BotCommandScopeAllGroupChats(),
+):
+    try:
+        if _command_scope is None:
+            bot.set_my_commands(_BASE_BOT_COMMANDS)
+        else:
+            bot.set_my_commands(_BASE_BOT_COMMANDS, scope=_command_scope)
+    except Exception as _command_error:
+        debug_logger.warning(
+            "BASE_COMMAND_MENU_SYNC_FAILED scope=%s error_type=%s",
+            getattr(_command_scope, "type", "default"), type(_command_error).__name__,
+        )
 
 #!==============================================================================
 #! 1) ФУНКЦИИ, СВЯЗАННЫЕ С ПАРСИНГОМ
@@ -2113,6 +2131,16 @@ def _verify_manual_source_type(chat_id):
 
 
 def run_one_parse_cycle():
+    for configured_chat in get_all_chats():
+        try:
+            _sync_send_to_max_command_menu(
+                int(configured_chat["chat_id"]), configured_chat
+            )
+        except Exception as command_menu_error:
+            debug_logger.warning(
+                "SEND_TO_MAX_COMMAND_MENU_CYCLE_SYNC_FAILED chat_id=%s error_type=%s",
+                configured_chat.get("chat_id"), type(command_menu_error).__name__,
+            )
     active_chats = _get_payable_active_chats()
     results = []
     if not active_chats:
@@ -5854,6 +5882,7 @@ def _delete_chat_everywhere(chat_id):
         chat = get_chat_by_id(chat_id)
         if not chat:
             return False
+        _sync_send_to_max_command_menu(chat_id, chat, force_disabled=True)
         destination_chat_id = int(chat.get("destination_chat_id") or chat_id)
         button_message_id = chat.get("max_send_button_message_id")
         if button_message_id:
@@ -6012,8 +6041,6 @@ def _max_source_is_private(chat):
         chat
         and chat.get("max_source_type") == "private"
         and chat.get("max_source_type_verified")
-        # Only an explicit private-chat choice is authoritative. Legacy rows
-        # were classified automatically and some groups were mislabeled.
         and chat.get("max_source_type_manual")
     )
 
@@ -6131,7 +6158,7 @@ def _admin_max_send_prompt(admin_id, source_chat_id, nonce, stage):
     flow["stage"] = stage
     flow["expires_at"] = time.time() + 15 * 60
     prompt_text = (
-        f"👤 Кто отправляет сообщение в MAX «{escape_html(chat.get('title') or 'Чат')}»?"
+        f"👤 Кто отправляет сообщение в MAX?"
         if stage == "name" else
         "✍️ Отправьте текст, фото, видео, кружок, голосовое, стикер, файл, геопозицию или опрос для MAX."
     )
@@ -6519,7 +6546,10 @@ def _latest_parser_send_anchor(chat_id, destination_chat_id):
 
 def _remove_max_send_button(chat_id, preserve_anchor=False):
     chat = get_chat_by_id(int(chat_id))
-    if not chat or not chat.get("max_send_button_message_id"):
+    if not chat:
+        return False
+    _sync_send_to_max_command_menu(int(chat_id), chat)
+    if not chat.get("max_send_button_message_id"):
         return False
     destination_chat_id = int(chat.get("destination_chat_id") or chat_id)
     _clear_max_send_anchor(
@@ -6581,9 +6611,47 @@ def _max_send_button_is_eligible(chat):
     return destination_type in {"group", "supergroup"}
 
 
+def _sync_send_to_max_command_menu(chat_id, chat=None, force_disabled=False):
+    """Expose /send_to_max only in connected Telegram groups with sendable MAX sources."""
+    chat_id = int(chat_id)
+    chat = chat or get_chat_by_id(chat_id)
+    if not chat:
+        return False
+    destination_type = str(chat.get("destination_type") or "group")
+    if destination_type not in {"group", "supergroup"}:
+        return False
+    try:
+        destination_chat_id = int(chat.get("destination_chat_id") or chat["chat_id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    should_show = bool(not force_disabled and _max_send_button_is_eligible(chat))
+    with _send_to_max_command_menu_lock:
+        if _send_to_max_command_menu_state.get(destination_chat_id) is should_show:
+            return True
+        scope = types.BotCommandScopeChat(chat_id=destination_chat_id)
+        try:
+            if should_show:
+                bot.set_my_commands(
+                    [*_BASE_BOT_COMMANDS, _SEND_TO_MAX_BOT_COMMAND], scope=scope
+                )
+            else:
+                # Chat scope overrides AllGroupChats. Delete it so the group
+                # inherits the base menu, which deliberately excludes this command.
+                bot.delete_my_commands(scope=scope)
+        except Exception as error:
+            debug_logger.warning(
+                "SEND_TO_MAX_COMMAND_MENU_SYNC_FAILED chat_id=%s destination_chat_id=%s enabled=%s error_type=%s",
+                chat_id, destination_chat_id, should_show, type(error).__name__,
+            )
+            return False
+        _send_to_max_command_menu_state[destination_chat_id] = should_show
+    return True
+
+
 def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=None):
     """Keep one MAX-send link beside the newest parser post for each connection."""
     chat = get_chat_by_id(int(chat_id))
+    _sync_send_to_max_command_menu(int(chat_id), chat)
     if not _max_send_button_is_eligible(chat):
         _remove_max_send_button(chat_id)
         return False
@@ -6645,7 +6713,7 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
 
 
 def _cleanup_legacy_max_send_buttons():
-    for chat in get_active_chats():
+    for chat in get_all_chats():
         try:
             _sync_max_send_button(int(chat["chat_id"]))
         except Exception as error:
@@ -6784,11 +6852,53 @@ def _start_public_max_send(call, source_chat_id, allowed_private_user_id=None):
             user.id, type(error).__name__,
         )
         return
-    _answer_public_max_send_action(call, "Продолжите в личном чате с ботом.")
+    if getattr(call, "id", None):
+        _answer_public_max_send_action(call, "Продолжите в личном чате с ботом.")
+    else:
+        bot.send_message(
+            destination_chat_id,
+            "✉️ Продолжите отправку в личном чате с MAX_Parser.",
+            **NO_PREVIEW,
+        )
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if current and current.get("nonce") == nonce:
             current["prompt_message_id"] = int(prompt.message_id)
+
+
+@bot.message_handler(commands=["send_to_max"], chat_types=["group", "supergroup"])
+def send_to_max_group_command(message):
+    if not message or not getattr(message, "from_user", None):
+        return
+    if getattr(message.from_user, "is_bot", False):
+        return
+    destination_chat_id = int(message.chat.id)
+    chat = None
+    for candidate in get_active_chats():
+        try:
+            candidate_destination = int(
+                candidate.get("destination_chat_id") or candidate["chat_id"]
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            candidate_destination == destination_chat_id
+            and str(candidate.get("destination_type") or "group") in {"group", "supergroup"}
+            and _max_send_button_is_eligible(candidate)
+        ):
+            chat = candidate
+            break
+    if not chat:
+        bot.send_message(
+            destination_chat_id,
+            "Отправка в MAX доступна в подключённой группе, если источник MAX — группа или личный чат. Для канала эта функция недоступна.",
+            **NO_PREVIEW,
+        )
+        return
+    _start_public_max_send(
+        SimpleNamespace(id=None, from_user=message.from_user, message=message),
+        int(chat["chat_id"]),
+    )
 
 
 def _ask_public_max_body(flow_key, nonce):
@@ -8051,6 +8161,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
             **NO_PREVIEW,
         )
         return False
+    _sync_send_to_max_command_menu(int(chat_id), get_chat_by_id(int(chat_id)))
     _clear_project_invite_pending(int(chat_id), delete_admin_messages=True)
     pending_setup_modes.pop(owner_id, None)
     customer_setup_state[owner_id] = {
