@@ -7786,8 +7786,8 @@ def send_message_to_max(
             for index in button_order:
                 try:
                     candidate = attach_controls.nth(int(index))
-                    with page.expect_file_chooser(timeout=1800) as chooser_info:
-                        candidate.click(timeout=1200)
+                    with page.expect_file_chooser(timeout=5000) as chooser_info:
+                        candidate.click(timeout=2500)
                     chooser_info.value.set_files(upload_payload, timeout=8000)
                     uploaded = True
                     upload_route = f"chooser-control:{int(index)}"
@@ -7804,22 +7804,41 @@ def send_message_to_max(
                     return inputs.map((el, index) => {
                         const r = el.getBoundingClientRect();
                         const accept = (el.getAttribute('accept') || '').toLowerCase();
+                        const trigger = el.closest('.btn,[role="button"],button,label') || el.parentElement;
                         const meta = [el.getAttribute('aria-label'), el.title, el.className,
-                            el.getAttribute('data-testid')].filter(Boolean).join(' ').toLowerCase();
+                            el.getAttribute('data-testid'), trigger?.innerText,
+                            trigger?.getAttribute('aria-label'), trigger?.title,
+                            trigger?.className].filter(Boolean).join(' ').toLowerCase();
                         let score = 0;
                         if (/image|video|audio|application|\\*/.test(accept)) score += 35;
                         if (/attach|file|media|photo|upload|влож|файл|медиа|фото/i.test(meta)) score += 45;
+                        if (/upload file|загрузить файл|прикрепить файл/i.test(meta)) score += 80;
                         if (r.top > window.innerHeight * 0.45) score += 12;
                         if (Math.abs(r.top - cr.top) < 220) score += 20;
                         const parent = el.closest('form,[class*="composer" i],[class*="message" i]');
                         if (parent && parent.contains(composer)) score += 60;
-                        return {index, score};
+                        return {index, score, trigger: trigger ? trigger.tagName : ''};
                     }).sort((a, b) => b.score - a.score).slice(0, 12).map(x => x.index);
                 }""")
                 file_inputs = page.locator('input[type="file"]')
                 for index in file_order:
                     try:
                         candidate = file_inputs.nth(int(index))
+                        # MAX's current composer renders the upload input inside
+                        # a small .btn wrapper. Activating that wrapper first is
+                        # necessary for its Svelte upload handler to select the
+                        # right composer state; setting files on the hidden input
+                        # alone can leave files.length=1 without a visible preview.
+                        try:
+                            trigger = candidate.locator("xpath=..")
+                            with page.expect_file_chooser(timeout=1600) as chooser_info:
+                                trigger.click(timeout=1000, force=True)
+                            chooser_info.value.set_files(upload_payload, timeout=8000)
+                            uploaded = True
+                            upload_route = f"chooser-input-parent:{int(index)}"
+                            break
+                        except Exception:
+                            pass
                         candidate.set_input_files(upload_payload, timeout=8000)
                         received_count = candidate.evaluate(
                             "el => el.files ? el.files.length : 0", timeout=1000
@@ -7847,7 +7866,34 @@ def send_message_to_max(
             if not uploaded:
                 raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
             # Let MAX finish rendering the selected file(s) in the composer.
-            page.wait_for_timeout(2200)
+            page.wait_for_timeout(350)
+            upload_ready = False
+            upload_state = {}
+            for _ in range(60):
+                upload_error = media_upload_error()
+                if upload_error:
+                    raise RuntimeError(
+                        "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
+                        else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
+                    )
+                upload_state = send_debug_state()
+                if (
+                    int(upload_state.get("composerPreview") or 0) > 0
+                    or int(upload_state.get("nearComposerMedia") or 0) > 0
+                ):
+                    upload_ready = True
+                    break
+                page.wait_for_timeout(250)
+            if not upload_ready:
+                diagnostic = {
+                    "upload": upload_route[:120],
+                    "method": "attachment-preview-not-ready",
+                    "state": upload_state,
+                }
+                raise RuntimeError(
+                    "MAX_UPLOAD_NOT_READY: " +
+                    json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))[:850]
+                )
             upload_error = media_upload_error()
             if upload_error:
                 raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")

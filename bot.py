@@ -1845,12 +1845,30 @@ def _update_detected_source_type(chat_id, source_type):
         return
     try:
         chat = get_chat_by_id(int(chat_id))
+        if not chat:
+            return
+        # A user-selected source type is authoritative: MAX's header can be
+        # ambiguous (especially for private chats). A successful navigation
+        # verifies access, but must not overwrite the user's group/private
+        # choice. A detected channel is the safety exception: MAX channels do
+        # not support the outbound-send action, even if the user picked a group.
+        if bool(chat.get("max_source_type_manual")):
+            if source_type == "channel" and chat.get("max_source_type") != "channel":
+                update_chat_source_type(int(chat_id), "channel", verified=True, manual=True)
+                debug_logger.info(
+                    "MAX_SOURCE_TYPE_CHANNEL_SAFETY_OVERRIDE chat_id=%s selected=%s",
+                    chat_id, chat.get("max_source_type"),
+                )
+                _sync_max_send_button(int(chat_id))
+            elif chat.get("max_source_type") and not bool(chat.get("max_source_type_verified")):
+                update_chat_source_type(
+                    int(chat_id), chat["max_source_type"], verified=True, manual=True
+                )
+                _sync_max_send_button(int(chat_id))
+            return
         if (
-            not chat
-            or (
-                chat.get("max_source_type") == source_type
-                and bool(chat.get("max_source_type_verified"))
-            )
+            chat.get("max_source_type") == source_type
+            and bool(chat.get("max_source_type_verified"))
         ):
             return
         update_chat_source_type(int(chat_id), source_type, verified=True)
@@ -1862,6 +1880,27 @@ def _update_detected_source_type(chat_id, source_type):
     except Exception as error:
         debug_logger.warning(
             "MAX_SOURCE_TYPE_PERSIST_FAILED chat_id=%s error_type=%s",
+            chat_id, type(error).__name__,
+        )
+
+
+def _verify_manual_source_type(chat_id):
+    """Mark the user's selected source kind verified after MAX opens the URL."""
+    try:
+        chat = get_chat_by_id(int(chat_id))
+        if (
+            chat
+            and bool(chat.get("max_source_type_manual"))
+            and chat.get("max_source_type") in {"group", "channel", "private"}
+            and not bool(chat.get("max_source_type_verified"))
+        ):
+            update_chat_source_type(
+                int(chat_id), chat["max_source_type"], verified=True, manual=True
+            )
+            _sync_max_send_button(int(chat_id))
+    except Exception as error:
+        debug_logger.warning(
+            "MAX_MANUAL_SOURCE_VERIFY_FAILED chat_id=%s error_type=%s",
             chat_id, type(error).__name__,
         )
 
@@ -1895,6 +1934,7 @@ def run_one_parse_cycle():
                 post_callback=consume_post,
                 source_type_callback=lambda detected, cid=chat_id: _update_detected_source_type(cid, detected),
             )
+            _verify_manual_source_type(chat_id)
             if not get_chat_by_id(chat_id):
                 continue
             new_count, skipped_count = parse_counts["new"], parse_counts["skipped"]
@@ -1992,6 +2032,7 @@ def process_single_chat(chat):
             post_callback=consume_post,
             source_type_callback=lambda detected, cid=chat_id: _update_detected_source_type(cid, detected),
         )
+        _verify_manual_source_type(chat_id)
         if get_chat_by_id(chat_id):
             _store_parse_diagnostic(
                 chat_id, title, parse_counts["new"], parse_counts["skipped"],
@@ -5974,6 +6015,10 @@ def _project_source_type_keyboard(chat_id):
         "👥 Группа или чат",
         callback_data=f"project_source_group_{chat_id}",
     ))
+    keyboard.add(types.InlineKeyboardButton(
+        "👤 ЛС · личный чат",
+        callback_data=f"project_source_private_{chat_id}",
+    ))
     keyboard.add(_setup_cancel_button(chat_id))
     return keyboard
 
@@ -5999,6 +6044,9 @@ def _customer_source_type_keyboard(chat_id):
     keyboard.add(types.InlineKeyboardButton(
         "👥 Группа или чат", callback_data=f"customer_source_group_{int(chat_id)}"
     ))
+    keyboard.add(types.InlineKeyboardButton(
+        "👤 ЛС · личный чат", callback_data=f"customer_source_private_{int(chat_id)}"
+    ))
     keyboard.add(_setup_cancel_button(chat_id))
     return keyboard
 
@@ -6020,6 +6068,12 @@ def _customer_source_type_text(chat_id):
 def _customer_source_url_prompt(owner_id, chat_id):
     chat = get_chat_by_id(int(chat_id)) or {}
     title = escape_html(chat.get("title") or "Группа")
+    source_type = chat.get("max_source_type") or "group"
+    source_label = {
+        "private": "личный чат",
+        "channel": "канал",
+        "group": "группу или чат",
+    }.get(source_type, "чат MAX")
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
         "🔙 Назад к выбору чата", callback_data=f"customer_source_back_{int(chat_id)}"
@@ -6028,17 +6082,17 @@ def _customer_source_url_prompt(owner_id, chat_id):
     if chat.get("destination_type") == "private":
         text = (
             "✅ Новые сообщения будут приходить в ваши личные сообщения с ботом.\n\n"
-            "<b>Шаг 2 из 3.</b> Пришлите ссылку на чат, группу или канал MAX, откуда получать сообщения.\n\n"
+            f"<b>Шаг 2 из 3.</b> Пришлите ссылку на {source_label} MAX, откуда получать сообщения.\n\n"
             "<b>Как скопировать ссылку</b>: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
-            "откройте нужный чат, группу или канал и скопируйте ссылку из меню.\n\n"
+            "откройте выбранный чат и скопируйте ссылку из меню.\n\n"
             "<i>Чтобы остановить настройку, нажмите «❌ Отмена».</i>"
         )
     else:
         text = (
             f"✅ Группа <b>{title}</b> закреплена за вами.\n\n"
-            "<b>Шаг 2 из 3.</b>\n\nПришлите ссылку на чат, группу или канал MAX, откуда получать сообщения.\n\n"
+            f"<b>Шаг 2 из 3.</b>\n\nПришлите ссылку на {source_label} MAX, откуда получать сообщения.\n\n"
             "<b>Как скопировать ссылку</b>: откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
-            "откройте нужный чат, группу или канал и скопируйте ссылку из меню.\n\n"
+            "откройте выбранный чат и скопируйте ссылку из меню.\n\n"
             "<i>Чтобы остановить настройку, нажмите «❌ Отмена».</i>"
         )
     return text, keyboard
@@ -7277,7 +7331,14 @@ def _project_source_instructions(owner_id, source_type, chat_id):
     setup_state["source_type"] = source_type
     setup_state["screen"] = "source_instructions"
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    if source_type == "group":
+    if source_type == "private":
+        text = (
+            "<b>Шаг 2 из 2 · Личный чат</b>\n\n"
+            "Пришлите ссылку на личный чат MAX. Готовый аккаунт сможет читать его, только если этот чат уже доступен аккаунту.\n\n"
+            "Если это переписка с другим человеком, сначала откройте её в MAX на аккаунте проекта и убедитесь, что сообщения видны. "
+            "После ссылки бот проверит доступ и включит пересылку."
+        )
+    elif source_type == "group":
         keyboard.add(types.InlineKeyboardButton(
             "🔗 Ссылка приглашения",
             callback_data=f"project_help_invite_{chat_id}",
@@ -7698,7 +7759,17 @@ def _verify_project_chat_access(
                 report("Проверка остановлена: подключение было удалено или изменено.")
                 return False
             toggle_chat(chat_id, True)
-            if detected_source_type in {"group", "channel", "private"}:
+            if (
+                bool(current.get("max_source_type_manual"))
+                and detected_source_type == "channel"
+                and current.get("max_source_type") != "channel"
+            ):
+                update_chat_source_type(chat_id, "channel", verified=True, manual=True)
+            elif bool(current.get("max_source_type_manual")) and current.get("max_source_type"):
+                update_chat_source_type(
+                    chat_id, current["max_source_type"], verified=True, manual=True
+                )
+            elif detected_source_type in {"group", "channel", "private"}:
                 update_chat_source_type(chat_id, detected_source_type, verified=True)
             current = get_chat_by_id(chat_id)
             if not current or not current.get("is_active"):
@@ -8099,7 +8170,7 @@ def customer_source_url(message):
             **NO_PREVIEW,
         )
         return
-    if state.get("source_type") not in {"channel", "group"}:
+    if state.get("source_type") not in {"channel", "group", "private"}:
         source_keyboard = (
             _project_source_type_keyboard(state["chat_id"])
             if mode == "project"
@@ -8117,8 +8188,12 @@ def customer_source_url(message):
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         if mode == "project":
             if state.get("screen") == "invite":
-                back_action = "project_back_channel" if state.get("source_type") == "channel" else "project_back_group"
-                back_label = "🔙 Назад к шагу канала" if state.get("source_type") == "channel" else "🔙 Назад к шагу группы"
+                if state.get("source_type") == "channel":
+                    back_action, back_label = "project_back_channel", "🔙 Назад к шагу канала"
+                elif state.get("source_type") == "private":
+                    back_action, back_label = "project_back_type", "🔙 Назад к выбору чата"
+                else:
+                    back_action, back_label = "project_back_group", "🔙 Назад к шагу группы"
             else:
                 back_action = "project_back_type"
                 back_label = "🔙 Назад к выбору чата"
@@ -8799,7 +8874,7 @@ def handle_password_input(message):
 #!==============================================================================
 #! 4) ОБРАБОТЧИК ЛОГИКИ ВСЕХ КНОПОК
 #!==============================================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("maxsend_") or call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("support_history_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data.startswith("connectdest_") or call.data.startswith("customer_source_") or call.data in ["delete_this_msg", "cancel_step"])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("maxsend_") or call.data.startswith("admin_") or call.data.startswith("qr_") or call.data.startswith("support_close_") or call.data.startswith("support_accept_") or call.data.startswith("support_history_") or call.data.startswith("review_") or call.data.startswith("reviews_") or call.data.startswith("project_retry_") or call.data.startswith("project_edit_source_") or call.data.startswith("project_source_channel_") or call.data.startswith("project_source_group_") or call.data.startswith("project_source_private_") or call.data.startswith("project_add_help_") or call.data.startswith("project_help_invite_") or call.data.startswith("project_invite_admin_") or call.data.startswith("project_help_channel_") or call.data.startswith("project_help_support_") or call.data.startswith("project_back_") or call.data.startswith("setup_cancel_") or call.data.startswith("connectdest_") or call.data.startswith("customer_source_") or call.data in ["delete_this_msg", "cancel_step"])
 def admin_callbacks(call):
     track_user(call)
     action = call.data
@@ -8989,10 +9064,15 @@ def admin_callbacks(call):
                 **NO_PREVIEW,
             )
             return
-        source_type = "channel" if action.startswith("customer_source_channel_") else "group"
+        if action.startswith("customer_source_channel_"):
+            source_type = "channel"
+        elif action.startswith("customer_source_private_"):
+            source_type = "private"
+        else:
+            source_type = "group"
         state["source_type"] = source_type
         state["screen"] = "source_url"
-        update_chat_source_type(source_chat_id, source_type)
+        update_chat_source_type(source_chat_id, source_type, manual=True)
         text, keyboard = _customer_source_url_prompt(owner_id, source_chat_id)
         state["prompt_message_id"] = int(call.message.message_id)
         bot.answer_callback_query(call.id, "Выберите чат MAX")
@@ -9228,7 +9308,7 @@ def admin_callbacks(call):
             )
         except (ValueError, IndexError, TypeError):
             is_allowed_project_retry = False
-    if not is_admin(call.from_user.id) and action.startswith(("project_source_channel_", "project_source_group_", "project_add_help_", "project_help_invite_", "project_help_channel_", "project_help_support_", "project_back_")):
+    if not is_admin(call.from_user.id) and action.startswith(("project_source_channel_", "project_source_group_", "project_source_private_", "project_add_help_", "project_help_invite_", "project_help_channel_", "project_help_support_", "project_back_")):
         try:
             setup_chat_id = int(action.rsplit("_", 1)[1])
             setup_chat = get_chat_by_id(setup_chat_id)
@@ -9267,7 +9347,7 @@ def admin_callbacks(call):
             except Exception:
                 is_allowed_customer_cancel = False
     if not is_admin(call.from_user.id) and action.startswith((
-        "project_source_channel_", "project_source_group_", "project_add_help_",
+        "project_source_channel_", "project_source_group_", "project_source_private_", "project_add_help_",
         "project_help_invite_", "project_help_channel_", "project_help_support_",
         "project_back_", "setup_cancel_",
     )):
@@ -9479,7 +9559,7 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "⚠️ Не удалось удалить")
             print(f"Ошибка удаления: {e}")
         return
-    if action.startswith(("project_source_channel_", "project_source_group_", "project_add_help_", "project_help_invite_", "project_help_channel_", "project_help_support_", "project_back_")):
+    if action.startswith(("project_source_channel_", "project_source_group_", "project_source_private_", "project_add_help_", "project_help_invite_", "project_help_channel_", "project_help_support_", "project_back_")):
         try:
             setup_chat_id = int(action.rsplit("_", 1)[1])
         except (ValueError, IndexError):
@@ -9503,9 +9583,14 @@ def admin_callbacks(call):
         ):
             bot.answer_callback_query(call.id, "Этот шаг настройки уже завершён", show_alert=True)
             return
-        if action.startswith(("project_source_channel_", "project_source_group_")):
-            source_type = "channel" if action.startswith("project_source_channel_") else "group"
-            update_chat_source_type(setup_chat_id, source_type)
+        if action.startswith(("project_source_channel_", "project_source_group_", "project_source_private_")):
+            if action.startswith("project_source_channel_"):
+                source_type = "channel"
+            elif action.startswith("project_source_private_"):
+                source_type = "private"
+            else:
+                source_type = "group"
+            update_chat_source_type(setup_chat_id, source_type, manual=True)
             prompt, keyboard = _project_source_instructions(
                 call.from_user.id, source_type, setup_chat_id
             )
@@ -9574,7 +9659,7 @@ def admin_callbacks(call):
             return
         if action.startswith("project_help_channel_"):
             setup_state["source_type"] = "channel"
-            update_chat_source_type(setup_chat_id, "channel")
+            update_chat_source_type(setup_chat_id, "channel", manual=True)
             prompt, keyboard = _project_invite_prompt(call.from_user.id, setup_chat_id)
             bot.answer_callback_query(call.id)
             try:

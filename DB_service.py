@@ -81,6 +81,7 @@ def init_db():
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_send_button_message_id BIGINT")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type TEXT")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type_verified BOOLEAN NOT NULL DEFAULT FALSE")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type_manual BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS connection_generation TEXT")
         conn.execute("""
             UPDATE chats SET destination_chat_id = chat_id
@@ -1357,14 +1358,37 @@ def update_chat_url(chat_id: int, max_url: str):
         conn.execute("UPDATE chats SET max_url = %s WHERE chat_id = %s", (max_url, chat_id))
 
 
-def update_chat_source_type(chat_id: int, source_type: str | None, verified: bool = False):
+def update_chat_source_type(
+    chat_id: int,
+    source_type: str | None,
+    verified: bool = False,
+    manual: bool = False,
+):
     source_type = str(source_type or "").strip().lower()
     if source_type not in {"group", "channel", "private"}:
         source_type = None
     with get_connection() as conn:
+        if source_type is None:
+            conn.execute(
+                """UPDATE chats SET max_source_type = NULL,
+                    max_source_type_verified = FALSE,
+                    max_source_type_manual = FALSE WHERE chat_id = %s""",
+                (int(chat_id),),
+            )
+            return
+        if manual:
+            conn.execute(
+                """UPDATE chats SET max_source_type = %s,
+                    max_source_type_verified = %s,
+                    max_source_type_manual = TRUE WHERE chat_id = %s""",
+                (source_type, bool(verified), int(chat_id)),
+            )
+            return
         conn.execute(
-            "UPDATE chats SET max_source_type = %s, max_source_type_verified = %s WHERE chat_id = %s",
-            (source_type, bool(verified) if source_type else False, int(chat_id)),
+            """UPDATE chats SET max_source_type = %s,
+                max_source_type_verified = %s
+            WHERE chat_id = %s AND max_source_type_manual = FALSE""",
+            (source_type, bool(verified), int(chat_id)),
         )
 
 
