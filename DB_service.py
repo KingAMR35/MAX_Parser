@@ -860,11 +860,6 @@ def claim_support_session(user_id: int, admin_id: int):
             RETURNING assigned_admin_id
         """, (int(admin_id), int(user_id))).fetchone()
         if row:
-            conn.execute("""
-                UPDATE support_conversations
-                SET assigned_admin_id = %s
-                WHERE user_id = %s AND closed_at IS NULL
-            """, (int(admin_id), int(user_id)))
             return {"claimed": True, "admin_id": int(row["assigned_admin_id"])}
         row = conn.execute(
             "SELECT assigned_admin_id FROM support_sessions WHERE user_id = %s",
@@ -947,11 +942,6 @@ def close_support_session(user_id: int):
         conn.execute("DELETE FROM support_request_notifications WHERE user_id = %s", (user_id,))
         conn.execute("DELETE FROM support_sessions WHERE user_id = %s", (user_id,))
         conn.execute("DELETE FROM support_message_routes WHERE user_id = %s", (user_id,))
-        conn.execute("""
-            UPDATE support_conversations
-            SET closed_at = CURRENT_TIMESTAMP
-            WHERE user_id = %s AND closed_at IS NULL
-        """, (int(user_id),))
 
 
 def select_users():

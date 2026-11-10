@@ -7890,7 +7890,6 @@ def send_message_to_max(
     session_path: str = None,
     on_before_send=None,
     on_send_confirmed=None,
-    on_send_failed=None,
     media: dict = None,
     source_type_callback=None,
     bold_first_line: bool = True,
@@ -7930,8 +7929,6 @@ def send_message_to_max(
             upload_payload = upload_payload[0]
 
     pw = browser = context = page = None
-    outbound_echo_armed = False
-    delivery_may_have_occurred = False
     try:
         pw = sync_playwright().start()
         browser = pw.chromium.launch(
@@ -8267,26 +8264,20 @@ def send_message_to_max(
             if supports_rich_text and str(bold_sender_name or "").strip():
                 try:
                     selected_name = composer.evaluate("""(el, name) => {
-                        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+                        const first = document.createTreeWalker(el, NodeFilter.SHOW_TEXT).nextNode();
                         name=String(name||'');
-                        let first = null;
-                        while (walker.nextNode()) {
-                            if (walker.currentNode.data.startsWith(name)) {
-                                first = walker.currentNode;
-                                break;
-                            }
-                        }
-                        if (!first || !name) return false;
+                        if (!first || !name || !first.data.startsWith(name)) return false;
                         const range=document.createRange();
                         range.setStart(first,0);
                         range.setEnd(first,name.length);
                         const selection=window.getSelection();
                         selection.removeAllRanges();
                         selection.addRange(range);
-                        return document.execCommand('bold', false, null);
+                        return true;
                     }""", str(bold_sender_name), timeout=1000)
-                    if not selected_name:
-                        debug_logger.info("MAX_SENDER_NAME_BOLD_UNAVAILABLE chat_id=%s", chat_id)
+                    if selected_name:
+                        composer.press("Control+B", timeout=1500)
+                        composer.press("Control+End", timeout=1500)
                 except Exception:
                     pass
             elif supports_rich_text and bold_first_line:
@@ -8301,13 +8292,8 @@ def send_message_to_max(
         fill_composer_text()
 
         upload_auto_sent_rows = []
+        outbound_echo_armed = False
         if upload_payload:
-            # Some MAX Web upload paths publish immediately on file selection.
-            # Arm echo suppression before opening the chooser so a concurrent
-            # parser cycle cannot forward our own upload back to Telegram.
-            if on_before_send and not outbound_echo_armed:
-                on_before_send(normalized_media_hashes)
-                outbound_echo_armed = True
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
             upload_route = _select_max_composer_upload(
                 page, upload_payload, expected_count
@@ -8355,7 +8341,16 @@ def send_message_to_max(
                     else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
                 )
             if upload_auto_sent_rows:
-                delivery_may_have_occurred = True
+                if on_before_send and not outbound_echo_armed:
+                    try:
+                        on_before_send(normalized_media_hashes)
+                        outbound_echo_armed = True
+                    except Exception as error:
+                        outbound_echo_armed = True
+                        debug_logger.warning(
+                            "MAX_OUTBOUND_ECHO_ARM_FAILED after_auto_upload error_type=%s",
+                            type(error).__name__,
+                        )
                 page.wait_for_timeout(1200)
                 upload_error = media_upload_error()
                 if upload_error:
@@ -8449,7 +8444,6 @@ def send_message_to_max(
         if on_before_send and not outbound_echo_armed:
             on_before_send(normalized_media_hashes)
             outbound_echo_armed = True
-        delivery_may_have_occurred = True
         if send_button is not None:
             try:
                 send_control_info = send_button.evaluate("""el => {
@@ -8579,14 +8573,6 @@ def send_message_to_max(
                 pass
         return
     except Exception as error:
-        if on_send_failed and outbound_echo_armed and not delivery_may_have_occurred:
-            try:
-                on_send_failed()
-            except Exception as cleanup_error:
-                debug_logger.warning(
-                    "MAX_OUTBOUND_ECHO_ROLLBACK_FAILED error_type=%s",
-                    type(cleanup_error).__name__,
-                )
         if isinstance(error, RuntimeError):
             raise
         raise RuntimeError(f"MAX_SEND_FAILED: {type(error).__name__}: {error}") from error
