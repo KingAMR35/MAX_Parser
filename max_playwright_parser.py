@@ -6340,6 +6340,18 @@ def parse_max_group_media(
                         const bubble = block.querySelector(".bubbleContent");
                         if (!bubble) return;
 
+                        const directionMarker = [
+                            safeAttr(row,"class"), safeAttr(row,"data-direction"),
+                            safeAttr(row,"data-testid"),
+                            ...Array.from(row.querySelectorAll(
+                                "[class*='outgoing' i],[class*='sent' i],[class*='own' i],[data-direction='out']"
+                            )).map(el=>safeAttr(el,"class"))
+                        ].filter(Boolean).join(" ");
+                        const bubbleRect = bubble.getBoundingClientRect();
+                        const outgoingHint = /(outgoing|sent|mine|own|is-out|my-message|message--out)/i.test(directionMarker) ||
+                            (bubbleRect.width > 0 && bubbleRect.width < window.innerWidth * 0.78 &&
+                                bubbleRect.left + bubbleRect.width / 2 > window.innerWidth * 0.58);
+
                         const name = getAuthor(row);
                         const role = getRole(row, name);
                         // Сначала получаем emoji из DOM, затем используем их как fallback
@@ -6623,6 +6635,7 @@ def parse_max_group_media(
                             poll: special.poll,
                             contact: special.contact,
                             video_note_hint: Boolean(videoNoteHint),
+                            is_outgoing: Boolean(outgoingHint),
                             voice_hint: Boolean(voiceHint),
                             media_duration_seconds: mediaDurationSeconds,
                             media_hint_debug: `${mediaDurationText} | ${mediaMeta}`.slice(0,500),
@@ -8069,6 +8082,10 @@ def send_message_to_max(
                         const id = row.getAttribute('data-message-id') || row.getAttribute('data-mid') ||
                             row.getAttribute('data-id') || row.getAttribute('data-index') || '';
                         const text = String(row.innerText || row.textContent || '').trim();
+                        const timeNode = row.querySelector(
+                            '.bubbleContent .meta .text,.bubbleContent .meta time,.meta .text,.meta time,time[datetime]'
+                        );
+                        const time = timeNode ? String(timeNode.textContent || timeNode.getAttribute('datetime') || '').trim() : '';
                         const images = Array.from(row.querySelectorAll('img')).filter(el => {
                             if (el.closest('[class*="avatar"],[class*="profile"],[class*="userpic"]')) return false;
                             const rect = el.getBoundingClientRect();
@@ -8091,7 +8108,7 @@ def send_message_to_max(
                         else if (images.length || nodes.some(el => el.tagName === 'CANVAS' || /photo|image|sticker|изображ/i.test(String(el.className || '')))) mediaKind = 'image';
                         else if (nodes.length) mediaKind = 'document';
                         const signature = String(id || index) + '|' + text + '|' + filename + '|' + mediaKind;
-                        return {id: String(id), text, filename, media: nodes.length > 0, mediaKind, outgoing, signature};
+                        return {id: String(id), text, time, filename, media: nodes.length > 0, mediaKind, outgoing, signature};
                     });
                 }""")
                 payload_items = upload_payload if isinstance(upload_payload, (list, tuple)) else [upload_payload]
@@ -8109,6 +8126,7 @@ def send_message_to_max(
                     )
                     result.append({
                         "id": str(row.get("id") or ""), "text": text,
+                        "time": str(row.get("time") or ""),
                         "filename": filename,
                         "media": bool(row.get("media") or has_named_upload),
                         "media_kind": str(row.get("mediaKind") or ""),
@@ -8232,6 +8250,47 @@ def send_message_to_max(
             except Exception as error:
                 return {"diagnostic_error": type(error).__name__}
 
+        # Prepare the caption before selecting the attachment. Some MAX Web
+        # upload routes send files immediately after selection; pre-filling lets
+        # MAX include the text in the same message whenever that route supports it.
+        def fill_composer_text():
+            if not str(text or "").strip():
+                return
+            composer.fill(str(text), timeout=5000)
+            try:
+                supports_rich_text = bool(composer.evaluate("el => el.isContentEditable"))
+            except Exception:
+                supports_rich_text = False
+            if supports_rich_text and str(bold_sender_name or "").strip():
+                try:
+                    selected_name = composer.evaluate("""(el, name) => {
+                        const first = document.createTreeWalker(el, NodeFilter.SHOW_TEXT).nextNode();
+                        name=String(name||'');
+                        if (!first || !name || !first.data.startsWith(name)) return false;
+                        const range=document.createRange();
+                        range.setStart(first,0);
+                        range.setEnd(first,name.length);
+                        const selection=window.getSelection();
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                        return true;
+                    }""", str(bold_sender_name), timeout=1000)
+                    if selected_name:
+                        composer.press("Control+B", timeout=1500)
+                        composer.press("Control+End", timeout=1500)
+                except Exception:
+                    pass
+            elif supports_rich_text and bold_first_line:
+                try:
+                    composer.press("Control+Home", timeout=1500)
+                    composer.press("Shift+End", timeout=1500)
+                    composer.press("Control+B", timeout=1500)
+                    composer.press("Control+End", timeout=1500)
+                except Exception:
+                    pass
+
+        fill_composer_text()
+
         upload_auto_sent_rows = []
         outbound_echo_armed = False
         if upload_payload:
@@ -8282,7 +8341,7 @@ def send_message_to_max(
                     else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
                 )
             if upload_auto_sent_rows:
-                if on_before_send:
+                if on_before_send and not outbound_echo_armed:
                     try:
                         on_before_send(normalized_media_hashes)
                         outbound_echo_armed = True
@@ -8301,14 +8360,26 @@ def send_message_to_max(
                     )
                 if on_send_confirmed:
                     for row in upload_auto_sent_rows:
-                        if row.get("id"):
+                        if row.get("id") or row.get("media"):
                             try:
-                                on_send_confirmed(row["id"])
+                                on_send_confirmed(row.get("id"), row)
                             except Exception as error:
                                 debug_logger.warning(
                                     "MAX_OUTBOUND_SOURCE_REMEMBER_FAILED after_auto_upload error_type=%s",
                                     type(error).__name__,
                                 )
+                expected_caption = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
+                caption_is_attached = bool(
+                    len(expected_caption) >= 3
+                    and any(
+                        expected_caption[:80] in re.sub(
+                            r"\s+", " ", str(row.get("text") or "")
+                        ).strip().casefold()
+                        for row in upload_auto_sent_rows
+                    )
+                )
+                if caption_is_attached:
+                    return
                 before_tail = chat_tail_snapshot()
                 before_source_ids = chat_tail_source_ids()
                 before_row_signatures = {
@@ -8318,44 +8389,7 @@ def send_message_to_max(
                 upload_payload = None
                 if not str(text or "").strip():
                     return
-
-        # Fill in one operation to preserve Unicode and the exact order of characters.
-        if str(text or "").strip():
-            composer.fill(str(text), timeout=5000)
-        try:
-            supports_rich_text = bool(composer.evaluate("el => el.isContentEditable"))
-        except Exception:
-            supports_rich_text = False
-        if supports_rich_text and str(bold_sender_name or "").strip():
-            try:
-                selected_name = composer.evaluate("""(el, name) => {
-                    const first = document.createTreeWalker(el, NodeFilter.SHOW_TEXT).nextNode();
-                    name=String(name||'');
-                    if (!first || !name || !first.data.startsWith(name)) return false;
-                    const range=document.createRange();
-                    range.setStart(first,0);
-                    range.setEnd(first,name.length);
-                    const selection=window.getSelection();
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                    return true;
-                }""", str(bold_sender_name), timeout=1000)
-                if selected_name:
-                    composer.press("Control+B", timeout=1500)
-                    composer.press("Control+End", timeout=1500)
-            except Exception:
-                # Text delivery is more important than styling on MAX clients
-                # that do not expose a standard contenteditable text node.
-                pass
-        elif supports_rich_text and bold_first_line:
-            try:
-                composer.press("Control+Home", timeout=1500)
-                composer.press("Shift+End", timeout=1500)
-                composer.press("Control+B", timeout=1500)
-                composer.press("Control+End", timeout=1500)
-            except Exception:
-                # If this MAX client has a different editor, send the text as entered.
-                pass
+                fill_composer_text()
 
         send_button = None
         send_control_info = ""
@@ -8511,7 +8545,8 @@ def send_message_to_max(
             try:
                 new_rows = [
                     row for row in chat_tail_source_rows()
-                    if row["id"] not in before_source_ids
+                    if (row.get("id") and row["id"] not in before_source_ids)
+                    or (row.get("signature") and row["signature"] not in before_row_signatures)
                 ]
                 expected = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
                 matching_rows = [
@@ -8522,16 +8557,16 @@ def send_message_to_max(
                     ).strip().casefold()
                 ]
                 if matching_rows:
-                    source_ids_to_remember = [row["id"] for row in matching_rows]
+                    source_rows_to_remember = matching_rows
                 elif upload_payload:
                     media_rows = new_upload_media_rows(require_outgoing=True)
-                    source_ids_to_remember = [row["id"] for row in media_rows if row.get("id")]
+                    source_rows_to_remember = [row for row in media_rows if row.get("id") or row.get("media")]
                 elif len(new_rows) == 1:
-                    source_ids_to_remember = [new_rows[0]["id"]]
+                    source_rows_to_remember = [new_rows[0]]
                 else:
-                    source_ids_to_remember = []
-                for source_id in source_ids_to_remember:
-                    on_send_confirmed(source_id)
+                    source_rows_to_remember = []
+                for row in source_rows_to_remember:
+                    on_send_confirmed(row.get("id"), row)
             except Exception:
                 # Content and media fingerprints remain the fallback if MAX
                 # does not expose a stable ID for the newly sent message.

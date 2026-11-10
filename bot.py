@@ -1580,6 +1580,14 @@ def _max_outbound_post_fingerprints(post):
     return fingerprints
 
 
+def _outbound_video_time_fingerprint(value):
+    """Stable one-use key for MAX's outgoing video when no message ID is exposed."""
+    value = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    if not re.fullmatch(r"\d{1,2}:\d{2}(?:\s*(?:am|pm))?", value):
+        return ""
+    return f"outgoing:video:{value}"
+
+
 def _load_max_outbound_suppressions():
     now = time.time()
     try:
@@ -1657,7 +1665,19 @@ def _process_posts(
             _consume_max_outbound_echo(chat_id, fingerprint)
             for fingerprint in outbound_text_fingerprints
         )
-        if outbound_source_echo or outbound_text_echo or outbound_media_echo:
+        outbound_video_time_echo = False
+        if post.get("is_outgoing") and (
+            post.get("video_note_hint")
+            or any(
+                isinstance(item, dict)
+                and str(item.get("type") or "").casefold() in {"video", "video_note"}
+                for item in post.get("media_files", []) or []
+            )
+        ):
+            outbound_video_time_echo = _consume_max_outbound_echo(
+                chat_id, _outbound_video_time_fingerprint(post.get("time"))
+            )
+        if outbound_source_echo or outbound_text_echo or outbound_media_echo or outbound_video_time_echo:
             _commit_successful_post(chat_id, post)
             _cleanup_post_media(post)
             skipped_count += 1
@@ -6379,7 +6399,7 @@ def _send_max_payload_with_sender(
     on_send_confirmed=None,
     source_type_callback=None,
 ):
-    """Send sender attribution with captionable media, or immediately before other media."""
+    """Send sender attribution and message text together with any attachment."""
     body = str(body or "").strip()
     sender_name = str(sender_name or "").strip()
     header = f"{sender_name} пишет" if sender_name else ""
@@ -6391,28 +6411,6 @@ def _send_max_payload_with_sender(
         "on_send_confirmed": on_send_confirmed,
         "source_type_callback": source_type_callback,
     }
-    media_items = media if isinstance(media, (list, tuple)) else ([media] if media else [])
-    captionable = all(
-        str(item.get("kind") or "") in {"photo", "video", "video_note", "sticker_image"}
-        for item in media_items
-    )
-    if media_items and not captionable and header:
-        send_message_to_max(
-            text=header,
-            media=None,
-            bold_sender_name=sender_name,
-            bold_first_line=False,
-            **common,
-        )
-        send_message_to_max(
-            text=body,
-            media=media,
-            bold_sender_name="",
-            bold_first_line=False,
-            **common,
-        )
-        return
-
     text = f"{header}\n\n{body}".strip() if header else body
     send_message_to_max(
         text=text,
@@ -6507,16 +6505,25 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 for fingerprint in fingerprints:
                     _remember_max_outbound_echo(affected_chat_id, fingerprint)
 
-        def remember_outbound_source(source_id):
+        def remember_outbound_source(source_id, row=None):
             source_id = str(source_id or "").strip()
-            if not source_id:
+            row = row if isinstance(row, dict) else {}
+            video_time_key = (
+                _outbound_video_time_fingerprint(row.get("time"))
+                if str(row.get("media_kind") or "").casefold() == "video"
+                else ""
+            )
+            if not source_id and not video_time_key:
                 return
             affected_chat_ids = {int(source_chat_id)}
             for candidate in get_all_chats():
                 if candidate.get("max_url") == chat.get("max_url"):
                     affected_chat_ids.add(int(candidate["chat_id"]))
             for affected_chat_id in affected_chat_ids:
-                _remember_max_outbound_echo(affected_chat_id, f"source:{source_id}")
+                if source_id:
+                    _remember_max_outbound_echo(affected_chat_id, f"source:{source_id}")
+                if video_time_key:
+                    _remember_max_outbound_echo(affected_chat_id, video_time_key)
 
         with source_lock:
             _send_max_payload_with_sender(
@@ -6815,7 +6822,11 @@ def _start_public_max_send(call, source_chat_id):
     if getattr(user, "is_bot", False):
         bot.answer_callback_query(call.id, "Эту кнопку может использовать пользователь.", show_alert=True)
         return
-    flow_key = (destination_chat_id, int(user.id))
+    # Collect the sender name and message in the clicker's private chat. Telegram
+    # Privacy Mode hides ordinary group messages from bots, so waiting for input
+    # in the destination group silently drops valid submissions.
+    input_chat_id = int(user.id)
+    flow_key = (input_chat_id, int(user.id))
     nonce = uuid.uuid4().hex[:10]
     is_private_source = _max_source_is_private(chat)
     initial_stage = "body" if is_private_source else "name"
@@ -6827,6 +6838,7 @@ def _start_public_max_send(call, source_chat_id):
         public_max_send_flows[flow_key] = {
             "source_chat_id": source_chat_id,
             "destination_chat_id": destination_chat_id,
+            "input_chat_id": input_chat_id,
             "user_id": int(user.id),
             "destination_type": str(chat.get("destination_type") or "group"),
             "nonce": nonce,
@@ -6834,13 +6846,12 @@ def _start_public_max_send(call, source_chat_id):
             "sender_name": "",
             "expires_at": time.time() + 15 * 60,
         }
-    bot.answer_callback_query(call.id)
     try:
         prompt_text = (
             "💬 Отправьте текст или вложение для этого личного чата MAX."
             if is_private_source else
             f"👤 Кто отправляет сообщение в MAX «{escape_html(chat.get('title') or 'Чат')}»?\n\n"
-            "Напишите имя в этот чат или нажмите «Пропустить этот шаг»."
+            "Напишите имя в личном чате с ботом или нажмите «Пропустить этот шаг»."
         )
         prompt_options = {
             "reply_markup": _public_max_send_keyboard(
@@ -6848,16 +6859,32 @@ def _start_public_max_send(call, source_chat_id):
             ),
             **NO_PREVIEW,
         }
-        prompt = bot.send_message(destination_chat_id, prompt_text, **prompt_options)
-    except Exception:
+        prompt = bot.send_message(input_chat_id, prompt_text, **prompt_options)
+    except Exception as error:
         with public_max_send_flow_lock:
             current = public_max_send_flows.get(flow_key)
             if current and current.get("nonce") == nonce:
                 public_max_send_flows.pop(flow_key, None)
+        bot.answer_callback_query(
+            call.id,
+            "Сначала откройте @max_parserBot и нажмите /start, затем нажмите кнопку ещё раз.",
+            show_alert=True,
+        )
+        if is_group_chat:
+            try:
+                bot.send_message(
+                    destination_chat_id,
+                    "Чтобы написать в MAX, сначала откройте @max_parserBot и нажмите /start. Затем нажмите эту кнопку ещё раз.",
+                    **NO_PREVIEW,
+                )
+            except Exception:
+                pass
+        debug_logger.info(
+            "PUBLIC_MAX_PRIVATE_PROMPT_FAILED user=%s error_type=%s",
+            user.id, type(error).__name__,
+        )
         return
-    _record_bot_sent_group_messages(
-        destination_chat_id, [prompt.message_id], "Запрос имени отправителя"
-    )
+    bot.answer_callback_query(call.id, "Продолжите в личном чате с ботом.")
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if current and current.get("nonce") == nonce:
@@ -6876,9 +6903,6 @@ def _ask_public_max_body(flow_key, nonce):
         reply_markup=_public_max_send_keyboard(nonce),
         **NO_PREVIEW,
     )
-    _record_bot_sent_group_messages(
-        int(flow_key[0]), [prompt.message_id], "Запрос сообщения для MAX"
-    )
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if current and current.get("nonce") == nonce and current.get("stage") == "body":
@@ -6887,13 +6911,9 @@ def _ask_public_max_body(flow_key, nonce):
 
 
 def _is_public_max_send_reply(message):
-    if (
-        not message
-        or not getattr(message, "from_user", None)
-        or message.chat.type not in {"group", "supergroup", "private"}
-    ):
+    if not message or not getattr(message, "from_user", None) or message.chat.type != "private":
         return False
-    if message.chat.type == "private" and int(message.chat.id) != int(message.from_user.id):
+    if int(message.chat.id) != int(message.from_user.id):
         return False
     key = (int(message.chat.id), int(message.from_user.id))
     with public_max_send_flow_lock:
@@ -6904,16 +6924,7 @@ def _is_public_max_send_reply(message):
             or float(flow.get("expires_at") or 0) <= time.time()
         ):
             return False
-        if message.chat.type == "private":
-            return flow.get("destination_type") == "private"
-        # The flow is keyed by (group_id, clicker_id), so only the person who
-        # opened it can advance it. The bot must be an admin or have privacy
-        # mode disabled to receive ordinary group messages without replies.
-        if message.chat.type in {"group", "supergroup"}:
-            return flow.get("destination_type") in {"group", "supergroup"}
-        media_group_id = getattr(message, "media_group_id", None)
-        album = public_max_send_albums.get((key, str(media_group_id))) if media_group_id else None
-        return bool(album and album.get("nonce") == flow.get("nonce") and flow.get("stage") == "body")
+        return int(flow.get("input_chat_id") or flow.get("destination_chat_id") or 0) == int(message.chat.id)
 
 
 def _public_max_input(message):
@@ -7255,16 +7266,25 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 for fingerprint in fingerprints:
                     _remember_max_outbound_echo(affected_chat_id, fingerprint)
 
-        def remember_outbound_source(source_id):
+        def remember_outbound_source(source_id, row=None):
             source_id = str(source_id or "").strip()
-            if not source_id:
+            row = row if isinstance(row, dict) else {}
+            video_time_key = (
+                _outbound_video_time_fingerprint(row.get("time"))
+                if str(row.get("media_kind") or "").casefold() == "video"
+                else ""
+            )
+            if not source_id and not video_time_key:
                 return
             affected_chat_ids = {int(source_chat_id)}
             for candidate in get_all_chats():
                 if candidate.get("max_url") == chat.get("max_url"):
                     affected_chat_ids.add(int(candidate["chat_id"]))
             for affected_chat_id in affected_chat_ids:
-                _remember_max_outbound_echo(affected_chat_id, f"source:{source_id}")
+                if source_id:
+                    _remember_max_outbound_echo(affected_chat_id, f"source:{source_id}")
+                if video_time_key:
+                    _remember_max_outbound_echo(affected_chat_id, video_time_key)
 
         source_lock = max_send_source_locks.setdefault(source_chat_id, threading.Lock())
         with source_lock:
@@ -7282,7 +7302,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
         result_text = "✅ Сообщение отправлено в MAX."
         result_keyboard = _public_max_send_button_keyboard(source_chat_id)
     except Exception as error:
-        _print_max_send_failure("PUBLIC_MAX_SEND_FAILED", flow_key[0], error)
+        _print_max_send_failure("PUBLIC_MAX_SEND_FAILED", int(flow.get("source_chat_id") or flow_key[0]), error)
         debug_logger.warning(
             "PUBLIC_MAX_SEND_FAILED user_chat=%s error_type=%s error=%s",
             flow_key, type(error).__name__, log_preview(error, 900),
@@ -7361,9 +7381,6 @@ def _finalize_public_max_album(flow_key, nonce, media_group_id):
             reply_markup=_public_max_send_keyboard(nonce),
             **NO_PREVIEW,
         )
-        _record_bot_sent_group_messages(
-            int(flow_key[0]), [prompt.message_id], "Подсказка о подписи к альбому"
-        )
         with public_max_send_flow_lock:
             current = public_max_send_flows.get(flow_key)
             if current and current.get("nonce") == nonce:
@@ -7386,9 +7403,6 @@ def _finalize_public_max_album(flow_key, nonce, media_group_id):
         parse_mode="HTML",
         reply_markup=_public_max_send_confirm_keyboard(source_chat_id, nonce),
         **NO_PREVIEW,
-    )
-    _record_bot_sent_group_messages(
-        int(flow_key[0]), [preview.message_id], "Предпросмотр альбома для MAX"
     )
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
