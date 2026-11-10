@@ -7679,19 +7679,19 @@ def send_message_to_max(
                             'video,audio,[class*="attachment" i],[class*="file" i],' +
                             '[data-testid*="attachment" i],[data-testid*="media" i]'
                         ));
+                        const mediaStructure=[...row.querySelectorAll(
+                            'img,video,audio,canvas,source,[class*="attachment" i],' +
+                            '[class*="file" i],[data-testid*="media" i]'
+                        )].map(el=>{
+                            const r=el.getBoundingClientRect();
+                            return `${el.tagName}:${String(el.className||'').slice(0,80)}:${Math.round(r.width)}x${Math.round(r.height)}`;
+                        }).join(',').slice(0,500);
                         const media=hasLargeImage||hasAttachment?1:0;
-                        return `${id}|${text}|${media}`;
+                        return `${id}|${text}|${media}|${mediaStructure}`;
                     });
                 }"""))
             except Exception:
                 return ()
-
-        def has_new_media_message(before, after):
-            previous_media_rows = {row for row in before if row.endswith("|1")}
-            return any(
-                row.endswith("|1") and row not in previous_media_rows
-                for row in after
-            )
 
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
@@ -7869,6 +7869,48 @@ def send_message_to_max(
                             break
                     except Exception:
                         continue
+                if send_button is None:
+                    # MAX sometimes renders the send icon without any text or
+                    # accessible label. In that case use only an enabled control
+                    # on the composer row, to its right, outside attachment and
+                    # recording controls. The rightmost eligible control is the
+                    # send action in the MAX composer layout.
+                    fallback_indices = page.evaluate("""() => {
+                        const composer = document.querySelector('[data-max-parser-send-composer="true"]');
+                        if (!composer) return [];
+                        const c = composer.getBoundingClientRect();
+                        const shell = composer.closest('form') || composer.parentElement?.parentElement;
+                        const visible = el => {
+                            const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                                s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
+                                !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                        };
+                        return [...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+                            .map((el, index) => {
+                                if (!visible(el) || el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i]')) return null;
+                                const r = el.getBoundingClientRect();
+                                const label = [el.innerText,el.getAttribute('aria-label'),el.title,
+                                    el.getAttribute('data-testid'),el.className,el.type]
+                                    .filter(Boolean).join(' ').toLowerCase();
+                                if (el.hasAttribute('aria-haspopup') ||
+                                    /(attach|file|media|photo|image|upload|emoji|sticker|gif|voice|audio|microphone|record|call|camera|прикреп|влож|файл|медиа|фото|смайл|стикер|голос|запис|звон|камера)/i.test(label)) return null;
+                                const verticalDistance = Math.abs((r.top+r.height/2)-(c.top+c.height/2));
+                                if (verticalDistance > 100 || r.top < window.innerHeight*0.55 ||
+                                    r.left+r.width/2 < c.left+c.width*0.45) return null;
+                                const inShell = Boolean(shell && shell.contains(el));
+                                const namedSend = /(отправ|send|submit)/i.test(label);
+                                return {index, score:(namedSend?10000:0)+(inShell?1000:0)+r.left};
+                            }).filter(Boolean).sort((a,b)=>b.score-a.score).map(x=>x.index);
+                    }""")
+                    for index in fallback_indices:
+                        candidate = send_controls.nth(int(index))
+                        try:
+                            if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
+                                send_button = candidate
+                                break
+                        except Exception:
+                            continue
             else:
                 send_buttons = page.get_by_role("button", name=re.compile(r"отправить|send", re.I))
                 for index in reversed(range(send_buttons.count())):
@@ -7890,7 +7932,6 @@ def send_message_to_max(
         before_tail = chat_tail_snapshot() if upload_payload else ()
         if on_before_send:
             on_before_send(normalized_media_hashes)
-        enter_media_fallback = bool(upload_payload and send_button is None)
         if send_button is not None:
             send_button.click(timeout=2500)
         else:
@@ -7913,11 +7954,7 @@ def send_message_to_max(
                     send_confirmed = True
                     break
                 current_tail = chat_tail_snapshot()
-                if enter_media_fallback:
-                    if has_new_media_message(before_tail, current_tail):
-                        send_confirmed = True
-                        break
-                elif current_tail != before_tail:
+                if current_tail != before_tail:
                     send_confirmed = True
                     break
             page.wait_for_timeout(250)
