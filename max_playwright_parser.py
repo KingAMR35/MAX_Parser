@@ -7536,6 +7536,103 @@ def _normalize_max_photo_upload(item: dict, chat_id: int) -> dict:
     return item
 
 
+def _select_max_composer_upload(page, upload_payload, expected_count: int) -> str:
+    """Attach files through MAX's visible composer control or its own wrapper."""
+    upload_button = page.get_by_role(
+        "button", name=re.compile(r"upload file|загрузить файл", re.I)
+    )
+    upload_button_count = upload_button.count()
+    for index in range(min(upload_button_count, 3)):
+        try:
+            candidate = upload_button.nth(index)
+            if not candidate.is_visible(timeout=300) or not candidate.is_enabled(timeout=300):
+                continue
+            with page.expect_file_chooser(timeout=5000) as chooser_info:
+                candidate.click(timeout=2500)
+            chooser_info.value.set_files(upload_payload, timeout=8000)
+            return f"composer-upload-button:{index}"
+        except Exception:
+            continue
+
+    # Some MAX builds expose only an icon/title instead of an accessible name.
+    if not upload_button_count:
+        button_order = page.evaluate("""() => {
+            const visible = el => {
+                const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+                return r.width>0&&r.height>0&&s.display!=='none'&&
+                    s.visibility!=='hidden'&&Number(s.opacity||1)>0;
+            };
+            const composer=document.querySelector('[data-max-parser-send-composer="true"]');
+            if(!composer)return [];
+            const cr=composer.getBoundingClientRect();
+            return [...document.querySelectorAll('button,[role="button"],[aria-label],[title]')]
+                .map((el,index)=>{
+                    if(!visible(el))return null;
+                    const r=el.getBoundingClientRect();
+                    const label=[el.innerText,el.getAttribute('aria-label'),el.title,
+                        el.getAttribute('data-testid'),el.className].filter(Boolean).join(' ').toLowerCase();
+                    if(!/(attach|file|media|photo|image|upload|прикреп|влож|файл|медиа|фото|изображ|скрепк)/i.test(label))return null;
+                    if(r.top<window.innerHeight*.45||Math.abs(r.top-cr.top)>180)return null;
+                    return {index,score:100-Math.min(Math.abs((r.left+r.width/2)-cr.left),100)};
+                }).filter(Boolean).sort((a,b)=>b.score-a.score).slice(0,4).map(x=>x.index);
+        }""")
+        controls = page.locator('button,[role="button"],[aria-label],[title]')
+        for index in button_order:
+            try:
+                with page.expect_file_chooser(timeout=2500) as chooser_info:
+                    controls.nth(int(index)).click(timeout=1500)
+                chooser_info.value.set_files(upload_payload, timeout=8000)
+                return f"composer-control:{int(index)}"
+            except Exception:
+                continue
+
+    file_order = page.evaluate("""() => {
+        const inputs=[...document.querySelectorAll('input[type="file"]')];
+        const composer=document.querySelector('[data-max-parser-send-composer="true"]');
+        if(!composer)return inputs.map((_,index)=>index);
+        const cr=composer.getBoundingClientRect();
+        return inputs.map((el,index)=>{
+            const r=el.getBoundingClientRect();
+            const accept=(el.getAttribute('accept')||'').toLowerCase();
+            const trigger=el.closest('.btn,[role="button"],button,label')||el.parentElement;
+            const meta=[el.getAttribute('aria-label'),el.title,el.className,
+                el.getAttribute('data-testid'),trigger?.innerText,trigger?.getAttribute('aria-label'),
+                trigger?.title,trigger?.className].filter(Boolean).join(' ').toLowerCase();
+            let score=0;
+            if(/image|video|audio|application|\\*/.test(accept))score+=35;
+            if(/attach|file|media|photo|upload|влож|файл|медиа|фото/i.test(meta))score+=45;
+            if(/upload file|загрузить файл|прикрепить файл/i.test(meta))score+=80;
+            if(r.top>window.innerHeight*.45)score+=12;
+            if(Math.abs(r.top-cr.top)<220)score+=20;
+            const parent=el.closest('form,[class*="composer" i],[class*="message" i]');
+            if(parent&&parent.contains(composer))score+=60;
+            return {index,score};
+        }).sort((a,b)=>b.score-a.score).slice(0,12).map(x=>x.index);
+    }""")
+    file_inputs = page.locator('input[type="file"]')
+    for index in file_order:
+        try:
+            candidate = file_inputs.nth(int(index))
+            trigger = candidate.locator("xpath=..")
+            try:
+                with page.expect_file_chooser(timeout=1600) as chooser_info:
+                    trigger.click(timeout=1000, force=True)
+                chooser_info.value.set_files(upload_payload, timeout=8000)
+                return f"chooser-input-parent:{int(index)}"
+            except Exception:
+                # Keep the wrapper's UI state, then dispatch Playwright's normal
+                # input/change events on this associated composer input.
+                candidate.set_input_files(upload_payload, timeout=8000)
+                received_count = candidate.evaluate(
+                    "el => el.files ? el.files.length : 0", timeout=1000
+                )
+                if int(received_count or 0) == expected_count:
+                    return f"wrapper-input-change:{int(index)}"
+        except Exception:
+            continue
+    raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
+
+
 def send_message_to_max(
     group_url: str,
     text: str,
@@ -7805,132 +7902,9 @@ def send_message_to_max(
 
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
-            uploaded = False
-
-            # Prefer the actual attachment control beside MAX's message composer.
-            # This avoids sending a file to an unrelated hidden input (for example,
-            # profile or chat search uploads) and then silently sending text only.
-            button_order = page.evaluate("""() => {
-                const visible = el => {
-                    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-                    return r.width > 0 && r.height > 0 && s.display !== 'none' &&
-                        s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
-                };
-                const composer = document.querySelector('[data-max-parser-send-composer="true"]');
-                if (!composer) return [];
-                const cr = composer.getBoundingClientRect();
-                const controls = [...document.querySelectorAll('button,[role="button"],[aria-label],[title]')];
-                return controls.map((el, index) => {
-                    if (!visible(el)) return null;
-                    const r = el.getBoundingClientRect();
-                    const label = [el.innerText, el.getAttribute('aria-label'), el.title,
-                        el.getAttribute('data-testid'), el.className].filter(Boolean).join(' ').toLowerCase();
-                    if (!/(attach|file|media|photo|image|upload|прикреп|влож|файл|медиа|фото|изображ|скрепк)/i.test(label)) {
-                        return null;
-                    }
-                    if (r.top < window.innerHeight * 0.45 || Math.abs(r.top - cr.top) > 180) return null;
-                    const distance = Math.abs((r.left + r.width / 2) - cr.left);
-                    return {index, score: 100 - Math.min(distance, 100) + (r.top > window.innerHeight * 0.68 ? 15 : 0)};
-                }).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 8).map(x => x.index);
-            }""")
-            attach_controls = page.locator('button,[role="button"],[aria-label],[title]')
-            for index in button_order:
-                try:
-                    candidate = attach_controls.nth(int(index))
-                    with page.expect_file_chooser(timeout=5000) as chooser_info:
-                        candidate.click(timeout=2500)
-                    chooser_info.value.set_files(upload_payload, timeout=8000)
-                    uploaded = True
-                    upload_route = f"chooser-control:{int(index)}"
-                    break
-                except Exception:
-                    continue
-
-            if not uploaded:
-                file_order = page.evaluate("""() => {
-                    const inputs = [...document.querySelectorAll('input[type="file"]')];
-                    const composer = document.querySelector('[data-max-parser-send-composer="true"]');
-                    if (!composer) return inputs.map((_, index) => index);
-                    const cr = composer.getBoundingClientRect();
-                    return inputs.map((el, index) => {
-                        const r = el.getBoundingClientRect();
-                        const accept = (el.getAttribute('accept') || '').toLowerCase();
-                        const trigger = el.closest('.btn,[role="button"],button,label') || el.parentElement;
-                        const meta = [el.getAttribute('aria-label'), el.title, el.className,
-                            el.getAttribute('data-testid'), trigger?.innerText,
-                            trigger?.getAttribute('aria-label'), trigger?.title,
-                            trigger?.className].filter(Boolean).join(' ').toLowerCase();
-                        let score = 0;
-                        if (/image|video|audio|application|\\*/.test(accept)) score += 35;
-                        if (/attach|file|media|photo|upload|влож|файл|медиа|фото/i.test(meta)) score += 45;
-                        if (/upload file|загрузить файл|прикрепить файл/i.test(meta)) score += 80;
-                        if (r.top > window.innerHeight * 0.45) score += 12;
-                        if (Math.abs(r.top - cr.top) < 220) score += 20;
-                        const parent = el.closest('form,[class*="composer" i],[class*="message" i]');
-                        if (parent && parent.contains(composer)) score += 60;
-                        return {index, score, trigger: trigger ? trigger.tagName : ''};
-                    }).sort((a, b) => b.score - a.score).slice(0, 12).map(x => x.index);
-                }""")
-                file_inputs = page.locator('input[type="file"]')
-                for index in file_order:
-                    try:
-                        candidate = file_inputs.nth(int(index))
-                        # MAX's current composer renders the upload input inside
-                        # a small .btn wrapper. Activating that wrapper first is
-                        # necessary for its Svelte upload handler to select the
-                        # right composer state; setting files on the hidden input
-                        # alone can leave files.length=1 without a visible preview.
-                        try:
-                            # Activate MAX's upload wrapper before touching the
-                            # hidden file input. In the current Svelte composer,
-                            # input.click() alone selects a file but does not
-                            # register it as a composer attachment.
-                            trigger = candidate.locator("xpath=..")
-                            with page.expect_file_chooser(timeout=1600) as chooser_info:
-                                trigger.click(timeout=1000, force=True)
-                            chooser_info.value.set_files(upload_payload, timeout=8000)
-                            uploaded = True
-                            upload_route = f"chooser-input-parent:{int(index)}"
-                            break
-                        except Exception:
-                            pass
-                        try:
-                            # Some MAX builds bind the picker directly to the
-                            # input, so use this only after the wrapper path.
-                            with page.expect_file_chooser(timeout=1800) as chooser_info:
-                                candidate.evaluate("el => el.click()", timeout=800)
-                            chooser_info.value.set_files(upload_payload, timeout=8000)
-                            uploaded = True
-                            upload_route = f"chooser-input:{int(index)}"
-                            break
-                        except Exception:
-                            pass
-                        candidate.set_input_files(upload_payload, timeout=8000)
-                        received_count = candidate.evaluate(
-                            "el => el.files ? el.files.length : 0", timeout=1000
-                        )
-                        if int(received_count or 0) == expected_count:
-                            uploaded = True
-                            try:
-                                upload_route = candidate.evaluate("""el => {
-                                    const p=el.parentElement;
-                                    const c=document.querySelector('[data-max-parser-send-composer="true"]');
-                                    const shell=el.closest('form,[class*="composer" i],[class*="message" i]');
-                                    return [
-                                        'file-input',el.getAttribute('accept')||'',
-                                        String(el.className||'').slice(0,70),
-                                        el.getAttribute('data-testid')||'',
-                                        p?.tagName||'',String(p?.className||'').slice(0,35),
-                                        Boolean(shell&&c&&shell.contains(c))
-                                    ].join(':');
-                                }""", timeout=500)
-                            except Exception:
-                                upload_route = "file-input:metadata-unavailable"
-                            break
-                    except Exception:
-                        continue
-            if not uploaded:
-                raise RuntimeError("MAX_UPLOAD_CONTROL_NOT_FOUND")
+            upload_route = _select_max_composer_upload(
+                page, upload_payload, expected_count
+            )
             # Let MAX finish rendering the selected file(s) in the composer.
             page.wait_for_timeout(350)
             upload_ready = False
