@@ -82,6 +82,12 @@ def init_db():
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type TEXT")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type_verified BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS max_source_type_manual BOOLEAN NOT NULL DEFAULT FALSE")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS setup_pending BOOLEAN NOT NULL DEFAULT FALSE")
+        conn.execute("""
+            UPDATE chats SET setup_pending = TRUE
+            WHERE destination_type = 'private' AND is_active = FALSE
+              AND max_url IS NULL AND message_count = 0
+        """)
         conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS connection_generation TEXT")
         conn.execute("""
             UPDATE chats SET destination_chat_id = chat_id
@@ -1287,7 +1293,11 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
                 return False
             if not row or row["owner_id"] is None:
                 count = conn.execute(
-                    "SELECT COUNT(*) AS count FROM chats WHERE owner_id = %s",
+                    """SELECT COUNT(*) AS count FROM chats
+                    WHERE owner_id = %s
+                      AND NOT (destination_type = 'private' AND is_active = FALSE
+                               AND (setup_pending = TRUE
+                                    OR (max_url IS NULL AND message_count = 0)))""",
                     (int(owner_id),),
                 ).fetchone()["count"]
                 has_multi = conn.execute("""
@@ -1305,7 +1315,8 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
                 SET title = %s, owner_id = %s, account_mode = %s, max_url = NULL,
                     phone = NULL, is_active = FALSE, destination_chat_id = %s,
                     destination_type = 'group', max_source_type = NULL,
-                    max_source_type_verified = FALSE, max_send_button_message_id = NULL,
+                    max_source_type_verified = FALSE, max_source_type_manual = FALSE,
+                    max_send_button_message_id = NULL, setup_pending = FALSE,
                     connection_generation = %s
                 WHERE chat_id = %s
             """, (title, owner_id, account_mode, chat_id, uuid.uuid4().hex, chat_id))
@@ -1313,13 +1324,37 @@ def claim_chat(chat_id: int, title: str, owner_id: int, account_mode: str) -> bo
 
 
 def claim_private_chat(owner_id: int, title: str, account_mode: str) -> int:
-    """Create a MAX source whose Telegram destination is the owner's private chat."""
+    """Claim/reuse an unfinished private-destination setup for this user."""
     owner_id = int(owner_id)
     with get_connection() as conn:
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (owner_id,))
+            pending = conn.execute("""
+                SELECT chat_id FROM chats
+                WHERE owner_id = %s
+                  AND destination_type = 'private' AND is_active = FALSE
+                  AND (setup_pending = TRUE OR (max_url IS NULL AND message_count = 0))
+                ORDER BY added_at DESC
+                LIMIT 1 FOR UPDATE
+            """, (owner_id,)).fetchone()
+            if pending:
+                source_chat_id = int(pending["chat_id"])
+                conn.execute("""
+                    UPDATE chats SET title = %s, account_mode = %s,
+                        phone = NULL, max_url = NULL,
+                        is_active = FALSE, message_count = 0,
+                        destination_chat_id = %s, destination_type = 'private',
+                        max_source_type = NULL, max_source_type_verified = FALSE,
+                        max_source_type_manual = FALSE, max_send_button_message_id = NULL,
+                        connection_generation = %s, setup_pending = TRUE
+                    WHERE chat_id = %s
+                """, (title, str(account_mode), owner_id, uuid.uuid4().hex, source_chat_id))
+                return source_chat_id
             count = conn.execute(
-                "SELECT COUNT(*) AS count FROM chats WHERE owner_id = %s",
+                """SELECT COUNT(*) AS count FROM chats
+                WHERE owner_id = %s
+                  AND NOT (destination_type = 'private' AND is_active = FALSE
+                           AND (setup_pending = TRUE OR (max_url IS NULL AND message_count = 0)))""",
                 (owner_id,),
             ).fetchone()["count"]
             has_multi = conn.execute("""
@@ -1339,8 +1374,9 @@ def claim_private_chat(owner_id: int, title: str, account_mode: str) -> int:
             conn.execute("""
                 INSERT INTO chats
                     (chat_id, title, owner_id, account_mode, is_active, message_count,
-                     destination_chat_id, destination_type, connection_generation)
-                VALUES (%s, %s, %s, %s, FALSE, 0, %s, 'private', %s)
+                    destination_chat_id, destination_type, connection_generation,
+                    setup_pending)
+                VALUES (%s, %s, %s, %s, FALSE, 0, %s, 'private', %s, TRUE)
             """, (source_chat_id, title, owner_id, account_mode, owner_id, uuid.uuid4().hex))
             return source_chat_id
 
@@ -1563,7 +1599,11 @@ def get_admin_group_reply_link_token(token: str):
 
 def toggle_chat(chat_id: int, active: bool):
     with get_connection() as conn:
-        conn.execute("UPDATE chats SET is_active = %s WHERE chat_id = %s", (bool(active), chat_id))
+        conn.execute("""
+            UPDATE chats SET is_active = %s,
+                setup_pending = CASE WHEN %s THEN FALSE ELSE setup_pending END
+            WHERE chat_id = %s
+        """, (bool(active), bool(active), chat_id))
 
 
 def delete_chat(chat_id: int):

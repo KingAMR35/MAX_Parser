@@ -1627,6 +1627,11 @@ def _process_posts(
     cycle_ids = set()
     for post in posts:
         source_id = str(post.get("source_id") or "").strip()
+        outbound_source_echo = bool(
+            source_id
+            and not post.get("source_id_is_index")
+            and _consume_max_outbound_echo(chat_id, f"source:{source_id}")
+        )
         outbound_fingerprint = _max_outbound_fingerprint(post.get("text"))
         outbound_media_echo = False
         for media_hash in _post_media_hashes(post):
@@ -1636,7 +1641,7 @@ def _process_posts(
             outbound_fingerprint
             and _consume_max_outbound_echo(chat_id, outbound_fingerprint)
         )
-        if outbound_text_echo or outbound_media_echo:
+        if outbound_source_echo or outbound_text_echo or outbound_media_echo:
             _commit_successful_post(chat_id, post)
             _cleanup_post_media(post)
             skipped_count += 1
@@ -4313,7 +4318,22 @@ def _start_customer_setup_prompt(user_id, account_mode, chat_id, message_id=None
     if account_mode not in {"self", "project"}:
         return
     chat_limit = get_customer_chat_limit(user_id)
-    if len(get_user_chats(user_id)) >= chat_limit:
+    customer_chats = get_user_chats(user_id)
+    charged_chat_count = sum(
+        1 for chat in customer_chats
+        if not (
+            chat.get("destination_type") == "private"
+            and not chat.get("is_active")
+            and (
+                chat.get("setup_pending")
+                or (
+                    not chat.get("max_url")
+                    and int(chat.get("message_count") or 0) == 0
+                )
+            )
+        )
+    )
+    if charged_chat_count >= chat_limit:
         bot.send_message(chat_id, _chat_limit_notice(chat_limit), **NO_PREVIEW)
         return
     if _user_needs_subscription(user_id, account_mode):
@@ -6103,6 +6123,9 @@ def _max_source_is_private(chat):
         chat
         and chat.get("max_source_type") == "private"
         and chat.get("max_source_type_verified")
+        # Only an explicit private-chat choice is authoritative. Legacy rows
+        # were classified automatically and some groups were mislabeled.
+        and chat.get("max_source_type_manual")
     )
 
 
@@ -6331,9 +6354,10 @@ def _send_max_payload_with_sender(
     chat_id,
     session_path,
     on_before_send=None,
+    on_send_confirmed=None,
     source_type_callback=None,
 ):
-    """Send sender attribution separately from media, inline with text-only posts."""
+    """Send sender attribution as text or as the first line of a media caption."""
     body = str(body or "").strip()
     sender_name = str(sender_name or "").strip()
     header = f"{sender_name} пишет:" if sender_name else ""
@@ -6342,22 +6366,14 @@ def _send_max_payload_with_sender(
         "chat_id": int(chat_id),
         "session_path": session_path,
         "on_before_send": on_before_send,
+        "on_send_confirmed": on_send_confirmed,
         "source_type_callback": source_type_callback,
     }
-    if media and header:
-        send_message_to_max(text=header, media=None, bold_first_line=True, **common)
-        send_message_to_max(
-            text=body,
-            media=media,
-            bold_first_line=False,
-            **common,
-        )
-        return
     text = f"{header}\n\n{body}".strip() if header else body
     send_message_to_max(
         text=text,
         media=media,
-        bold_first_line=bool(header and not media),
+        bold_first_line=bool(header),
         **common,
     )
 
@@ -6416,7 +6432,7 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             if len(media) == 1:
                 media = media[0]
         source_lock = max_send_source_locks.setdefault(int(source_chat_id), threading.Lock())
-        header_text = f"{name} пишет" if name else ""
+        header_text = f"{name} пишет:" if name else ""
         message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         fingerprints = {
             value for value in (
@@ -6442,6 +6458,16 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                     for fingerprint in fingerprints:
                         _remember_max_outbound_echo(int(candidate["chat_id"]), fingerprint)
 
+        def remember_outbound_source(source_id):
+            source_id = str(source_id or "").strip()
+            if not source_id:
+                return
+            for candidate in get_all_chats():
+                if candidate.get("max_url") == chat.get("max_url"):
+                    _remember_max_outbound_echo(
+                        int(candidate["chat_id"]), f"source:{source_id}"
+                    )
+
         with source_lock:
             _send_max_payload_with_sender(
                 group_url=chat["max_url"],
@@ -6451,6 +6477,7 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 chat_id=int(source_chat_id),
                 session_path=_session_path_for_chat(chat),
                 on_before_send=remember_outbound_echo,
+                on_send_confirmed=remember_outbound_source,
                 source_type_callback=lambda detected: _update_detected_source_type(
                     source_chat_id, detected
                 ),
@@ -6998,7 +7025,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
         body = str(flow.get("body") or "").strip()
         name = str(flow.get("sender_name") or "").strip()
-        header_text = f"{name} пишет" if name else ""
+        header_text = f"{name} пишет:" if name else ""
         message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         media = flow.get("media") or None
         if media:
@@ -7042,6 +7069,16 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                     for fingerprint in fingerprints:
                         _remember_max_outbound_echo(int(candidate["chat_id"]), fingerprint)
 
+        def remember_outbound_source(source_id):
+            source_id = str(source_id or "").strip()
+            if not source_id:
+                return
+            for candidate in get_all_chats():
+                if candidate.get("max_url") == chat.get("max_url"):
+                    _remember_max_outbound_echo(
+                        int(candidate["chat_id"]), f"source:{source_id}"
+                    )
+
         source_lock = max_send_source_locks.setdefault(source_chat_id, threading.Lock())
         with source_lock:
             _send_max_payload_with_sender(
@@ -7052,6 +7089,7 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 chat_id=source_chat_id,
                 session_path=_session_path_for_chat(chat),
                 on_before_send=remember_outbound_echo,
+                on_send_confirmed=remember_outbound_source,
                 source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
             )
         result_text = "✅ Сообщение отправлено в MAX."
@@ -7975,6 +8013,27 @@ def _begin_customer_private_setup(owner_id, account_mode, callback_message=None)
             **NO_PREVIEW,
         )
         return False
+    try:
+        for old_chat in get_user_chats(owner_id):
+            old_id = int(old_chat.get("chat_id") or 0)
+            if (
+                old_id != int(source_chat_id)
+                and old_chat.get("destination_type") == "private"
+                and not old_chat.get("is_active")
+                and (
+                    old_chat.get("setup_pending")
+                    or (
+                        not old_chat.get("max_url")
+                        and int(old_chat.get("message_count") or 0) == 0
+                    )
+                )
+            ):
+                _delete_chat_everywhere(old_id)
+    except Exception as error:
+        debug_logger.warning(
+            "PRIVATE_SETUP_DUPLICATE_CLEANUP_FAILED user_id=%s error_type=%s",
+            owner_id, type(error).__name__,
+        )
     pending_setup_modes.pop(owner_id, None)
     customer_setup_state[owner_id] = {
         "chat_id": source_chat_id,

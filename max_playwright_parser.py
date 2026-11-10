@@ -7536,6 +7536,7 @@ def send_message_to_max(
     chat_id: int,
     session_path: str = None,
     on_before_send=None,
+    on_send_confirmed=None,
     media: dict = None,
     source_type_callback=None,
     bold_first_line: bool = True,
@@ -7696,6 +7697,48 @@ def send_message_to_max(
             except Exception:
                 return ()
 
+        def chat_tail_source_ids():
+            """Return stable MAX message IDs currently present in the chat DOM."""
+            try:
+                values = page.evaluate("""() => {
+                    let rows=[...document.querySelectorAll('.item')];
+                    if (!rows.length) rows=[...document.querySelectorAll(
+                        '[data-message-id],[data-mid],[data-id]'
+                    )];
+                    return rows.map(row=>row.getAttribute('data-message-id')||
+                        row.getAttribute('data-mid')||row.getAttribute('data-id')||'')
+                        .filter(Boolean);
+                }""")
+                return {str(value) for value in values or []}
+            except Exception:
+                return set()
+
+        def chat_tail_source_ids_matching_text(expected_text):
+            expected = re.sub(r"\s+", " ", str(expected_text or "")).strip().casefold()
+            if len(expected) < 3:
+                return set()
+            needle = expected[:80]
+            try:
+                rows = page.evaluate("""() => {
+                    let items=[...document.querySelectorAll('.item')];
+                    if (!items.length) items=[...document.querySelectorAll(
+                        '[data-message-id],[data-mid],[data-id]'
+                    )];
+                    return items.map(row=>({
+                        id:row.getAttribute('data-message-id')||row.getAttribute('data-mid')||
+                            row.getAttribute('data-id')||'',
+                        text:String(row.innerText||row.textContent||'')
+                    })).filter(row=>row.id);
+                }""")
+            except Exception:
+                return set()
+            matches = set()
+            for row in rows or []:
+                row_text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip().casefold()
+                if needle in row_text:
+                    matches.add(str(row.get("id")))
+            return matches
+
         def send_debug_state():
             try:
                 return page.evaluate("""() => {
@@ -7724,7 +7767,9 @@ def send_message_to_max(
                         accept:el.getAttribute('accept')||'',cls:String(el.className||'').slice(0,16),
                         parent:String(el.parentElement?.className||'').slice(0,18),
                         related:Boolean(shell&&shell.contains(el)),
-                        files:el.files?.length||0
+                        files:el.files?.length||0,
+                        fileName:el.files?.[0]?.name||'',fileSize:el.files?.[0]?.size||0,
+                        fileType:el.files?.[0]?.type||''
                     }));
                     const rows=[...document.querySelectorAll('.item')];
                     const globalPreview=[...document.querySelectorAll(
@@ -7829,6 +7874,18 @@ def send_message_to_max(
                         # necessary for its Svelte upload handler to select the
                         # right composer state; setting files on the hidden input
                         # alone can leave files.length=1 without a visible preview.
+                        try:
+                            # Some Svelte versions attach the picker listener to
+                            # the input itself, so exercise its real click path
+                            # before assigning the payload through Playwright.
+                            with page.expect_file_chooser(timeout=1800) as chooser_info:
+                                candidate.evaluate("el => el.click()", timeout=800)
+                            chooser_info.value.set_files(upload_payload, timeout=8000)
+                            uploaded = True
+                            upload_route = f"chooser-input:{int(index)}"
+                            break
+                        except Exception:
+                            pass
                         try:
                             trigger = candidate.locator("xpath=..")
                             with page.expect_file_chooser(timeout=1600) as chooser_info:
@@ -8069,7 +8126,8 @@ def send_message_to_max(
             # selected attachment. Wait before deciding that no send control
             # became available.
             page.wait_for_timeout(250)
-        before_tail = chat_tail_snapshot() if upload_payload else ()
+        before_tail = chat_tail_snapshot()
+        before_source_ids = chat_tail_source_ids()
         send_mode = "button" if send_button is not None else "enter"
         send_control_info = ""
         if upload_payload and send_button is None:
@@ -8180,6 +8238,18 @@ def send_message_to_max(
             upload_error = media_upload_error()
             if upload_error:
                 raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
+        if on_send_confirmed:
+            try:
+                new_source_ids = chat_tail_source_ids() - before_source_ids
+                matching_source_ids = (
+                    chat_tail_source_ids_matching_text(text) & new_source_ids
+                )
+                if len(matching_source_ids) == 1:
+                    on_send_confirmed(next(iter(matching_source_ids)))
+            except Exception:
+                # Content and media fingerprints remain the fallback if MAX
+                # does not expose a stable ID for the newly sent message.
+                pass
         return
     except Exception as error:
         if isinstance(error, RuntimeError):
