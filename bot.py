@@ -6679,10 +6679,10 @@ def _public_max_input(message):
             label = "Анимация"
             kind = "video"
         elif content_type == "video_note":
-            # MAX Web has no round video-note composer. Use its generic file
-            # upload route so the original MP4 is delivered as an attachment.
-            filename, mime_type, label = "video.mp4", "application/octet-stream", "Видеосообщение"
-            kind = "document"
+            # MAX Web has no Telegram-style round video-note composer. Upload
+            # the original square clip through MAX's regular video picker.
+            filename, mime_type, label = "video.mp4", "video/mp4", "Видеосообщение"
+            kind = "video"
         else:
             filename = str(getattr(item, "file_name", None) or "video.mp4")
             mime_type = str(getattr(item, "mime_type", None) or "video/mp4")
