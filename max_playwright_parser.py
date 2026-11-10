@@ -7850,11 +7850,9 @@ def _pin_live_max_send_control(page, upload_payload=False):
     return None, str(selected)
 
 
-def _new_max_upload_rows(rows, before_ids, before_signatures, upload_names,
+def _new_max_upload_rows(rows, before_ids, before_signatures,
                          expected_kinds=(), require_outgoing=False):
     """Return newly rendered attachment rows, optionally requiring evidence they are ours."""
-    normalized_names = [os.path.basename(str(name or "")).casefold() for name in upload_names]
-    normalized_names = [name for name in normalized_names if name]
     expected_kinds = {str(kind or "").casefold() for kind in expected_kinds if kind}
     candidates = []
     for row in rows or []:
@@ -7862,14 +7860,12 @@ def _new_max_upload_rows(rows, before_ids, before_signatures, upload_names,
             continue
         row_id = str(row.get("id") or "")
         signature = str(row.get("signature") or "")
-        text = str(row.get("text") or "")
-        filename = str(row.get("filename") or "")
-        named_upload = any(name in (text + " " + filename).casefold() for name in normalized_names)
-        if not (row.get("media") or named_upload):
+        if not row.get("media"):
             continue
-        is_new = bool(
-            (row_id and row_id not in before_ids)
-            or (signature and signature not in before_signatures)
+        # A stable ID takes precedence. A changed DOM signature must not make
+        # an old message look new when MAX updates its time or attachment markup.
+        is_new = row_id not in before_ids if row_id else bool(
+            signature and signature not in before_signatures
         )
         if not is_new:
             continue
@@ -7877,8 +7873,7 @@ def _new_max_upload_rows(rows, before_ids, before_signatures, upload_names,
             row.get("outgoing")
             and (not expected_kinds or str(row.get("media_kind") or "").casefold() in expected_kinds)
         )
-        named_outgoing_upload = bool(row.get("outgoing") and named_upload)
-        if require_outgoing and not (matching_outgoing_media or named_outgoing_upload):
+        if require_outgoing and not matching_outgoing_media:
             continue
         candidates.append(row)
     return candidates
@@ -7905,6 +7900,7 @@ def send_message_to_max(
     upload_payload = None
     has_photo_upload = False
     normalized_media_hashes = []
+    upload_media_kinds = []
     upload_route = ""
     if media:
         media_items = media if isinstance(media, (list, tuple)) else [media]
@@ -7925,6 +7921,7 @@ def send_message_to_max(
                 "mimeType": str(item.get("mime_type") or "application/octet-stream")[:120],
                 "buffer": bytes(raw_data),
             })
+            upload_media_kinds.append(str(item.get("kind") or "").casefold())
             normalized_media_hashes.append(get_media_hash(data=raw_data))
         if len(upload_payload) == 1:
             upload_payload = upload_payload[0]
@@ -8079,9 +8076,15 @@ def send_message_to_max(
                         '[class*="media"],[class*="voice"],[class*="audio"],[class*="video"],'+
                         '[data-testid*="file"],[data-testid*="document"],[data-testid*="audio"],'+
                         '[data-testid*="video"],[data-testid*="media"]';
-                    return items.map((row, index) => {
+                    const composer=document.querySelector('[data-max-parser-send-composer="true"]');
+                    const composerRect=composer?composer.getBoundingClientRect():null;
+                    const paneLeft=composerRect?.left||0;
+                    const paneWidth=composerRect?.width||0;
+                    return items.map(row => {
+                        // data-index is only a position in the rendered list,
+                        // not a stable message ID; never use it to confirm sends.
                         const id = row.getAttribute('data-message-id') || row.getAttribute('data-mid') ||
-                            row.getAttribute('data-id') || row.getAttribute('data-index') || '';
+                            row.getAttribute('data-id') || '';
                         const text = String(row.innerText || row.textContent || '').trim();
                         const timeNode = row.querySelector(
                             '.bubbleContent .meta .text,.bubbleContent .meta time,.meta .text,.meta time,time[datetime]'
@@ -8101,8 +8104,15 @@ def send_message_to_max(
                                 .map(el => el.className)].filter(Boolean).join(' ');
                         const bubble = row.querySelector('[class*="bubble"],[class*="message-content"],[data-testid*="message"]') || row;
                         const rect = bubble.getBoundingClientRect();
+                        const centerInChatPane = paneWidth > 0
+                            ? (rect.left + rect.width / 2 - paneLeft) / paneWidth
+                            : -1;
+                        const leftInChatPane = paneWidth > 0
+                            ? (rect.left - paneLeft) / paneWidth
+                            : -1;
                         const outgoing = /(outgoing|sent|mine|own|is-out|my-message|message--out)/i.test(marker) ||
-                            (rect.width > 0 && rect.width < window.innerWidth * 0.78 && rect.left + rect.width / 2 > window.innerWidth * 0.58);
+                            (rect.width > 0 && paneWidth > 0 && rect.width < paneWidth * 0.9 &&
+                                centerInChatPane > 0.56 && leftInChatPane > 0.12);
                         let mediaKind = '';
                         if (nodes.some(el => el.tagName === 'VIDEO' || /video|videonote|круж/i.test(String(el.className || '')))) mediaKind = 'video';
                         else if (nodes.some(el => el.tagName === 'AUDIO' || /voice|audio|голос/i.test(String(el.className || '')))) mediaKind = 'audio';
@@ -8140,6 +8150,30 @@ def send_message_to_max(
             except Exception:
                 return []
 
+        # Let MAX finish rendering its existing history before taking the
+        # baseline. Otherwise a delayed old outgoing video can look like the
+        # attachment we just selected and trigger a false success.
+        def source_row_baseline():
+            rows = chat_tail_source_rows()
+            ids = tuple(sorted(str(row.get("id") or "") for row in rows if row.get("id")))
+            signatures = tuple(sorted(
+                str(row.get("signature") or "") for row in rows if row.get("signature")
+            ))
+            return ids, signatures
+
+        previous_baseline = source_row_baseline()
+        stable_samples = 0
+        for _ in range(12):
+            page.wait_for_timeout(250)
+            current_baseline = source_row_baseline()
+            if current_baseline == previous_baseline:
+                stable_samples += 1
+                if stable_samples >= 3:
+                    break
+            else:
+                stable_samples = 0
+                previous_baseline = current_baseline
+
         before_tail = chat_tail_snapshot()
         before_source_ids = chat_tail_source_ids()
         before_row_signatures = {row["signature"] for row in chat_tail_source_rows() if row.get("signature")}
@@ -8147,24 +8181,90 @@ def send_message_to_max(
         def new_upload_media_rows(require_outgoing=False):
             rows = chat_tail_source_rows()
             payload_items = upload_payload if isinstance(upload_payload, (list, tuple)) else [upload_payload]
-            names = [str(item.get("name") or "") for item in payload_items if isinstance(item, dict)]
             expected_kinds = set()
-            for item in payload_items:
+            for item_index, item in enumerate(payload_items):
                 if not isinstance(item, dict):
                     continue
                 mime = str(item.get("mimeType") or "").lower()
-                filename = str(item.get("name") or "").lower()
-                expected_kinds.add(
-                    "image" if mime.startswith("image/") else
-                    "video" if mime.startswith("video/") else
-                    "audio" if mime.startswith("audio/") else "document"
+                declared_kind = (
+                    upload_media_kinds[item_index]
+                    if item_index < len(upload_media_kinds)
+                    else ""
                 )
-                if filename.endswith((".mp4", ".mov", ".webm", ".m4v")):
-                    expected_kinds.update({"video", "document"})
+                kind_aliases = {
+                    "photo": "image", "sticker": "image", "sticker_image": "image",
+                    "video_note": "video", "voice": "audio",
+                    "file": "document",
+                }
+                if declared_kind:
+                    expected_kinds.add(kind_aliases.get(declared_kind, declared_kind))
+                else:
+                    expected_kinds.add(
+                        "image" if mime.startswith("image/") else
+                        "video" if mime.startswith("video/") else
+                        "audio" if mime.startswith("audio/") else "document"
+                    )
             return _new_max_upload_rows(
-                rows, before_source_ids, before_row_signatures, names, expected_kinds,
+                rows, before_source_ids, before_row_signatures, expected_kinds,
                 require_outgoing=require_outgoing,
             )
+
+        def confirm_stable_outgoing_media_rows(initial_rows):
+            def row_key(row):
+                row_id = str(row.get("id") or "")
+                signature = str(row.get("signature") or "")
+                return f"id:{row_id}" if row_id else f"sig:{signature}"
+
+            initial_keys = {row_key(row) for row in initial_rows if row_key(row) not in {"id:", "sig:"}}
+            if not initial_keys:
+                raise RuntimeError("MAX_SEND_NOT_CONFIRMED: outgoing media has no stable identity")
+
+            previous_keys = None
+            stable_samples = 0
+            stable_rows = []
+            for _ in range(16):
+                page.wait_for_timeout(250)
+                upload_error = media_upload_error()
+                if upload_error:
+                    raise RuntimeError(
+                        "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
+                        else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
+                    )
+                current_rows = [
+                    row for row in new_upload_media_rows(require_outgoing=True)
+                    if row_key(row) in initial_keys
+                ]
+                current_keys = tuple(sorted(row_key(row) for row in current_rows))
+                if current_keys and current_keys == previous_keys:
+                    stable_samples += 1
+                    if stable_samples >= 7:
+                        return current_rows
+                else:
+                    stable_samples = 0
+                    previous_keys = current_keys
+                    stable_rows = current_rows
+
+            raise RuntimeError(
+                "MAX_SEND_NOT_CONFIRMED: outgoing media row did not remain stable "
+                f"(initial={len(initial_keys)}, current={len(stable_rows)})"
+            )
+
+        def new_outgoing_text_rows(expected_text):
+            expected = re.sub(r"\s+", " ", str(expected_text or "")).strip().casefold()
+            if not expected:
+                return []
+            needle = expected[:80]
+            result = []
+            for row in chat_tail_source_rows():
+                row_id = str(row.get("id") or "")
+                signature = str(row.get("signature") or "")
+                is_new = row_id not in before_source_ids if row_id else bool(
+                    signature and signature not in before_row_signatures
+                )
+                row_text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip().casefold()
+                if is_new and row.get("outgoing") and needle in row_text:
+                    result.append(row)
+            return result
 
         def chat_tail_source_ids_matching_text(expected_text):
             expected = re.sub(r"\s+", " ", str(expected_text or "")).strip().casefold()
@@ -8299,6 +8399,7 @@ def send_message_to_max(
 
         upload_auto_sent_rows = []
         outbound_echo_armed = False
+        media_auto_sent_confirmed = False
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
             upload_route = _select_max_composer_upload(
@@ -8357,13 +8458,8 @@ def send_message_to_max(
                             "MAX_OUTBOUND_ECHO_ARM_FAILED after_auto_upload error_type=%s",
                             type(error).__name__,
                         )
-                page.wait_for_timeout(1200)
-                upload_error = media_upload_error()
-                if upload_error:
-                    raise RuntimeError(
-                        "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
-                        else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
-                    )
+                upload_auto_sent_rows = confirm_stable_outgoing_media_rows(upload_auto_sent_rows)
+                media_auto_sent_confirmed = True
                 if on_send_confirmed:
                     for row in upload_auto_sent_rows:
                         if row.get("id") or row.get("media"):
@@ -8469,6 +8565,7 @@ def send_message_to_max(
             composer.press("Enter", timeout=2500)
 
         send_confirmed = False
+        send_confirmed_media_rows = []
         for _ in range(48):
             upload_error = media_upload_error()
             if upload_error:
@@ -8478,12 +8575,19 @@ def send_message_to_max(
             except Exception:
                 remaining = ""
             if not str(remaining or "").strip():
-                if not upload_payload and chat_tail_snapshot() != before_tail:
-                    send_confirmed = True
-                    break
-                if upload_payload and new_upload_media_rows(require_outgoing=True):
-                    send_confirmed = True
-                    break
+                if not upload_payload:
+                    if media_auto_sent_confirmed:
+                        if new_outgoing_text_rows(text):
+                            send_confirmed = True
+                            break
+                    elif chat_tail_snapshot() != before_tail:
+                        send_confirmed = True
+                        break
+                if upload_payload:
+                    send_confirmed_media_rows = new_upload_media_rows(require_outgoing=True)
+                    if send_confirmed_media_rows:
+                        send_confirmed = True
+                        break
             page.wait_for_timeout(250)
         if not send_confirmed:
             upload_error = media_upload_error()
@@ -8543,16 +8647,19 @@ def send_message_to_max(
         # MAX may clear the composer optimistically before reporting an upload
         # failure. Allow the asynchronous error toast to arrive before success.
         if upload_payload:
-            page.wait_for_timeout(1200)
-            upload_error = media_upload_error()
-            if upload_error:
-                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
+            send_confirmed_media_rows = confirm_stable_outgoing_media_rows(send_confirmed_media_rows)
         if on_send_confirmed:
             try:
                 new_rows = [
                     row for row in chat_tail_source_rows()
-                    if (row.get("id") and row["id"] not in before_source_ids)
-                    or (row.get("signature") and row["signature"] not in before_row_signatures)
+                    if (
+                        str(row.get("id") or "") not in before_source_ids
+                        if row.get("id")
+                        else bool(
+                            row.get("signature")
+                            and row["signature"] not in before_row_signatures
+                        )
+                    )
                 ]
                 expected = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
                 matching_rows = [
