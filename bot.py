@@ -1423,7 +1423,7 @@ def _send_post_impl(chat_id: int, post: dict, destination_chat_id=None) -> None:
     if caption_pending:
         _telegram_call(bot.send_message,destination_chat_id,msg_text,**NO_PREVIEW)
 
-def _send_post(chat_id: int, post: dict, destination_chat_id=None) -> bool:
+def _send_post(chat_id: int, post: dict, destination_chat_id=None) -> tuple[bool, int | None]:
     destination_chat_id = int(destination_chat_id or chat_id)
     post_id = str(post.get("source_id") or post.get("idx") or "?")
     context = {
@@ -1480,7 +1480,8 @@ def _send_post(chat_id: int, post: dict, destination_chat_id=None) -> bool:
             chat_id, post_id, result, context["api_ok"], context["api_errors"],
             context["message_ids"] or "<none>", context["suppressed_media"]
         )
-        return result != "no_telegram_payload"
+        latest_message_id = int(context["message_ids"][-1]) if context["message_ids"] else None
+        return result != "no_telegram_payload", latest_message_id
     except Exception as exc:
         if context["message_ids"] and not sent_record_saved:
             _record_parser_sent_post(
@@ -1754,6 +1755,7 @@ def _process_posts(
     new_count = 0
     skipped_count = 0
     failed_count = 0
+    latest_sent_message_id = None
     diagnostic_posts = []
     destination_chat_id = int(destination_chat_id or chat_id)
     debug_logger.info("CHAT_PROCESS_START chat_id=%s title=%s posts=%s", chat_id, log_preview(title, 100), len(posts))
@@ -1879,7 +1881,7 @@ def _process_posts(
             continue
 
         try:
-            sent = _send_post(chat_id, post, destination_chat_id)
+            sent, sent_message_id = _send_post(chat_id, post, destination_chat_id)
             if not sent:
                 skipped_count += 1
                 diagnostic_posts.append(_diagnostic_post(post, "skipped", "нет поддерживаемого содержимого"))
@@ -1888,6 +1890,8 @@ def _process_posts(
                     chat_id, source_id or "?", log_preview(post.get("text")) or "<empty>"
                 )
                 continue
+            if sent_message_id:
+                latest_sent_message_id = int(sent_message_id)
             _commit_successful_post(chat_id, post)
             increment_message_count(chat_id)
             new_count += 1
@@ -1910,12 +1914,17 @@ def _process_posts(
     should_sync_button = bool(
         button_chat
         and button_chat.get("is_active")
-        and button_chat.get("max_source_type") in {"group", "private"}
+        and not (
+            button_chat.get("max_source_type") == "channel"
+            and bool(button_chat.get("max_source_type_verified"))
+        )
     )
     if should_sync_button:
         try:
             _sync_max_send_button(
-                int(chat_id), destination_chat_id=destination_chat_id
+                int(chat_id),
+                anchor_message_id=latest_sent_message_id,
+                destination_chat_id=destination_chat_id,
             )
         except Exception as error:
             debug_logger.info(
@@ -6488,11 +6497,16 @@ def _answer_public_max_send_action(call, *args, **kwargs):
 
 
 def _max_send_button_is_eligible(chat):
+    source_is_confirmed_channel = bool(
+        chat
+        and chat.get("max_source_type") == "channel"
+        and chat.get("max_source_type_verified")
+    )
     if (
         not chat
         or not chat.get("is_active")
         or not chat.get("max_url")
-        or chat.get("max_source_type") not in {"group", "private"}
+        or source_is_confirmed_channel
         or not os.path.exists(_session_path_for_chat(chat))
     ):
         return False
@@ -6526,8 +6540,12 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
 
     target_id = anchor_message_id or _latest_parser_send_anchor(
         int(chat_id), destination_chat_id
-    )
+    ) or chat.get("max_send_button_message_id")
     if not target_id:
+        debug_logger.info(
+            "MAX_SEND_BUTTON_NO_ANCHOR chat_id=%s destination_chat_id=%s",
+            chat_id, destination_chat_id,
+        )
         return False
     target_id = int(target_id)
     if existing_id and int(existing_id) != target_id:
@@ -6543,18 +6561,26 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
                     "MAX_SEND_BUTTON_MOVE_FAILED chat_id=%s message_id=%s error=%s",
                     chat_id, existing_id, log_preview(error, 180),
                 )
-                return False
-        set_max_send_button_message_id(int(chat_id), None)
+            else:
+                set_max_send_button_message_id(int(chat_id), None)
 
     try:
         bot.edit_message_reply_markup(
             destination_chat_id, target_id, reply_markup=keyboard
         )
         set_max_send_button_message_id(int(chat_id), target_id)
+        debug_logger.info(
+            "MAX_SEND_BUTTON_ATTACHED chat_id=%s destination_chat_id=%s message_id=%s",
+            chat_id, destination_chat_id, target_id,
+        )
         return True
     except Exception as error:
         if "message is not modified" in str(error).lower():
             set_max_send_button_message_id(int(chat_id), target_id)
+            debug_logger.info(
+                "MAX_SEND_BUTTON_ATTACHED chat_id=%s destination_chat_id=%s message_id=%s already_present=true",
+                chat_id, destination_chat_id, target_id,
+            )
             return True
         debug_logger.warning(
             "MAX_SEND_BUTTON_ATTACH_FAILED chat_id=%s message_id=%s error=%s",
