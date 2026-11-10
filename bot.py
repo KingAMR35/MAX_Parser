@@ -977,10 +977,10 @@ def _telegram_call(fn, *args, **kwargs):
             "send_message", "send_photo", "send_video", "send_video_note",
             "send_document", "send_voice", "send_audio", "send_animation",
         }
-        and "reply_markup" not in kwargs
+        and not isinstance(kwargs.get("reply_markup"), types.InlineKeyboardMarkup)
     ):
-        # Remove the persistent ReplyKeyboardMarkup added by older versions;
-        # the new inline link is attached once to a parser post separately.
+        # Never recreate the legacy MAX ReplyKeyboard. Remove it from existing
+        # chats on the next parsed post, while preserving any inline controls.
         kwargs["reply_markup"] = types.ReplyKeyboardRemove()
     send_cost = 1
     if method_name == "send_media_group":
