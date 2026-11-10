@@ -969,6 +969,7 @@ def _telegram_call(fn, *args, **kwargs):
     except (TypeError, ValueError):
         destination_key = None
     ctx = getattr(_send_context, "current", None)
+    injected_inline_button = False
     if (
         ctx is not None
         and destination_key is not None
@@ -982,6 +983,19 @@ def _telegram_call(fn, *args, **kwargs):
         # Never recreate the legacy MAX ReplyKeyboard. Remove it from existing
         # chats on the next parsed post, while preserving any inline controls.
         kwargs["reply_markup"] = types.ReplyKeyboardRemove()
+    if (
+        ctx is not None
+        and ctx.get("button_keyboard") is not None
+        and destination_key == int(ctx.get("destination_chat_id") or 0)
+        and method_name in {
+            "send_message", "send_photo", "send_video", "send_video_note",
+            "send_document", "send_voice", "send_audio", "send_animation",
+        }
+    ):
+        # Put the button on the message as Telegram creates it. The final sync
+        # below moves it to the last message in a multi-part MAX post.
+        kwargs["reply_markup"] = ctx["button_keyboard"]
+        injected_inline_button = True
     send_cost = 1
     if method_name == "send_media_group":
         media_group = kwargs.get("media")
@@ -1052,6 +1066,8 @@ def _telegram_call(fn, *args, **kwargs):
             ids = _telegram_result_ids(result)
             ctx["api_ok"] += 1
             ctx["message_ids"].extend(ids)
+            if injected_inline_button:
+                ctx["inline_button_message_ids"].extend(ids)
             if method_name == "send_message":
                 ctx["text_sent"] = True
             if _telegram_call_has_media_caption(method_name, args, kwargs):
@@ -1426,9 +1442,17 @@ def _send_post_impl(chat_id: int, post: dict, destination_chat_id=None) -> None:
 def _send_post(chat_id: int, post: dict, destination_chat_id=None) -> tuple[bool, int | None]:
     destination_chat_id = int(destination_chat_id or chat_id)
     post_id = str(post.get("source_id") or post.get("idx") or "?")
+    button_chat = get_chat_by_id(int(chat_id))
+    button_keyboard = (
+        _public_max_send_button_keyboard(int(chat_id))
+        if _max_send_button_is_eligible(button_chat)
+        else None
+    )
     context = {
         "chat_id": chat_id,
         "destination_chat_id": destination_chat_id,
+        "button_keyboard": button_keyboard,
+        "inline_button_message_ids": [],
         "source_id": post_id,
         "api_ok": 0,
         "api_errors": 0,
@@ -1481,6 +1505,19 @@ def _send_post(chat_id: int, post: dict, destination_chat_id=None) -> tuple[bool
             context["message_ids"] or "<none>", context["suppressed_media"]
         )
         latest_message_id = int(context["message_ids"][-1]) if context["message_ids"] else None
+        for message_id in context["inline_button_message_ids"]:
+            if latest_message_id and int(message_id) == latest_message_id:
+                continue
+            try:
+                bot.edit_message_reply_markup(
+                    destination_chat_id, int(message_id), reply_markup=None
+                )
+            except Exception as button_cleanup_error:
+                if "message is not modified" not in str(button_cleanup_error).lower():
+                    debug_logger.info(
+                        "MAX_SEND_BUTTON_INTERMEDIATE_CLEANUP_FAILED chat_id=%s message_id=%s error_type=%s",
+                        chat_id, message_id, type(button_cleanup_error).__name__,
+                    )
         return result != "no_telegram_payload", latest_message_id
     except Exception as exc:
         if context["message_ids"] and not sent_record_saved:
@@ -1916,7 +1953,10 @@ def _process_posts(
         and button_chat.get("is_active")
         and not (
             button_chat.get("max_source_type") == "channel"
-            and bool(button_chat.get("max_source_type_verified"))
+            and (
+                bool(button_chat.get("max_source_type_verified"))
+                or bool(button_chat.get("max_source_type_manual"))
+            )
         )
     )
     if should_sync_button:
@@ -2081,6 +2121,18 @@ def run_one_parse_cycle():
         chat_id = chat["chat_id"]
         max_url = chat["max_url"]
         title = chat["title"]
+        try:
+            # Reconcile existing connections on every cycle, even when MAX
+            # yielded no new posts. This also repairs old chats in place.
+            _sync_max_send_button(
+                int(chat_id),
+                destination_chat_id=(chat.get("destination_chat_id") or chat_id),
+            )
+        except Exception as button_error:
+            debug_logger.warning(
+                "MAX_SEND_BUTTON_CYCLE_SYNC_FAILED chat_id=%s error_type=%s",
+                chat_id, type(button_error).__name__,
+            )
         parse_counts = {"new": 0, "skipped": 0}
         parse_diagnostics = []
 
@@ -6500,7 +6552,10 @@ def _max_send_button_is_eligible(chat):
     source_is_confirmed_channel = bool(
         chat
         and chat.get("max_source_type") == "channel"
-        and chat.get("max_source_type_verified")
+        and (
+            chat.get("max_source_type_verified")
+            or chat.get("max_source_type_manual")
+        )
     )
     if (
         not chat
