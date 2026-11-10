@@ -7724,13 +7724,17 @@ def _select_max_composer_upload(page, upload_payload, expected_count: int) -> st
 
 
 def _click_live_max_send_control(page, send_control, upload_payload, before_tail, tail_snapshot):
-    """Click a freshly ranked composer control if a global locator became stale."""
+    """Click the pinned live composer control, reranking only after a DOM refresh."""
     try:
-        send_control.click(timeout=2500)
+        send_control.click(timeout=1400)
         return ""
     except Exception as click_error:
-        if not upload_payload or tail_snapshot() != before_tail:
+        if not upload_payload:
             raise
+        if tail_snapshot() != before_tail:
+            # The click may have submitted the attachment before Playwright
+            # timed out. Do not click again; the caller verifies the new media row.
+            return "click-timeout-tail-changed"
         clicked = page.evaluate("""() => {
             const composer=document.querySelector('[data-max-parser-send-composer="true"]');
             if(!composer)return null;
@@ -7777,6 +7781,93 @@ def _click_live_max_send_control(page, send_control, upload_payload, before_tail
                 + log_preview(click_error, 180)
             ) from click_error
         return f"js-rerender-fallback:{clicked}"
+
+
+def _pin_live_max_send_control(page, upload_payload=False):
+    """Find and pin the send button in one DOM pass; never reuse a global nth index."""
+    token = f"max-parser-send-{time.time_ns()}"
+    selected = page.evaluate("""([token, hasUpload]) => {
+        const composer=document.querySelector('[data-max-parser-send-composer="true"]');
+        if(!composer)return null;
+        const c=composer.getBoundingClientRect();
+        const shell=composer.closest('form,[class*="composer" i],[class*="message" i]')||composer.parentElement?.parentElement;
+        const visible=el=>{
+            const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+            return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&
+                Number(s.opacity||1)>0&&!el.disabled&&el.getAttribute('aria-disabled')!=='true';
+        };
+        const forbidden=/(attach|file|media|photo|image|upload|emoji|sticker|gif|voice|audio|microphone|record|call|camera|прикреп|влож|файл|медиа|фото|смайл|стикер|голос|запис|звон|камера)/i;
+        const label=el=>[el.innerText,el.getAttribute('aria-label'),el.title,
+            el.getAttribute('data-testid'),el.className,el.type].filter(Boolean).join(' ').toLowerCase();
+        const controls=[...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+            .filter(el=>visible(el)&&!el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i],.item'));
+        const candidates=controls.map(el=>{
+            const r=el.getBoundingClientRect(),l=label(el);
+            const inShell=Boolean(shell&&shell.contains(el));
+            const inDialog=Boolean(el.closest('[role="dialog"],[class*="modal" i],[class*="preview" i]'));
+            const dy=Math.abs((r.top+r.height/2)-(c.top+c.height/2));
+            const namedSend=/(отправ|send|submit)/i.test(l);
+            if(hasUpload){
+                if((!inShell&&!inDialog)||(inShell&&(dy>150||r.left<c.left+c.width*.4)))return null;
+                if(!namedSend&&forbidden.test(l))return null;
+                if(!namedSend&&(dy>100||r.top<window.innerHeight*.55||r.left+r.width/2<c.left+c.width*.45))return null;
+            }else{
+                if(!namedSend||(!inShell&&!inDialog))return null;
+            }
+            const score=(namedSend?10000:0)+(inDialog?500:0)+(inShell?300:0)+
+                (el.type==='submit'?150:0)-dy+r.left*.01;
+            return {el,score};
+        }).filter(Boolean).sort((a,b)=>b.score-a.score);
+        const target=candidates[0]?.el;
+        if(!target)return null;
+        target.setAttribute('data-max-parser-send-control',token);
+        const r=target.getBoundingClientRect();
+        return [target.tagName,String(target.className||'').slice(0,60),
+            String(target.getAttribute('aria-label')||target.title||target.innerText||'').slice(0,40),
+            Math.round(r.left),Math.round(r.top)].join(':');
+    }""", [token, bool(upload_payload)])
+    if not selected:
+        return None, ""
+    locator = page.locator(f'[data-max-parser-send-control="{token}"]').first
+    try:
+        if locator.is_visible(timeout=150) and locator.is_enabled(timeout=150):
+            return locator, str(selected)
+    except Exception:
+        pass
+    return None, str(selected)
+
+
+def _new_max_upload_rows(rows, before_ids, before_signatures, upload_names,
+                         expected_kinds=(), require_outgoing=False):
+    """Return newly rendered attachment rows, optionally requiring evidence they are ours."""
+    normalized_names = [os.path.basename(str(name or "")).casefold() for name in upload_names]
+    normalized_names = [name for name in normalized_names if name]
+    expected_kinds = {str(kind or "").casefold() for kind in expected_kinds if kind}
+    candidates = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        row_id = str(row.get("id") or "")
+        signature = str(row.get("signature") or "")
+        text = str(row.get("text") or "")
+        filename = str(row.get("filename") or "")
+        named_upload = any(name in (text + " " + filename).casefold() for name in normalized_names)
+        if not (row.get("media") or named_upload):
+            continue
+        is_new = bool(
+            (row_id and row_id not in before_ids)
+            or (signature and signature not in before_signatures)
+        )
+        if not is_new:
+            continue
+        matching_outgoing_media = bool(
+            row.get("outgoing")
+            and (not expected_kinds or str(row.get("media_kind") or "").casefold() in expected_kinds)
+        )
+        if require_outgoing and not (matching_outgoing_media or named_upload):
+            continue
+        candidates.append(row)
+    return candidates
 
 
 def send_message_to_max(
@@ -7964,30 +8055,92 @@ def send_message_to_max(
                 return set()
 
         def chat_tail_source_rows():
-            """Return ordered IDs and media flags for recently rendered MAX rows."""
+            """Return stable identity, attachment evidence, and direction for recent MAX rows."""
             try:
                 rows = page.evaluate("""() => {
-                    let items=[...document.querySelectorAll('.item')];
-                    if (!items.length) items=[...document.querySelectorAll(
-                        '[data-message-id],[data-mid],[data-id]'
-                    )];
-                    return items.map(row=>({
-                        id:row.getAttribute('data-message-id')||row.getAttribute('data-mid')||
-                            row.getAttribute('data-id')||'',
-                        text:String(row.innerText||row.textContent||''),
-                        media:Boolean(row.querySelector(
-                            'img,video,audio,canvas,[class*="attachment" i],[class*="media" i],' +
-                            '[data-testid*="file" i],[data-testid*="audio" i],[data-testid*="video" i]'
-                        ))
-                    })).filter(row=>row.id);
+                    let items = Array.from(document.querySelectorAll('.item'));
+                    if (!items.length) items = Array.from(document.querySelectorAll('[data-message-id],[data-mid],[data-id]'));
+                    const mediaSelector = 'video,audio,canvas,source,a[download],'+
+                        '[class*="attachment"],[class*="document"],[class*="file"],'+
+                        '[class*="media"],[class*="voice"],[class*="audio"],[class*="video"],'+
+                        '[data-testid*="file"],[data-testid*="document"],[data-testid*="audio"],'+
+                        '[data-testid*="video"],[data-testid*="media"]';
+                    return items.map((row, index) => {
+                        const id = row.getAttribute('data-message-id') || row.getAttribute('data-mid') ||
+                            row.getAttribute('data-id') || row.getAttribute('data-index') || '';
+                        const text = String(row.innerText || row.textContent || '').trim();
+                        const images = Array.from(row.querySelectorAll('img')).filter(el => {
+                            if (el.closest('[class*="avatar"],[class*="profile"],[class*="userpic"]')) return false;
+                            const rect = el.getBoundingClientRect();
+                            return rect.width >= 80 && rect.height >= 80;
+                        });
+                        const nodes = Array.from(row.querySelectorAll(mediaSelector)).concat(images);
+                        const filename = nodes.map(el => [el.getAttribute('download'), el.getAttribute('title'),
+                            el.getAttribute('aria-label'), el.getAttribute('data-filename'), el.getAttribute('href')]
+                            .filter(Boolean).join(' ')).join(' ');
+                        const marker = [row.className, row.getAttribute('data-direction'), row.getAttribute('data-testid'),
+                            ...Array.from(row.querySelectorAll('[class*="outgoing"],[class*="sent"],[class*="own"],[data-direction="out"]'))
+                                .map(el => el.className)].filter(Boolean).join(' ');
+                        const bubble = row.querySelector('[class*="bubble"],[class*="message-content"],[data-testid*="message"]') || row;
+                        const rect = bubble.getBoundingClientRect();
+                        const outgoing = /(outgoing|sent|mine|own|is-out|my-message|message--out)/i.test(marker) ||
+                            (rect.width > 0 && rect.width < window.innerWidth * 0.78 && rect.left + rect.width / 2 > window.innerWidth * 0.58);
+                        let mediaKind = '';
+                        if (nodes.some(el => el.tagName === 'VIDEO' || /video|videonote|круж/i.test(String(el.className || '')))) mediaKind = 'video';
+                        else if (nodes.some(el => el.tagName === 'AUDIO' || /voice|audio|голос/i.test(String(el.className || '')))) mediaKind = 'audio';
+                        else if (images.length || nodes.some(el => el.tagName === 'CANVAS' || /photo|image|sticker|изображ/i.test(String(el.className || '')))) mediaKind = 'image';
+                        else if (nodes.length) mediaKind = 'document';
+                        const signature = String(id || index) + '|' + text + '|' + filename + '|' + mediaKind;
+                        return {id: String(id), text, filename, media: nodes.length > 0, mediaKind, outgoing, signature};
+                    });
                 }""")
-                return [
-                    {"id": str(row.get("id")), "text": str(row.get("text") or ""),
-                     "media": bool(row.get("media"))}
-                    for row in rows or []
+                payload_items = upload_payload if isinstance(upload_payload, (list, tuple)) else [upload_payload]
+                expected_names = [
+                    os.path.basename(str(item.get("name") or "")).casefold()
+                    for item in payload_items if isinstance(item, dict) and item.get("name")
                 ]
+                result = []
+                for row in rows or []:
+                    text = str(row.get("text") or "")
+                    filename = str(row.get("filename") or "")
+                    has_named_upload = any(
+                        name in (text + " " + filename).casefold()
+                        for name in expected_names
+                    )
+                    result.append({
+                        "id": str(row.get("id") or ""), "text": text,
+                        "filename": filename,
+                        "media": bool(row.get("media") or has_named_upload),
+                        "media_kind": str(row.get("mediaKind") or ""),
+                        "outgoing": bool(row.get("outgoing")),
+                        "signature": str(row.get("signature") or "")
+                    })
+                return result
             except Exception:
                 return []
+
+        before_tail = chat_tail_snapshot()
+        before_source_ids = chat_tail_source_ids()
+        before_row_signatures = {row["signature"] for row in chat_tail_source_rows() if row.get("signature")}
+
+        def new_upload_media_rows(require_outgoing=False):
+            rows = chat_tail_source_rows()
+            payload_items = upload_payload if isinstance(upload_payload, (list, tuple)) else [upload_payload]
+            names = [str(item.get("name") or "") for item in payload_items if isinstance(item, dict)]
+            expected_kinds = set()
+            for item in payload_items:
+                if not isinstance(item, dict):
+                    continue
+                mime = str(item.get("mimeType") or "").lower()
+                expected_kinds.add(
+                    "image" if mime.startswith("image/") else
+                    "video" if mime.startswith("video/") else
+                    "audio" if mime.startswith("audio/") else "document"
+                )
+            return _new_max_upload_rows(
+                rows, before_source_ids, before_row_signatures, names, expected_kinds,
+                require_outgoing=require_outgoing,
+            )
 
         def chat_tail_source_ids_matching_text(expected_text):
             expected = re.sub(r"\s+", " ", str(expected_text or "")).strip().casefold()
@@ -8079,13 +8232,14 @@ def send_message_to_max(
             except Exception as error:
                 return {"diagnostic_error": type(error).__name__}
 
+        upload_auto_sent_rows = []
+        outbound_echo_armed = False
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
             upload_route = _select_max_composer_upload(
                 page, upload_payload, expected_count
             )
-            # Let MAX finish rendering the selected file(s) in the composer.
-            page.wait_for_timeout(350)
+            page.wait_for_timeout(250)
             upload_ready = False
             upload_state = {}
             for _ in range(60):
@@ -8095,10 +8249,16 @@ def send_message_to_max(
                         "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
                         else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
                     )
+                upload_auto_sent_rows = new_upload_media_rows(require_outgoing=True)
+                if upload_auto_sent_rows:
+                    upload_ready = True
+                    break
                 upload_state = send_debug_state()
+                selected_files = int(upload_state.get("selectedFiles") or 0)
                 if (
                     int(upload_state.get("composerPreview") or 0) > 0
                     or int(upload_state.get("nearComposerMedia") or 0) > 0
+                    or selected_files >= expected_count
                 ):
                     upload_ready = True
                     break
@@ -8108,6 +8268,8 @@ def send_message_to_max(
                     "upload": upload_route[:120],
                     "method": "attachment-preview-not-ready",
                     "state": upload_state,
+                    "new_media_rows": len(new_upload_media_rows()),
+                    "matching_outgoing_rows": len(new_upload_media_rows(require_outgoing=True)),
                 }
                 raise RuntimeError(
                     "MAX_UPLOAD_NOT_READY: " +
@@ -8115,7 +8277,47 @@ def send_message_to_max(
                 )
             upload_error = media_upload_error()
             if upload_error:
-                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
+                raise RuntimeError(
+                    "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
+                    else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
+                )
+            if upload_auto_sent_rows:
+                if on_before_send:
+                    try:
+                        on_before_send(normalized_media_hashes)
+                        outbound_echo_armed = True
+                    except Exception as error:
+                        outbound_echo_armed = True
+                        debug_logger.warning(
+                            "MAX_OUTBOUND_ECHO_ARM_FAILED after_auto_upload error_type=%s",
+                            type(error).__name__,
+                        )
+                page.wait_for_timeout(1200)
+                upload_error = media_upload_error()
+                if upload_error:
+                    raise RuntimeError(
+                        "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
+                        else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
+                    )
+                if on_send_confirmed:
+                    for row in upload_auto_sent_rows:
+                        if row.get("id"):
+                            try:
+                                on_send_confirmed(row["id"])
+                            except Exception as error:
+                                debug_logger.warning(
+                                    "MAX_OUTBOUND_SOURCE_REMEMBER_FAILED after_auto_upload error_type=%s",
+                                    type(error).__name__,
+                                )
+                before_tail = chat_tail_snapshot()
+                before_source_ids = chat_tail_source_ids()
+                before_row_signatures = {
+                    row["signature"] for row in chat_tail_source_rows()
+                    if row.get("signature")
+                }
+                upload_payload = None
+                if not str(text or "").strip():
+                    return
 
         # Fill in one operation to preserve Unicode and the exact order of characters.
         if str(text or "").strip():
@@ -8155,175 +8357,46 @@ def send_message_to_max(
                 # If this MAX client has a different editor, send the text as entered.
                 pass
 
-        def pin_send_control(candidate):
-            token = f"max-parser-send-{time.time_ns()}"
-            candidate.evaluate(
-                "(el, value) => el.setAttribute('data-max-parser-send-control', value)",
-                token,
-                timeout=500,
-            )
-            return page.locator(
-                f'[data-max-parser-send-control="{token}"]'
-            ).first
-
         send_button = None
+        send_control_info = ""
         attempts = 80 if upload_payload else 1
         if upload_payload:
-            # Focus the message composer after the file picker closes. Some
-            # MAX layouts reveal the attachment send action only after focus.
             try:
                 composer.click(timeout=1200)
             except Exception:
                 pass
-            # A file picker can leave MAX's attachment/sticker popover open.
-            # Dismiss it before finding the send control; otherwise its
-            # backdrop can intercept a click on the composer button.
             try:
                 backdrops = page.locator(
                     '[data-testid="popoverPortal"] [role="presentation"], '
                     '.popoverPortal [role="presentation"]'
                 )
-                if any(backdrops.nth(index).is_visible(timeout=200) for index in range(backdrops.count())):
-                    for _ in range(2):
-                        page.keyboard.press("Escape")
-                        page.wait_for_timeout(200)
-                        if not any(
-                            backdrops.nth(index).is_visible(timeout=200)
-                            for index in range(backdrops.count())
-                        ):
-                            break
-                    if any(
-                        backdrops.nth(index).is_visible(timeout=200)
-                        for index in range(backdrops.count())
-                    ):
-                        raise RuntimeError("MAX_SEND_POPOVER_BLOCKING")
-            except RuntimeError:
-                raise
+                for _ in range(2):
+                    visible_backdrop = any(
+                        backdrops.nth(index).is_visible(timeout=120)
+                        for index in range(min(backdrops.count(), 4))
+                    )
+                    if not visible_backdrop:
+                        break
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(150)
             except Exception:
                 pass
 
-        send_controls = page.locator(
-            'button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]'
-        )
-        for attempt in range(attempts):
+        for _ in range(attempts):
             upload_error = media_upload_error()
             if upload_error:
-                raise RuntimeError("MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}")
-            if upload_payload:
-                candidate_indices = page.evaluate("""() => {
-                    const composer = document.querySelector('[data-max-parser-send-composer="true"]');
-                    if (!composer) return [];
-                    const c = composer.getBoundingClientRect();
-                    const visible = el => {
-                        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-                        return r.width > 0 && r.height > 0 && s.display !== 'none' &&
-                            s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
-                            !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-                    };
-                    return [...document.querySelectorAll(
-                        'button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]'
-                    )]
-                        .map((el, index) => {
-                            if (!visible(el) || el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i]')) return null;
-                            if (el.closest('.item')) return null;
-                            const r = el.getBoundingClientRect();
-                            const label = [el.innerText, el.getAttribute('aria-label'), el.title,
-                                el.getAttribute('data-testid'), el.className, el.type]
-                                .filter(Boolean).join(' ').toLowerCase();
-                            if (!/(отправ|send|submit)/i.test(label)) return null;
-                            const verticalDistance = Math.abs((r.top + r.height / 2) - (c.top + c.height / 2));
-                            const form = composer.closest('form');
-                            const inComposerForm = Boolean(form && form.contains(el));
-                            const composerShell = composer.closest('form,[class*="composer" i],[class*="message" i]') || composer.parentElement?.parentElement;
-                            const inComposerShell = Boolean(composerShell && composerShell.contains(el));
-                            const inDialog = Boolean(el.closest('[role="dialog"],[class*="modal" i],[class*="preview" i]'));
-                            if (!inComposerShell && !inDialog) return null;
-                            if (inComposerShell && (verticalDistance > 150 || r.left < c.left + c.width * 0.4)) return null;
-                            const score = (inDialog ? 200 : 0) + (inComposerForm ? 100 : 0) +
-                                (inComposerShell ? 50 : 0) +
-                                (el.type === 'submit' ? 80 : 0) +
-                                (/отправ|send|submit/i.test(label) ? 40 : 0) - verticalDistance;
-                            return {index, score};
-                        })
-                        .filter(Boolean)
-                        .sort((a, b) => b.score - a.score)
-                        .map(item => item.index);
-                }""")
-                for index in candidate_indices:
-                    candidate = send_controls.nth(int(index))
-                    try:
-                        if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
-                            send_button = pin_send_control(candidate)
-                            break
-                    except Exception:
-                        continue
-                if send_button is None:
-                    # MAX sometimes renders the send icon without any text or
-                    # accessible label. In that case use only an enabled control
-                    # on the composer row, to its right, outside attachment and
-                    # recording controls. The rightmost eligible control is the
-                    # send action in the MAX composer layout.
-                    fallback_indices = page.evaluate("""() => {
-                        const composer = document.querySelector('[data-max-parser-send-composer="true"]');
-                        if (!composer) return [];
-                        const c = composer.getBoundingClientRect();
-                        const shell = composer.closest('form') || composer.parentElement?.parentElement;
-                        const visible = el => {
-                            const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-                            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
-                                s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
-                                !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-                        };
-                        return [...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
-                            .map((el, index) => {
-                                if (!visible(el) || el.closest('[data-testid="popoverPortal"],.popoverPortal,[role="presentation"],[class*="backdrop" i]')) return null;
-                                const r = el.getBoundingClientRect();
-                                const label = [el.innerText,el.getAttribute('aria-label'),el.title,
-                                    el.getAttribute('data-testid'),el.className,el.type]
-                                    .filter(Boolean).join(' ').toLowerCase();
-                                if (el.hasAttribute('aria-haspopup') ||
-                                    /(attach|file|media|photo|image|upload|emoji|sticker|gif|voice|audio|microphone|record|call|camera|прикреп|влож|файл|медиа|фото|смайл|стикер|голос|запис|звон|камера)/i.test(label)) return null;
-                                const verticalDistance = Math.abs((r.top+r.height/2)-(c.top+c.height/2));
-                                if (verticalDistance > 100 || r.top < window.innerHeight*0.55 ||
-                                    r.left+r.width/2 < c.left+c.width*0.45) return null;
-                                const inShell = Boolean(shell && shell.contains(el));
-                                const namedSend = /(отправ|send|submit)/i.test(label);
-                                return {index, score:(namedSend?10000:0)+(inShell?1000:0)+r.left};
-                            }).filter(Boolean).sort((a,b)=>b.score-a.score).map(x=>x.index);
-                    }""")
-                    fallback_controls = page.locator(
-                        'button,[role="button"],input[type="submit"]'
-                    )
-                    for index in fallback_indices:
-                        candidate = fallback_controls.nth(int(index))
-                        try:
-                            if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
-                                send_button = pin_send_control(candidate)
-                                break
-                        except Exception:
-                            continue
-            else:
-                send_buttons = page.get_by_role("button", name=re.compile(r"отправить|send", re.I))
-                for index in reversed(range(send_buttons.count())):
-                    candidate = send_buttons.nth(index)
-                    try:
-                        if candidate.is_visible(timeout=250) and candidate.is_enabled(timeout=250):
-                            send_button = pin_send_control(candidate)
-                            break
-                    except Exception:
-                        continue
-            if send_button is not None:
+                raise RuntimeError(
+                    "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
+                    else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
+                )
+            send_button, send_control_info = _pin_live_max_send_control(
+                page, upload_payload=bool(upload_payload)
+            )
+            if send_button is not None or not upload_payload:
                 break
-            if not upload_payload:
-                break
-            # MAX can keep the send control disabled while it is preparing a
-            # selected attachment. Wait before deciding that no send control
-            # became available.
             page.wait_for_timeout(250)
-        before_tail = chat_tail_snapshot()
-        before_source_ids = chat_tail_source_ids()
+
         send_mode = "button" if send_button is not None else "enter"
-        send_control_info = ""
         if upload_payload and send_button is None:
             diagnostic = {
                 "upload": upload_route[:120],
@@ -8334,8 +8407,9 @@ def send_message_to_max(
                 "MAX_SEND_CONTROL_NOT_FOUND: " +
                 json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))[:850]
             )
-        if on_before_send:
+        if on_before_send and not outbound_echo_armed:
             on_before_send(normalized_media_hashes)
+            outbound_echo_armed = True
         if send_button is not None:
             try:
                 send_control_info = send_button.evaluate("""el => {
@@ -8364,11 +8438,10 @@ def send_message_to_max(
             except Exception:
                 remaining = ""
             if not str(remaining or "").strip():
-                if not upload_payload:
+                if not upload_payload and chat_tail_snapshot() != before_tail:
                     send_confirmed = True
                     break
-                current_tail = chat_tail_snapshot()
-                if current_tail != before_tail:
+                if upload_payload and new_upload_media_rows(require_outgoing=True):
                     send_confirmed = True
                     break
             page.wait_for_timeout(250)
@@ -8451,13 +8524,8 @@ def send_message_to_max(
                 if matching_rows:
                     source_ids_to_remember = [row["id"] for row in matching_rows]
                 elif upload_payload:
-                    media_rows = [row for row in new_rows if row["media"]]
-                    if media_rows:
-                        source_ids_to_remember = [media_rows[-1]["id"]]
-                    elif len(new_rows) == 1:
-                        source_ids_to_remember = [new_rows[0]["id"]]
-                    else:
-                        source_ids_to_remember = []
+                    media_rows = new_upload_media_rows(require_outgoing=True)
+                    source_ids_to_remember = [row["id"] for row in media_rows if row.get("id")]
                 elif len(new_rows) == 1:
                     source_ids_to_remember = [new_rows[0]["id"]]
                 else:
