@@ -7670,12 +7670,28 @@ def send_message_to_max(
                     return visibleRows.map(row=>{
                         const id=row.getAttribute('data-message-id')||row.getAttribute('data-mid')||row.getAttribute('data-id')||row.getAttribute('data-index')||'';
                         const text=String(row.innerText||row.textContent||'').replace(/\\s+/g,' ').trim().slice(0,240);
-                        const media=row.querySelectorAll('img,video,audio,canvas,[class*="attachment" i],[class*="file" i]').length;
+                        const hasLargeImage=[...row.querySelectorAll('img')].some(img=>{
+                            const r=img.getBoundingClientRect();
+                            return Math.max(img.naturalWidth||0,r.width)>=80 &&
+                                Math.max(img.naturalHeight||0,r.height)>=80;
+                        });
+                        const hasAttachment=Boolean(row.querySelector(
+                            'video,audio,[class*="attachment" i],[class*="file" i],' +
+                            '[data-testid*="attachment" i],[data-testid*="media" i]'
+                        ));
+                        const media=hasLargeImage||hasAttachment?1:0;
                         return `${id}|${text}|${media}`;
                     });
                 }"""))
             except Exception:
                 return ()
+
+        def has_new_media_message(before, after):
+            previous_media_rows = {row for row in before if row.endswith("|1")}
+            return any(
+                row.endswith("|1") and row not in previous_media_rows
+                for row in after
+            )
 
         if upload_payload:
             expected_count = len(upload_payload) if isinstance(upload_payload, list) else 1
@@ -7783,7 +7799,7 @@ def send_message_to_max(
         if upload_payload:
             # A file picker can leave MAX's attachment/sticker popover open.
             # Dismiss it before finding the send control; otherwise its
-            # backdrop can intercept the click on the composer button.
+            # backdrop can intercept a click on the composer button.
             try:
                 backdrops = page.locator(
                     '[data-testid="popoverPortal"] [role="presentation"], '
@@ -7868,19 +7884,19 @@ def send_message_to_max(
             if not upload_payload:
                 break
             # MAX can keep the send control disabled while it is preparing a
-            # selected attachment. Do not fall back to Enter and accidentally
-            # send only the accompanying text.
+            # selected attachment. Wait for it to become available before the
+            # one-shot Enter fallback below is considered.
             page.wait_for_timeout(250)
-        if upload_payload and send_button is None:
-            raise RuntimeError("MAX_UPLOAD_NOT_READY")
         before_tail = chat_tail_snapshot() if upload_payload else ()
         if on_before_send:
             on_before_send(normalized_media_hashes)
+        enter_media_fallback = bool(upload_payload and send_button is None)
         if send_button is not None:
             send_button.click(timeout=2500)
         else:
-            # A single send action only. If the button cannot be identified, use
-            # MAX's usual Enter shortcut instead of retrying after a click timeout.
+            # Some MAX versions render the send control as an unlabeled icon.
+            # If the upload is already selected, Enter is the same single send
+            # action and avoids falsely failing just because the icon has no label.
             composer.press("Enter", timeout=2500)
 
         send_confirmed = False
@@ -7896,7 +7912,12 @@ def send_message_to_max(
                 if not upload_payload:
                     send_confirmed = True
                     break
-                if chat_tail_snapshot() != before_tail:
+                current_tail = chat_tail_snapshot()
+                if enter_media_fallback:
+                    if has_new_media_message(before_tail, current_tail):
+                        send_confirmed = True
+                        break
+                elif current_tail != before_tail:
                     send_confirmed = True
                     break
             page.wait_for_timeout(250)
