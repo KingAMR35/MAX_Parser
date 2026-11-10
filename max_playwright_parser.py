@@ -7538,25 +7538,77 @@ def _normalize_max_photo_upload(item: dict, chat_id: int) -> dict:
 
 def _select_max_composer_upload(page, upload_payload, expected_count: int) -> str:
     """Attach files through MAX's visible composer control or its own wrapper."""
+    def choose_from_open_upload_menu() -> bool:
+        """Handle MAX variants where Upload file first opens a small media menu."""
+        try:
+            menus = page.locator('[role="menu"], [role="dialog"], [data-state="open"]')
+            for menu_index in range(min(menus.count(), 8)):
+                menu = menus.nth(menu_index)
+                try:
+                    if not menu.is_visible(timeout=150):
+                        continue
+                except Exception:
+                    continue
+                entries = menu.locator(
+                    '[role="menuitem"], [role="option"], button, [role="button"], li'
+                )
+                for entry_index in range(min(entries.count(), 12)):
+                    entry = entries.nth(entry_index)
+                    try:
+                        if not entry.is_visible(timeout=150):
+                            continue
+                        label = " ".join((entry.inner_text(timeout=200) or "").split())
+                        if not re.search(
+                            r"photo|video|file|media|gallery|фото|видео|файл|медиа|галере",
+                            label,
+                            re.I,
+                        ):
+                            continue
+                        with page.expect_file_chooser(timeout=2500) as chooser_info:
+                            entry.click(timeout=1000)
+                        chooser_info.value.set_files(upload_payload, timeout=8000)
+                        return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return False
+
     upload_button = page.get_by_role(
         "button", name=re.compile(r"upload file|загрузить файл", re.I)
     )
     upload_button_count = upload_button.count()
     for index in range(min(upload_button_count, 3)):
+        candidate = upload_button.nth(index)
+        click_error = None
         try:
-            candidate = upload_button.nth(index)
             if not candidate.is_visible(timeout=300) or not candidate.is_enabled(timeout=300):
                 continue
-            with page.expect_file_chooser(timeout=5000) as chooser_info:
-                candidate.click(timeout=2500)
+            with page.expect_file_chooser(timeout=1500) as chooser_info:
+                try:
+                    candidate.click(timeout=1000)
+                except Exception as error:
+                    click_error = error
+                    raise
             chooser_info.value.set_files(upload_payload, timeout=8000)
             return f"composer-upload-button:{index}"
+        except Exception as error:
+            # MAX can leave an overlay above the toolbar or open a media menu
+            # instead of a native chooser. Handle that menu before retrying via DOM.
+            if click_error is None and choose_from_open_upload_menu():
+                return f"composer-upload-menu:{index}"
+        try:
+            with page.expect_file_chooser(timeout=3000) as chooser_info:
+                candidate.evaluate("el => el.click()", timeout=800)
+            chooser_info.value.set_files(upload_payload, timeout=8000)
+            return f"composer-upload-button-js:{index}"
         except Exception:
-            continue
+            if choose_from_open_upload_menu():
+                return f"composer-upload-menu:{index}"
 
-    # Some MAX builds expose only an icon/title instead of an accessible name.
-    if not upload_button_count:
-        button_order = page.evaluate("""() => {
+    # Some MAX builds expose only an icon/title, or expose a named button which
+    # does not open the chooser directly. Inspect composer-local controls too.
+    button_order = page.evaluate("""() => {
             const visible = el => {
                 const r=el.getBoundingClientRect(), s=getComputedStyle(el);
                 return r.width>0&&r.height>0&&s.display!=='none'&&
@@ -7576,15 +7628,30 @@ def _select_max_composer_upload(page, upload_payload, expected_count: int) -> st
                     return {index,score:100-Math.min(Math.abs((r.left+r.width/2)-cr.left),100)};
                 }).filter(Boolean).sort((a,b)=>b.score-a.score).slice(0,4).map(x=>x.index);
         }""")
-        controls = page.locator('button,[role="button"],[aria-label],[title]')
-        for index in button_order:
-            try:
-                with page.expect_file_chooser(timeout=2500) as chooser_info:
-                    controls.nth(int(index)).click(timeout=1500)
-                chooser_info.value.set_files(upload_payload, timeout=8000)
-                return f"composer-control:{int(index)}"
-            except Exception:
-                continue
+    controls = page.locator('button,[role="button"],[aria-label],[title]')
+    for index in button_order:
+        candidate = controls.nth(int(index))
+        click_error = None
+        try:
+            with page.expect_file_chooser(timeout=2500) as chooser_info:
+                try:
+                    candidate.click(timeout=1000)
+                except Exception as error:
+                    click_error = error
+                    raise
+            chooser_info.value.set_files(upload_payload, timeout=8000)
+            return f"composer-control:{int(index)}"
+        except Exception:
+            if click_error is None and choose_from_open_upload_menu():
+                return f"composer-control-menu:{int(index)}"
+        try:
+            with page.expect_file_chooser(timeout=3000) as chooser_info:
+                candidate.evaluate("el => el.click()", timeout=800)
+            chooser_info.value.set_files(upload_payload, timeout=8000)
+            return f"composer-control-js:{int(index)}"
+        except Exception:
+            if choose_from_open_upload_menu():
+                return f"composer-control-menu:{int(index)}"
 
     file_order = page.evaluate("""() => {
         const inputs=[...document.querySelectorAll('input[type="file"]')];
