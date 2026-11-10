@@ -1612,19 +1612,25 @@ def _accept_max_invite_if_available(page, source_url: str, chat_id: int):
 
     # A direct chat URL can still show a preview with a Join/Subscribe action.
     # Never click it here; the account owner/admin must join it manually first.
-    buttons = page.locator("button, [role='button']")
     try:
-        for index in range(min(buttons.count(), 40)):
-            button = buttons.nth(index)
-            if not button.is_visible(timeout=100):
-                continue
-            label = " ".join((button.inner_text(timeout=250) or "").split())
-            if not label:
-                label = " ".join((button.get_attribute("aria-label") or "").split())
-            if invite_actions.fullmatch(label):
-                raise Exception("MAX_INVITE_MANUAL_REQUIRED")
-    except Exception:
-        raise
+        labels = page.locator("button, [role='button']").evaluate_all("""buttons => buttons
+            .filter(button => {
+                const rect=button.getBoundingClientRect(), style=getComputedStyle(button);
+                return rect.width>0&&rect.height>0&&style.display!=='none'&&
+                    style.visibility!=='hidden'&&Number(style.opacity||1)>0;
+            })
+            .map(button => String(button.innerText||button.textContent||
+                button.getAttribute('aria-label')||button.title||'').replace(/\\s+/g,' ').trim())
+        """)
+    except Exception as error:
+        # A transient/detached button must not abort sending an ordinary message.
+        debug_logger.debug(
+            "MAX_INVITE_ACTION_SCAN_SKIPPED chat_id=%s error_type=%s",
+            chat_id, type(error).__name__,
+        )
+        return False
+    if any(invite_actions.fullmatch(label) for label in labels if label):
+        raise Exception("MAX_INVITE_MANUAL_REQUIRED")
     return False
 
 def mark_message_seen(post: dict, chat_id: int = 0) -> None:
@@ -7875,24 +7881,27 @@ def send_message_to_max(
                         # right composer state; setting files on the hidden input
                         # alone can leave files.length=1 without a visible preview.
                         try:
-                            # Some Svelte versions attach the picker listener to
-                            # the input itself, so exercise its real click path
-                            # before assigning the payload through Playwright.
-                            with page.expect_file_chooser(timeout=1800) as chooser_info:
-                                candidate.evaluate("el => el.click()", timeout=800)
-                            chooser_info.value.set_files(upload_payload, timeout=8000)
-                            uploaded = True
-                            upload_route = f"chooser-input:{int(index)}"
-                            break
-                        except Exception:
-                            pass
-                        try:
+                            # Activate MAX's upload wrapper before touching the
+                            # hidden file input. In the current Svelte composer,
+                            # input.click() alone selects a file but does not
+                            # register it as a composer attachment.
                             trigger = candidate.locator("xpath=..")
                             with page.expect_file_chooser(timeout=1600) as chooser_info:
                                 trigger.click(timeout=1000, force=True)
                             chooser_info.value.set_files(upload_payload, timeout=8000)
                             uploaded = True
                             upload_route = f"chooser-input-parent:{int(index)}"
+                            break
+                        except Exception:
+                            pass
+                        try:
+                            # Some MAX builds bind the picker directly to the
+                            # input, so use this only after the wrapper path.
+                            with page.expect_file_chooser(timeout=1800) as chooser_info:
+                                candidate.evaluate("el => el.click()", timeout=800)
+                            chooser_info.value.set_files(upload_payload, timeout=8000)
+                            uploaded = True
+                            upload_route = f"chooser-input:{int(index)}"
                             break
                         except Exception:
                             pass
