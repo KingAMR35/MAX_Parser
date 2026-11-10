@@ -246,6 +246,35 @@ _BASE_BOT_COMMANDS = [
     types.BotCommand("admin", "Админ-панель")
 ]
 _SEND_TO_MAX_BOT_COMMAND = types.BotCommand("send_to_max", "Отправить сообщение в MAX")
+BOT_SHORT_DESCRIPTION = (
+    "Пересылает сообщения из MAX в Telegram. Отправляйте текст и вложения обратно командой /send_to_max."
+)
+BOT_PROFILE_DESCRIPTION = (
+    "MAX_Parser пересылает новые сообщения из MAX в Telegram: текст, фото, видео, документы и другие вложения. "
+    "Подключайте доступные группы, каналы и личные чаты, выбирайте получение в Telegram-группу или личные сообщения. "
+    "Из подключённой Telegram-группы можно отправлять текст и вложения обратно в MAX командой /send_to_max, "
+    "если источник не является каналом. Пошаговая инструкция и поддержка — в боте."
+)
+
+
+def _sync_bot_profile_descriptions():
+    for language_code in (None, "ru"):
+        try:
+            bot.set_my_short_description(
+                BOT_SHORT_DESCRIPTION, language_code=language_code
+            )
+            bot.set_my_description(
+                BOT_PROFILE_DESCRIPTION, language_code=language_code
+            )
+        except Exception as error:
+            debug_logger.warning(
+                "BOT_PROFILE_DESCRIPTION_SYNC_FAILED language=%s error_type=%s",
+                language_code or "default", type(error).__name__,
+            )
+
+
+_sync_bot_profile_descriptions()
+
 for _command_scope in (
     None,
     types.BotCommandScopeAllPrivateChats(),
@@ -6632,7 +6661,12 @@ def _sync_send_to_max_command_menu(chat_id, chat=None, force_disabled=False):
         try:
             if should_show:
                 bot.set_my_commands(
-                    [*_BASE_BOT_COMMANDS, _SEND_TO_MAX_BOT_COMMAND], scope=scope
+                    [
+                        _BASE_BOT_COMMANDS[0],
+                        _SEND_TO_MAX_BOT_COMMAND,
+                        *_BASE_BOT_COMMANDS[1:],
+                    ],
+                    scope=scope,
                 )
             else:
                 # Chat scope overrides AllGroupChats. Delete it so the group
@@ -6818,7 +6852,7 @@ def _start_public_max_send(call, source_chat_id, allowed_private_user_id=None):
         prompt_text = (
             "💬 Отправьте текст или вложение для этого личного чата MAX."
             if is_private_source else
-            f"👤 Кто отправляет сообщение в MAX «{escape_html(chat.get('title') or 'Чат')}»?\n\n"
+            f"👤 Кто отправляет сообщение в MAX?\n\n"
             "Напишите имя в личном чате с ботом или нажмите «Пропустить этот шаг»."
         )
         prompt_options = {
@@ -11110,6 +11144,7 @@ def callback_handler(call):
 <blockquote><b>Что умеет бот:</b>\n
 • Пересылать новые сообщения из подключённого чата MAX.
 • Отправлять текст, фото, видео, документы и другие поддерживаемые вложения.
+• Отправлять сообщения обратно в подходящую группу MAX командой /send_to_max из подключённой Telegram-группы.
 • Работать автоматически: не нужно постоянно открывать MAX и проверять группу вручную.
 • Помогать не терять важную информацию из школьных, рабочих или дружеских чатов.
 <b>Почему это удобно:</b>\n
