@@ -8,6 +8,7 @@ import shutil
 import io
 import base64
 import subprocess
+import sys
 from urllib.parse import unquote, urlparse
 import queue
 import threading
@@ -616,6 +617,37 @@ def _get_unlabeled_otp_input(page, value: str):
     return None
 
 
+def _visible_otp_cells(page, reference_input=None):
+    """Return visible single-character OTP inputs in visual (left-to-right) order."""
+    try:
+        reference_box = reference_input.bounding_box() if reference_input else None
+    except Exception:
+        reference_box = None
+
+    candidates = page.locator("input[maxlength='1']")
+    fields = []
+    for index in range(candidates.count()):
+        field = candidates.nth(index)
+        try:
+            if not field.is_visible(timeout=150):
+                continue
+            box = field.bounding_box()
+            if not box:
+                continue
+            y, x = float(box.get("y", 0)), float(box.get("x", index))
+            if reference_box:
+                # Avoid unrelated one-character controls elsewhere in the MAX
+                # page; segmented verification cells share the same visual row.
+                row_tolerance = max(18.0, float(reference_box.get("height", 0)) * 1.5)
+                if abs(y - float(reference_box.get("y", y))) > row_tolerance:
+                    continue
+            fields.append((y, x, field))
+        except Exception:
+            continue
+    fields.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in fields]
+
+
 def _focus_max_auth_input(page) -> bool:
     """Focus the visible MAX auth field without a chain of slow locator waits."""
     try:
@@ -638,7 +670,12 @@ def _focus_max_auth_input(page) -> bool:
             const semanticCode = fields.find(el => /one-time-code|otp|verification|verify|sms|(?:^|[ _-])code(?:$|[ _-])|код подтверждения|код проверки/.test(info(el)) && !/phone|телефон|номер/.test(info(el)));
             const phone = fields.find(el => el.type === 'tel' || /autocomplete=["']?tel|phone|телефон|номер/.test(info(el)));
             const password = fields.find(el => el.type === 'password' || /current-password|password|пароль/.test(info(el)));
-            const segmentedCode = fields.find(el => el.maxLength === 1 && !/phone|телефон|номер|search|поиск/.test(info(el)));
+            const segmentedCode = fields
+                .filter(el => el.maxLength === 1 && !/phone|телефон|номер|search|поиск/.test(info(el)))
+                .sort((a, b) => {
+                    const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+                    return Math.abs(ar.top - br.top) > 2 ? ar.top - br.top : ar.left - br.left;
+                })[0];
             const numericCode = codePrompt && fields.find(el => /numeric|one-time-code/.test(info(el)) && !/phone|телефон|номер/.test(info(el)));
             const target = semanticCode || (codePrompt || !phone ? segmentedCode : null) || phone || password || numericCode;
             if (!target) return false;
@@ -655,15 +692,7 @@ def _clear_max_auth_input(page) -> bool:
     if code_input:
         try:
             if str(code_input.get_attribute("maxlength") or "") == "1":
-                fields = page.locator("input[maxlength='1']")
-                visible_fields = []
-                for index in range(fields.count()):
-                    field = fields.nth(index)
-                    try:
-                        if field.is_visible(timeout=100):
-                            visible_fields.append(field)
-                    except Exception:
-                        continue
+                visible_fields = _visible_otp_cells(page, code_input)
                 if visible_fields:
                     for field in visible_fields:
                         field.fill("", timeout=700)
@@ -690,15 +719,7 @@ def _backspace_max_auth_input(page) -> bool:
     code_input = _get_login_code_input(page)
     try:
         if code_input and str(code_input.get_attribute("maxlength") or "") == "1":
-            fields = page.locator("input[maxlength='1']")
-            visible_fields = []
-            for index in range(fields.count()):
-                field = fields.nth(index)
-                try:
-                    if field.is_visible(timeout=100):
-                        visible_fields.append(field)
-                except Exception:
-                    continue
+            visible_fields = _visible_otp_cells(page, code_input)
             if visible_fields:
                 target = next(
                     (field for field in reversed(visible_fields) if field.input_value(timeout=200)),
@@ -725,99 +746,33 @@ def _backspace_max_auth_input(page) -> bool:
 
 def _fill_login_code(page, code_input, digits: str) -> bool:
     try:
+        if not re.fullmatch(r"\d{4,8}", digits or ""):
+            return False
+
         if str(code_input.get_attribute("maxlength") or "") == "1":
-            candidates = page.locator("input[maxlength='1']")
-            fields = []
-            for index in range(candidates.count()):
-                field = candidates.nth(index)
-                try:
-                    if field.is_visible(timeout=150):
-                        fields.append(field)
-                except Exception:
-                    continue
-            if len(fields) >= len(digits):
-                # Type the whole code through MAX's own OTP auto-advance logic
-                # first. Filling each React-controlled cell back-to-back can
-                # make MAX retain only the first digit.
-                for field in fields:
-                    field.fill("", timeout=700)
-                page.wait_for_timeout(35)
-                fields[0].focus(timeout=700)
-                page.keyboard.type(digits, delay=20)
-                page.wait_for_timeout(50)
-                try:
-                    values = [field.input_value(timeout=300) for field in fields]
-                except Exception:
-                    # MAX may submit automatically and remove the OTP cells as
-                    # soon as the last digit arrives.
-                    if _max_login_advanced_after_code(page, code_input):
-                        return True
-                    values = []
-                if "".join(values[:len(digits)]) == digits:
-                    return True
-
-                # Fallback for MAX layouts that do not advance focus while
-                # typing. Let the UI process each input event before the next.
-                for field, digit in zip(fields, digits):
-                    field.fill(digit, timeout=700)
+            # MAX can put OTP inputs in reverse DOM order. Sort by their actual
+            # position and keep only the row that contains the detected OTP.
+            cells = _visible_otp_cells(page, code_input)
+            if len(cells) >= len(digits):
+                cells = cells[:len(digits)]
+                for cell in cells:
+                    cell.fill("", timeout=700)
+                page.wait_for_timeout(40)
+                for cell, digit in zip(cells, digits):
+                    cell.fill(digit, timeout=700)
                     page.wait_for_timeout(35)
-                try:
-                    values = [field.input_value(timeout=300) for field in fields]
-                except Exception:
-                    if _max_login_advanced_after_code(page, code_input):
-                        return True
-                    values = []
-                if "".join(values[:len(digits)]) == digits:
-                    return True
-
-            if len(fields) < len(digits):
-                # MAX may expose only the active digit cell at a time. In that
-                # layout, give its real key handler time to advance focus.
-                try:
-                    code_input.fill("", timeout=700)
-                    code_input.focus(timeout=700)
-                    page.keyboard.type(digits, delay=110)
-                    page.wait_for_timeout(80)
-                    if _login_code_value_accepted(page, code_input, digits):
-                        return True
-                except Exception:
-                    pass
-
-            # Some MAX versions display six boxes but expose just one input
-            # with maxlength=1. A normal fill is truncated to its first digit.
-            # First send a paste event (many OTP widgets distribute it), then
-            # set the complete value and dispatch the input events MAX listens to.
-            try:
-                code_input.fill("", timeout=700)
-                code_input.evaluate("""(el, code) => {
-                    el.focus({preventScroll: true});
-                    const clipboard = new DataTransfer();
-                    clipboard.setData('text/plain', code);
-                    el.dispatchEvent(new ClipboardEvent('paste', {
-                        bubbles: true, cancelable: true, clipboardData: clipboard
-                    }));
-                }""", digits, timeout=700)
-                page.wait_for_timeout(50)
                 if _login_code_value_accepted(page, code_input, digits):
                     return True
-            except Exception:
-                pass
-            try:
-                code_input.evaluate("""(el, code) => {
-                    el.focus({preventScroll: true});
-                    const proto = el instanceof HTMLTextAreaElement
-                        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                    setter.call(el, code);
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText', data: code
-                    }));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                }""", digits, timeout=700)
-                page.wait_for_timeout(50)
-                return _login_code_value_accepted(page, code_input, digits)
-            except Exception:
+                if _max_login_advanced_after_code(page, code_input):
+                    return True
+
+            # If MAX exposes only one active cell, paste the code as one browser
+            # action. Typing characters one-by-one into maxlength=1 repeatedly
+            # replaces that cell, leaving only the last digit visible.
+            if not _paste_full_otp_code(page, code_input, digits):
                 return _max_login_advanced_after_code(page, code_input)
+            page.wait_for_timeout(100)
+            return _login_code_value_accepted(page, code_input, digits)
         code_input.fill(digits, timeout=5000)
         page.wait_for_timeout(35)
         return _login_code_value_accepted(page, code_input, digits)
@@ -825,16 +780,37 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
         return False
 
 
+def _paste_full_otp_code(page, code_input, digits: str) -> bool:
+    """Paste the entire OTP as one trusted browser paste action."""
+    origin = urlparse(page.url)
+    permission_origin = f"{origin.scheme}://{origin.netloc}" if origin.scheme and origin.netloc else None
+    try:
+        permissions = ["clipboard-write"]
+        if permission_origin:
+            page.context.grant_permissions(permissions, origin=permission_origin)
+        else:
+            page.context.grant_permissions(permissions)
+        page.evaluate("text => navigator.clipboard.writeText(text)", digits)
+        code_input.fill("", timeout=700)
+        code_input.focus(timeout=700)
+        page.keyboard.press("Meta+V" if sys.platform == "darwin" else "Control+V")
+        page.wait_for_timeout(80)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            page.evaluate("navigator.clipboard.writeText('')")
+        except Exception:
+            pass
+
+
 def _login_code_value_accepted(page, code_input, digits: str) -> bool:
     """Confirm all code digits reached the input, or MAX advanced from it."""
     try:
-        cells = page.locator("input[maxlength='1']")
-        cell_values = []
-        for index in range(cells.count()):
-            cell = cells.nth(index)
-            if cell.is_visible(timeout=100):
-                cell_values.append(re.sub(r"\D", "", cell.input_value(timeout=200)))
-        if len(cell_values) >= len(digits) and "".join(cell_values[:len(digits)]) == digits:
+        cells = _visible_otp_cells(page, code_input)
+        values = [re.sub(r"\D", "", cell.input_value(timeout=200)) for cell in cells]
+        if len(values) >= len(digits) and "".join(values[:len(digits)]) == digits:
             return True
     except Exception:
         pass

@@ -4396,7 +4396,7 @@ def parser_keyboard():
         _subscription_product_button_label("multi"), callback_data="connect_multi"
     ))
     keyboard.add(types.InlineKeyboardButton("ℹ️ Разница способов", callback_data="compare_modes"))
-    keyboard.add(types.InlineKeyboardButton("🤔 Не знаю, что выбрать", callback_data="method_choice_help"))
+    keyboard.add(types.InlineKeyboardButton("❔ Не знаю, что выбрать", callback_data="method_choice_help"))
     keyboard.add(types.InlineKeyboardButton("📖 Инструкция", callback_data="instruction"))
     keyboard.add(types.InlineKeyboardButton("🎬 Видео инструкция", callback_data="video_instruction"))
     keyboard.add(types.InlineKeyboardButton("🏠 В главное меню", callback_data="start_home"))
@@ -11175,7 +11175,7 @@ def callback_handler(call):
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=(
-                    "<b>Подключение MAX → Telegram</b>\n\n"
+                    "<b>Подключение MAX ↔ Telegram</b>\n\n"
                     "Выберите, какой аккаунт в мессенджере MAX будет пересылать сообщения.\n\n"
                     "<blockquote><b>1️⃣ Ваш аккаунт MAX\n</b>Бот будет пересылать сообщения из вашего аккаунта MAX в выбранную вами группу.</blockquote>\n"
                     "<blockquote><b>2️⃣ Через готовый аккаунт MAX\n</b>Здесь вам не понадобится подключать ваш аккаунт, вы уже используете подготовленный аккаунт MAX</blockquote>\n"
@@ -11217,21 +11217,11 @@ def callback_handler(call):
                 "🔙 К выбору способа", callback_data="parse_setup"
             ))
             bot.edit_message_text(
-                "<b>🤔 Какой способ подойдёт?</b>\n\n"
-                "<blockquote><b>1️⃣ Свой MAX-аккаунт</b> — выбирайте, если:\n"
-                "• вы уже состоите в группе, но добавить аккаунт проекта нельзя;\n"
-                "• закрытый чат не принимает новых участников и в него нельзя вступить по приглашению;\n"
-                "• личную переписку в MAX видите только вы.</blockquote>\n\n"
-                "<blockquote><b>2️⃣ Готовый аккаунт MAX_Parser</b> — выбирайте, если:\n"
-                f"• аккаунт проекта <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code> можно добавить в группу;\n"
-                "• канал открыт и аккаунту проекта доступны публикации;\n"
-                "• готовый аккаунт уже видит нужную личную переписку.\n"
-                "Для закрытой группы или канала отправьте ссылку-приглашение. Администратор проекта вручную попробует вступить. "
-                "Если MAX пришлёт заявку, владелец или администратор должен её одобрить. После вступления отправьте обычную ссылку на чат.</blockquote>\n\n"
-                "<blockquote><b>✨ Мульти-подписка</b> включает оба способа. Можно подключить свой аккаунт к личным и закрытым для добавления чатам, "
-                "а готовый — к группам и каналам, куда ему можно получить доступ.</blockquote>\n\n"
-                "<b>Простое правило:</b> если чат виден только вашему аккаунту — выбирайте свой. Если готовый аккаунт можно добавить, пригласить "
-                "или он уже видит источник — выбирайте готовый. Если ни один вариант не подходит, напишите в поддержку через /help.",
+                "<b>1️⃣ Свой MAX-аккаунт</b> — для личной переписки и закрытой группы/чата, "
+                "куда нельзя добавить или пригласить аккаунт MAX_Parser.\n\n"
+                "<b>2️⃣ Готовый аккаунт MAX_Parser</b> — для канала или группы/чата, "
+                "которые он уже видит или куда может вступить.\n\n"
+                "<b>Коротко:</b> выбирайте аккаунт, у которого есть доступ к нужному источнику.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=method_help_keyboard,
