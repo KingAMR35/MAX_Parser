@@ -1846,53 +1846,6 @@ def _process_posts(
     cycle_ids = set()
     for post in posts:
         source_id = str(post.get("source_id") or "").strip()
-        outbound_source_echo = bool(
-            source_id
-            and not post.get("source_id_is_index")
-            and _consume_max_outbound_echo(chat_id, f"source:{source_id}")
-        )
-        outbound_text_fingerprints = _max_outbound_post_fingerprints(post)
-        outbound_media_echo = False
-        for media_hash in _post_media_hashes(post):
-            if _consume_max_outbound_echo(chat_id, f"media:{media_hash}"):
-                outbound_media_echo = True
-        outbound_text_echo = any(
-            _consume_max_outbound_echo(chat_id, fingerprint)
-            for fingerprint in outbound_text_fingerprints
-        )
-        outbound_video_time_echo = False
-        if post.get("is_outgoing") and (
-            post.get("video_note_hint")
-            or any(
-                isinstance(item, dict)
-                and str(item.get("type") or "").casefold() in {"video", "video_note"}
-                for item in post.get("media_files", []) or []
-            )
-        ):
-            outbound_video_time_echo = _consume_max_outbound_echo(
-                chat_id, _outbound_video_time_fingerprint(post.get("time"))
-            )
-        outbound_kind_echo = False
-        if (
-            post.get("is_outgoing") or outbound_source_echo or outbound_text_echo
-            or outbound_media_echo or outbound_video_time_echo
-        ):
-            for media_kind in _max_outbound_post_media_kinds(post):
-                if _consume_max_outbound_kind_echo(chat_id, media_kind):
-                    outbound_kind_echo = True
-                    break
-        if outbound_source_echo or outbound_text_echo or outbound_media_echo or outbound_video_time_echo or outbound_kind_echo:
-            _commit_successful_post(chat_id, post)
-            _cleanup_post_media(post)
-            skipped_count += 1
-            diagnostic_posts.append(
-                _diagnostic_post(post, "skipped", "сообщение отправлено в MAX из админ-панели")
-            )
-            debug_logger.info(
-                "MAX_OUTBOUND_ECHO_SUPPRESSED chat_id=%s source_id=%s",
-                chat_id, source_id or "?",
-            )
-            continue
         if post.get("source_id_is_index"):
             cycle_key = get_message_hash(post)
         else:
@@ -2687,6 +2640,30 @@ def _build_qr_keyboard(target_chat_id):
     return kb
 
 
+def _build_phone_login_keyboard(target_chat_id, link):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🔐 Открыть MAX и войти", url=link))
+    kb.add(types.InlineKeyboardButton(
+        "🔄 Обновить страницу", callback_data=f"qr_refreshpage_{target_chat_id}"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        "🔙 Назад к QR-коду", callback_data=f"qr_back_{target_chat_id}"
+    ))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"qr_cancel_{target_chat_id}"))
+    return kb
+
+
+def _phone_login_message_text():
+    return (
+        "📱 <b>Вход в MAX по номеру</b>\n\n"
+        "Откройте защищённую страницу и проходите вход прямо в окне MAX: выберите вход по номеру, "
+        "введите номер, код и при необходимости пароль там же. Не отправляйте их боту.\n\n"
+        "Ссылка одноразовая и действует 10 минут. Не пересылайте её. После успешного входа браузер "
+        "закроется, а MAX-сессия сохранится на сервере. Сервер браузера обрабатывает ввод, "
+        "но бот не получает номер/код через Telegram и не записывает текст ввода."
+    )
+
+
 def _qr_target_from_action(action):
     raw_target = action.split("_", 2)[2]
     return "project_account" if raw_target == "project_account" else int(raw_target)
@@ -2705,6 +2682,14 @@ def _build_auth_check_keyboard(target_chat_id):
 
 
 def _auth_human_check_text(session, reason):
+    if reason == "device_password_setup":
+        return (
+            "⚠️ MAX не завершил вход: сначала нужно задать пароль для входа на устройстве, "
+            "где ваш аккаунт MAX уже открыт. В приложении MAX откройте «Настройки» → "
+            "«Безопасность» → «Пароль для входа» и задайте пароль. Затем вернитесь на защищённую "
+            "страницу, нажмите кнопку на экране MAX для повторной попытки и пройдите вход ещё раз. "
+            "Пока MAX не подтвердит вход, сессия не сохранится и парсинг не включится."
+        )
     if reason == "captcha":
         return (
             "🛡 MAX запросил дополнительную проверку безопасности. Проверьте приложение MAX, "
@@ -2791,6 +2776,7 @@ def _complete_login(target_chat_id, output_chat_id):
 def _monitor_remote_login(target_chat_id, session, output_chat_id):
     monitor_key = (str(target_chat_id), id(session))
     deadline = time.monotonic() + SESSION_TTL_SECONDS
+    device_password_notice_sent = False
     try:
         while time.monotonic() < deadline:
             if active_logins.get(target_chat_id) is not session:
@@ -2826,6 +2812,24 @@ def _monitor_remote_login(target_chat_id, session, output_chat_id):
                     target_chat_id, type(data).__name__,
                 )
                 return
+            if (
+                status == "awaiting_human"
+                and data == "device_password_setup"
+                and not device_password_notice_sent
+            ):
+                device_password_notice_sent = True
+                try:
+                    bot.send_message(
+                        output_chat_id,
+                        _auth_human_check_text(session, data),
+                        reply_markup=_build_auth_check_keyboard(target_chat_id),
+                        **NO_PREVIEW,
+                    )
+                except Exception as error:
+                    debug_logger.warning(
+                        "REMOTE_MAX_PASSWORD_SETUP_NOTICE_FAILED target=%s error_type=%s",
+                        target_chat_id, type(error).__name__,
+                    )
             time.sleep(1.5)
         if active_logins.get(target_chat_id) is session:
             active_logins.pop(target_chat_id, None)
@@ -6276,7 +6280,7 @@ def _receive_admin_max_body(message, source_chat_id, nonce):
     chat = get_chat_by_id(source_chat_id) or {}
     body_preview = escape_html(value) if value else f"<i>{escape_html(flow['payload_label'])}</i>"
     sender_preview = (
-        f"<b>{escape_html(flow['sender_name'])}</b> пишет\n\n"
+        f"<b>{escape_html(flow['sender_name'])}</b> пишет:\n\n"
         if str(flow.get("sender_name") or "").strip()
         else ""
     )
@@ -6311,7 +6315,7 @@ def _send_max_payload_with_sender(
     """Send sender attribution and message text together with any attachment."""
     body = str(body or "").strip()
     sender_name = str(sender_name or "").strip()
-    header = f"{sender_name} пишет" if sender_name else ""
+    header = f"{sender_name} пишет:" if sender_name else ""
     common = {
         "group_url": group_url,
         "chat_id": int(chat_id),
@@ -6385,54 +6389,6 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             if len(media) == 1:
                 media = media[0]
         source_lock = max_send_source_locks.setdefault(int(source_chat_id), threading.Lock())
-        header_text = f"{name} пишет" if name else ""
-        message_text = f"{header_text}\n\n{body}".strip() if header_text else body
-        fingerprints = {
-            value for value in (
-                _max_outbound_fingerprint(message_text),
-                _max_outbound_fingerprint(header_text),
-                _max_outbound_fingerprint(body),
-                _max_outbound_fingerprint(name),
-            ) if value
-        }
-        media_items_for_hash = media if isinstance(media, list) else ([media] if media else [])
-        for item in media_items_for_hash:
-            raw_bytes = item.get("bytes") if isinstance(item, dict) else None
-            if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
-                fingerprints.add(f"media:{get_media_hash(data=raw_bytes)}")
-
-        def remember_outbound_echo(normalized_media_hashes=None):
-            for media_hash in normalized_media_hashes or []:
-                fingerprints.add(f"media:{media_hash}")
-            affected_chat_ids = {int(source_chat_id)}
-            for candidate in get_all_chats():
-                if candidate.get("max_url") == chat.get("max_url"):
-                    affected_chat_ids.add(int(candidate["chat_id"]))
-            for affected_chat_id in affected_chat_ids:
-                for fingerprint in fingerprints:
-                    _remember_max_outbound_echo(affected_chat_id, fingerprint)
-            _remember_max_outbound_kind_echoes(affected_chat_ids, media)
-
-        def remember_outbound_source(source_id, row=None):
-            source_id = str(source_id or "").strip()
-            row = row if isinstance(row, dict) else {}
-            video_time_key = (
-                _outbound_video_time_fingerprint(row.get("time"))
-                if str(row.get("media_kind") or "").casefold() == "video"
-                else ""
-            )
-            if not source_id and not video_time_key:
-                return
-            affected_chat_ids = {int(source_chat_id)}
-            for candidate in get_all_chats():
-                if candidate.get("max_url") == chat.get("max_url"):
-                    affected_chat_ids.add(int(candidate["chat_id"]))
-            for affected_chat_id in affected_chat_ids:
-                if source_id:
-                    _remember_max_outbound_echo(affected_chat_id, f"source:{source_id}")
-                if video_time_key:
-                    _remember_max_outbound_echo(affected_chat_id, video_time_key)
-
         with source_lock:
             _send_max_payload_with_sender(
                 group_url=chat["max_url"],
@@ -6441,8 +6397,6 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 media=media,
                 chat_id=int(source_chat_id),
                 session_path=_session_path_for_chat(chat),
-                on_before_send=remember_outbound_echo,
-                on_send_confirmed=remember_outbound_source,
                 source_type_callback=lambda detected: _update_detected_source_type(
                     source_chat_id, detected
                 ),
@@ -6887,13 +6841,7 @@ def _start_public_max_send(call, source_chat_id, allowed_private_user_id=None):
         )
         return
     if getattr(call, "id", None):
-        _answer_public_max_send_action(call, "Продолжите в личном чате с ботом.")
-    else:
-        bot.send_message(
-            destination_chat_id,
-            "✉️ Продолжите отправку в личном чате с MAX_Parser.",
-            **NO_PREVIEW,
-        )
+        _answer_public_max_send_action(call, "Откройте личный чат с ботом для продолжения.")
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if current and current.get("nonce") == nonce:
@@ -7145,7 +7093,7 @@ def _public_max_preview_text(flow):
     description = body[:1800] if body else f"<i>{label}</i>"
     if len(body) > 1800:
         description += "…"
-    sender_line = f"<b>{name}</b> пишет\n\n" if name else ""
+    sender_line = f"<b>{name}</b> пишет:\n\n" if name else ""
     return f"Проверьте сообщение для MAX:\n\n{sender_line}{description}"
 
 
@@ -7264,8 +7212,6 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
         body = str(flow.get("body") or "").strip()
         name = str(flow.get("sender_name") or "").strip()
-        header_text = f"{name} пишет" if name else ""
-        message_text = f"{header_text}\n\n{body}".strip() if header_text else body
         media = flow.get("media") or None
         if media:
             media_items = media if isinstance(media, list) else [media]
@@ -7287,52 +7233,6 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             if len(media) == 1:
                 media = media[0]
 
-        fingerprints = {
-            value for value in (
-                _max_outbound_fingerprint(message_text),
-                _max_outbound_fingerprint(header_text),
-                _max_outbound_fingerprint(body),
-                _max_outbound_fingerprint(name),
-            ) if value
-        }
-        media_items_for_hash = media if isinstance(media, list) else ([media] if media else [])
-        for item in media_items_for_hash:
-            raw_bytes = item.get("bytes") if isinstance(item, dict) else None
-            if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
-                fingerprints.add(f"media:{get_media_hash(data=raw_bytes)}")
-
-        def remember_outbound_echo(normalized_media_hashes=None):
-            for media_hash in normalized_media_hashes or []:
-                fingerprints.add(f"media:{media_hash}")
-            affected_chat_ids = {int(source_chat_id)}
-            for candidate in get_all_chats():
-                if candidate.get("max_url") == chat.get("max_url"):
-                    affected_chat_ids.add(int(candidate["chat_id"]))
-            for affected_chat_id in affected_chat_ids:
-                for fingerprint in fingerprints:
-                    _remember_max_outbound_echo(affected_chat_id, fingerprint)
-            _remember_max_outbound_kind_echoes(affected_chat_ids, media)
-
-        def remember_outbound_source(source_id, row=None):
-            source_id = str(source_id or "").strip()
-            row = row if isinstance(row, dict) else {}
-            video_time_key = (
-                _outbound_video_time_fingerprint(row.get("time"))
-                if str(row.get("media_kind") or "").casefold() == "video"
-                else ""
-            )
-            if not source_id and not video_time_key:
-                return
-            affected_chat_ids = {int(source_chat_id)}
-            for candidate in get_all_chats():
-                if candidate.get("max_url") == chat.get("max_url"):
-                    affected_chat_ids.add(int(candidate["chat_id"]))
-            for affected_chat_id in affected_chat_ids:
-                if source_id:
-                    _remember_max_outbound_echo(affected_chat_id, f"source:{source_id}")
-                if video_time_key:
-                    _remember_max_outbound_echo(affected_chat_id, video_time_key)
-
         source_lock = max_send_source_locks.setdefault(source_chat_id, threading.Lock())
         with source_lock:
             _send_max_payload_with_sender(
@@ -7342,8 +7242,6 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 media=media,
                 chat_id=source_chat_id,
                 session_path=_session_path_for_chat(chat),
-                on_before_send=remember_outbound_echo,
-                on_send_confirmed=remember_outbound_source,
                 source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
             )
         result_text = "✅ Сообщение отправлено в MAX."
@@ -10196,7 +10094,75 @@ def admin_callbacks(call):
             except Exception:
                 pass
         return
-    if action.startswith("qr_phone_"):
+    if action.startswith("qr_refreshpage_"):
+        target_id = _qr_target_from_action(action)
+        session = active_logins.get(target_id)
+        if not session:
+            bot.answer_callback_query(call.id, "Сессия авторизации не найдена", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "🔄 Обновляю страницу MAX…")
+        remote_auth_service.revoke_session(session)
+        try:
+            session.remote_action("refresh", timeout=20)
+        except Exception as error:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Не удалось обновить страницу MAX. Попробуйте нажать кнопку ещё раз.",
+                **NO_PREVIEW,
+            )
+            debug_logger.warning(
+                "REMOTE_AUTH_PAGE_REFRESH_FAILED target=%s error_type=%s",
+                target_id, type(error).__name__,
+            )
+            return
+        if active_logins.get(target_id) is not session:
+            return
+        try:
+            link, _record = remote_auth_service.create_link(
+                session, target_id, call.from_user.id, call.message.chat.id
+            )
+        except RuntimeError as error:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Не удалось обновить ссылку на страницу входа. Попробуйте позже.",
+                **NO_PREVIEW,
+            )
+            debug_logger.warning(
+                "REMOTE_AUTH_LINK_REFRESH_FAILED target=%s error_type=%s",
+                target_id, type(error).__name__,
+            )
+            return
+        try:
+            bot.edit_message_text(
+                _phone_login_message_text(),
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=_build_phone_login_keyboard(target_id, link),
+                **NO_PREVIEW,
+            )
+            _track_auth_message(target_id, call.message)
+        except Exception as error:
+            debug_logger.warning(
+                "REMOTE_AUTH_LINK_REFRESH_MESSAGE_FAILED target=%s error_type=%s",
+                target_id, type(error).__name__,
+            )
+    elif action.startswith("qr_back_"):
+        target_id = _qr_target_from_action(action)
+        session = active_logins.get(target_id)
+        if not session:
+            bot.answer_callback_query(call.id, "Сессия авторизации не найдена", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Возвращаю QR-код…")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        # Start a fresh QR session instead of reusing a partially completed
+        # phone-login page; this also invalidates its one-time browser link.
+        do_qr_login(target_id, call.message.chat.id)
+        return
+    elif action.startswith("qr_phone_"):
         target_id = _qr_target_from_action(action)
         session = active_logins.get(target_id)
         if not session:
@@ -10227,18 +10193,11 @@ def admin_callbacks(call):
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=cancel_keyboard)
         except Exception:
             pass
-        link_keyboard = types.InlineKeyboardMarkup(row_width=1)
-        link_keyboard.add(types.InlineKeyboardButton("🔐 Открыть MAX и войти", url=link))
         link_message = bot.send_message(
             call.message.chat.id,
-            "📱 <b>Вход в MAX по номеру</b>\n\n"
-            "Откройте защищённую страницу и проходите вход прямо в окне MAX: выберите вход по номеру, "
-            "введите номер, код и при необходимости пароль там же. Не отправляйте их боту.\n\n"
-            "Ссылка одноразовая и действует 10 минут. Не пересылайте её. После успешного входа браузер "
-            "закроется, а MAX-сессия сохранится на сервере. Сервер браузера обрабатывает ввод, "
-            "но бот не получает номер/код через Telegram и не записывает текст ввода.",
+            _phone_login_message_text(),
             parse_mode="HTML",
-            reply_markup=link_keyboard,
+            reply_markup=_build_phone_login_keyboard(target_id, link),
             **NO_PREVIEW,
         )
         _track_auth_message(target_id, link_message)
@@ -11478,7 +11437,6 @@ if __name__ == "__main__":
                 print("⚠️ Сервис входа по номеру не запустился; QR-вход остаётся доступен")
         else:
             print("ℹ️ Вход по номеру ждёт REMOTE_AUTH_BASE_URL с HTTPS-доменом; QR-вход доступен")
-        _load_max_outbound_suppressions()
         _cleanup_legacy_max_send_buttons()
         threading.Thread(target=background_parser, daemon=True).start()
         if PAYMENTS_ENABLED:

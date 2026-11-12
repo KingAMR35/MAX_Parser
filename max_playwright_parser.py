@@ -271,6 +271,28 @@ def _order_max_messages(messages: list[dict]) -> list[dict]:
 #! 1. QR-АВТОРИЗАЦИЯ
 #! ==========================================
 
+def _needs_device_password_setup(page) -> bool:
+    """MAX can reject a new device until a sign-in password is set on a trusted device."""
+    try:
+        body_text = page.locator("body").inner_text(timeout=500).casefold()
+    except Exception:
+        return False
+    markers = (
+        "set a password on the device",
+        "you've signed in to max on",
+        "then you'll be able to sign in here",
+        "set sign-in password",
+        "set a sign-in password",
+        "установите пароль на устройстве",
+        "задайте пароль на устройстве",
+        "задать пароль на устройстве",
+        "сначала установите пароль",
+        "затем вы сможете войти здесь",
+        "пароль для входа на устройстве",
+    )
+    return any(marker in body_text for marker in markers)
+
+
 def _is_logged_in(page) -> bool:
     try:
         page_content = page.content()
@@ -279,6 +301,11 @@ def _is_logged_in(page) -> bool:
         current_url = page.url.lower()
         current_path = urlparse(current_url).path.lower()
         if re.search(r"/(?:auth|login|signin|sign-in)(?:/|$)", current_path):
+            return False
+
+        # MAX may accept the one-time code but still block this browser until
+        # the account owner sets a sign-in password on a trusted device.
+        if _needs_device_password_setup(page):
             return False
 
         # Never treat an unfinished challenge as a successful login. MAX may
@@ -737,7 +764,9 @@ class QRLoginSession:
             raise RuntimeError("Браузер авторизации уже закрыт")
         args = args if isinstance(args, dict) else {}
         if action == "screenshot":
-            return self.page.screenshot(full_page=False, animations="disabled")
+            return self.page.screenshot(
+                full_page=False, type="jpeg", quality=68, animations="disabled"
+            )
         if action == "click":
             x, y = int(args.get("x", -1)), int(args.get("y", -1))
             if not (0 <= x < 1280 and 0 <= y < 800):
@@ -826,7 +855,7 @@ class QRLoginSession:
             self.page.mouse.wheel(0, delta_y)
             return True
         if action == "refresh":
-            self.page.reload(wait_until="domcontentloaded", timeout=20000)
+            self.page.reload(wait_until="domcontentloaded", timeout=12000)
             self.page.wait_for_timeout(1500)
             return True
         raise ValueError("Неизвестное действие")
@@ -854,6 +883,10 @@ class QRLoginSession:
         self.context = self.browser.new_context(
             viewport={'width': 1280, 'height': 800},
             timezone_id=MAX_TIMEZONE_ID,
+            locale="ru-RU",
+            extra_http_headers={
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+            },
         )
         self.page = self.context.new_page()
         self.page.goto("https://web.max.ru", timeout=30000)
@@ -917,6 +950,10 @@ class QRLoginSession:
                     self.status = "awaiting_human"
                     self.result_queue.put(("awaiting_human", "captcha"))
                     return
+                if _needs_device_password_setup(self.page):
+                    self.status = "awaiting_human"
+                    self.result_queue.put(("awaiting_human", "device_password_setup"))
+                    return
                 if _get_password_input(self.page):
                     self.status = "awaiting_password"
                     self.result_queue.put(("awaiting_password", None))
@@ -973,6 +1010,10 @@ class QRLoginSession:
                     self.status = "awaiting_human"
                     self.result_queue.put(("awaiting_human", "captcha"))
                     return
+                if _needs_device_password_setup(self.page):
+                    self.status = "awaiting_human"
+                    self.result_queue.put(("awaiting_human", "device_password_setup"))
+                    return
                 if _get_password_input(self.page):
                     self.status = "awaiting_password"
                     self.screenshot_bytes = self.page.screenshot(full_page=True)
@@ -1002,11 +1043,16 @@ class QRLoginSession:
             self.result_queue.put(("error", f"Не удалось подтвердить код в MAX: {str(e)[:200]}"))
 
     def _do_refresh(self):
-        if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code"):
+        if self.status not in ("waiting", "awaiting_password", "awaiting_phone", "awaiting_code", "awaiting_human"):
             self.result_queue.put(("error", "Сессия не активна"))
             return
         self.page.reload()
         self.page.wait_for_timeout(4000)
+        if _needs_device_password_setup(self.page):
+            self.status = "awaiting_human"
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("awaiting_human", "device_password_setup"))
+            return
         if not _has_auth_captcha(self.page) and _is_logged_in(self.page):
             self.context.storage_state(path=self.session_file)
             self._do_close()
@@ -1024,6 +1070,12 @@ class QRLoginSession:
             self._logged_in_confirmation_count = 0
             self.status = "awaiting_human"
             self.result_queue.put(("awaiting_human", "captcha"))
+            return
+        if _needs_device_password_setup(self.page):
+            self._logged_in_confirmation_count = 0
+            self.status = "awaiting_human"
+            self.screenshot_bytes = self.page.screenshot(full_page=True)
+            self.result_queue.put(("awaiting_human", "device_password_setup"))
             return
         password_input = _get_password_input(self.page)
         if password_input:
@@ -1080,6 +1132,10 @@ class QRLoginSession:
                 if _has_auth_captcha(self.page):
                     self.status = "awaiting_human"
                     self.result_queue.put(("awaiting_human", "captcha"))
+                    return
+                if _needs_device_password_setup(self.page):
+                    self.status = "awaiting_human"
+                    self.result_queue.put(("awaiting_human", "device_password_setup"))
                     return
                 if _get_login_code_input(self.page):
                     self.status = "awaiting_code"
