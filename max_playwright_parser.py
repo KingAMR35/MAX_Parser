@@ -711,21 +711,56 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 if "".join(values[:len(digits)]) == digits:
                     return True
 
-            # Some MAX versions expose one semantic OTP field with maxlength
-            # metadata. Try putting the complete value there before failing.
-            code_input.fill(digits, timeout=1500)
-            page.wait_for_timeout(35)
+            # Some MAX versions display six boxes but expose just one input
+            # with maxlength=1. A normal fill is truncated to its first digit.
+            # First send a paste event (many OTP widgets distribute it), then
+            # set the complete value and dispatch the input events MAX listens to.
             try:
-                return code_input.input_value(timeout=300) == digits
+                code_input.evaluate("""(el, code) => {
+                    el.focus({preventScroll: true});
+                    const clipboard = new DataTransfer();
+                    clipboard.setData('text/plain', code);
+                    el.dispatchEvent(new ClipboardEvent('paste', {
+                        bubbles: true, cancelable: true, clipboardData: clipboard
+                    }));
+                }""", digits, timeout=700)
+                page.wait_for_timeout(50)
+                if _login_code_value_accepted(page, code_input, digits):
+                    return True
+            except Exception:
+                pass
+            try:
+                code_input.evaluate("""(el, code) => {
+                    el.focus({preventScroll: true});
+                    const proto = el instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                    setter.call(el, code);
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertText', data: code
+                    }));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }""", digits, timeout=700)
+                page.wait_for_timeout(50)
+                return _login_code_value_accepted(page, code_input, digits)
             except Exception:
                 return not _get_login_code_input(page)
         code_input.fill(digits, timeout=5000)
-        try:
-            return code_input.input_value(timeout=500) == digits
-        except Exception:
-            return not _get_login_code_input(page)
+        page.wait_for_timeout(35)
+        return _login_code_value_accepted(page, code_input, digits)
     except Exception:
         return False
+
+
+def _login_code_value_accepted(page, code_input, digits: str) -> bool:
+    """Confirm all code digits reached the input, or MAX advanced from it."""
+    try:
+        value = re.sub(r"\D", "", code_input.input_value(timeout=300))
+        if value == digits:
+            return True
+    except Exception:
+        pass
+    return not _get_login_code_input(page)
 
 
 def _click_phone_login_option(page):
