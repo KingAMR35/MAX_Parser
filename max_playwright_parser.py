@@ -521,24 +521,35 @@ def _get_login_code_input(page):
         except Exception:
             continue
 
-    # Do not mistake a generic/numeric phone field for the code form. MAX must
-    # have removed the phone input and shown explicit code-step text first.
-    if _get_phone_input(page):
+    if not code_prompt_visible:
         return None
-    if code_prompt_visible:
-        selectors = [
-            "input[inputmode='numeric']",
-            "input[maxlength='1']",
-            "input[type='text']",
-            "[role='textbox']",
-            "[contenteditable='true']",
-        ]
-    else:
-        selectors = []
+    # Some MAX screens keep the phone field in the DOM after switching to the
+    # SMS step. Search the explicit code-step inputs anyway, while excluding
+    # the phone/search controls themselves.
+    selectors = [
+        "input[inputmode='numeric']",
+        "input[maxlength='1']",
+        "input[type='text']",
+        "[role='textbox']",
+        "[contenteditable='true']",
+    ]
     for selector in selectors:
         try:
             element = page.locator(selector).first
             if not element.is_visible(timeout=150):
+                continue
+            hints = " ".join(
+                str(element.get_attribute(attribute) or "")
+                for attribute in (
+                    "type", "name", "placeholder", "aria-label",
+                    "autocomplete", "inputmode", "data-testid",
+                )
+            )
+            if re.search(r"phone|телефон|номер", hints, re.I):
+                continue
+            if re.search(r"search|поиск", hints, re.I) and not re.search(
+                r"otp|verification|code|код|one-time", hints, re.I
+            ):
                 continue
             return element
         except Exception:
@@ -666,12 +677,53 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 except Exception:
                     continue
             if len(fields) >= len(digits):
+                # Type the whole code through MAX's own OTP auto-advance logic
+                # first. Filling each React-controlled cell back-to-back can
+                # make MAX retain only the first digit.
+                for field in fields:
+                    field.fill("", timeout=700)
+                page.wait_for_timeout(35)
+                fields[0].focus(timeout=700)
+                page.keyboard.type(digits, delay=20)
+                page.wait_for_timeout(50)
+                try:
+                    values = [field.input_value(timeout=300) for field in fields]
+                except Exception:
+                    # MAX may submit automatically and remove the OTP cells as
+                    # soon as the last digit arrives.
+                    if not _get_login_code_input(page):
+                        return True
+                    values = []
+                if "".join(values[:len(digits)]) == digits:
+                    return True
+
+                # Fallback for MAX layouts that do not advance focus while
+                # typing. Let the UI process each input event before the next.
                 for field, digit in zip(fields, digits):
-                    field.fill(digit, timeout=1500)
-                return True
-            return False
+                    field.fill(digit, timeout=700)
+                    page.wait_for_timeout(35)
+                try:
+                    values = [field.input_value(timeout=300) for field in fields]
+                except Exception:
+                    if not _get_login_code_input(page):
+                        return True
+                    values = []
+                if "".join(values[:len(digits)]) == digits:
+                    return True
+
+            # Some MAX versions expose one semantic OTP field with maxlength
+            # metadata. Try putting the complete value there before failing.
+            code_input.fill(digits, timeout=1500)
+            page.wait_for_timeout(35)
+            try:
+                return code_input.input_value(timeout=300) == digits
+            except Exception:
+                return not _get_login_code_input(page)
         code_input.fill(digits, timeout=5000)
-        return True
+        try:
+            return code_input.input_value(timeout=500) == digits
+        except Exception:
+            return not _get_login_code_input(page)
     except Exception:
         return False
 

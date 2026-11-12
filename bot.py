@@ -5225,7 +5225,7 @@ def on_bot_added_to_chat(message):
                     bot.send_message(
                         chat_id,
                         "👋 <b>Привет!</b>\n\n"
-                        "Я — <b>MAX Parser Bot</b>. Меня добавили в этот чат.\n\n"
+                        "Я — <b>MAX_Parser</b>. Меня добавили в этот чат.\n\n"
                         "Эту группу можно выбрать как место получения сообщений MAX.\n"
                         "В личном чате со мной отправьте /connect, выберите способ подключения, "
                         "а затем напишите здесь /bind.\n\n"
@@ -5236,7 +5236,7 @@ def on_bot_added_to_chat(message):
                     bot.send_message(
                         chat_id,
                         "👋 <b>Привет!</b>\n\n"
-                        "Я — <b>MAX Parser Bot</b>. Меня добавили в этот чат.\n\n"
+                        "Я — <b>MAX_Parser</b>. Меня добавили в этот чат.\n\n"
                         "Группу можно выбрать как место получения сообщений MAX.\n"
                         "В личном чате со мной отправьте /connect, выберите способ подключения, "
                         "а затем напишите здесь /bind.",
@@ -5389,7 +5389,7 @@ def start_bot(message):
             bot.send_message(
                 message.chat.id,
                 f"✉️ Напишите ответ администраторам по группе «{group_name}».\n\n"
-                "Сообщение увидят администраторы MAX_Parser. Ответ можно отправить текстом или вложением.",
+                "Сообщение увидят администраторы <b>MAX_Parser</b>. Ответ можно отправить текстом или вложением.",
                 reply_markup=keyboard,
                 **NO_PREVIEW,
             )
@@ -5398,7 +5398,7 @@ def start_bot(message):
         "👋 <b>Привет!</b>\n\n"
         "Меня зовут <b>MAX_Parser</b>.\n\n"
         "Я помогаю автоматически пересылать сообщения из выбранной группы "
-        "мессенджера MAX в Telegram.\n\n"
+        "<b>мессенджера MAX в Telegram</b> , а также <b>из Telegram в MAX</b>.\n\n"
         "📌 <b>Для чего я нужен</b>\n"
         "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
         "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
@@ -5997,7 +5997,7 @@ def _project_source_type_keyboard(chat_id):
         callback_data=f"project_source_group_{chat_id}",
     ))
     keyboard.add(types.InlineKeyboardButton(
-        "👤 ЛС · личный чат",
+        "👤 ЛС - личный чат",
         callback_data=f"project_source_private_{chat_id}",
     ))
     keyboard.add(_setup_cancel_button(chat_id))
@@ -6026,7 +6026,7 @@ def _customer_source_type_keyboard(chat_id):
         "👥 Группа или чат", callback_data=f"customer_source_group_{int(chat_id)}"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        "👤 ЛС · личный чат", callback_data=f"customer_source_private_{int(chat_id)}"
+        "👤 ЛС - личный чат", callback_data=f"customer_source_private_{int(chat_id)}"
     ))
     keyboard.add(_setup_cancel_button(chat_id))
     return keyboard
@@ -11433,7 +11433,7 @@ def callback_handler(call):
                     "в Telegram-группу, куда должны приходить сообщения. После появления бота отправьте в группе /bind. "
                     "Если бот уже добавлен, то просто напишите /bind. Боту нужно разрешить отправлять сообщения.\n\n"
                     "<b>Шаг 2 · Выберите чат MAX</b>\n"
-                    "Во втором способе нажмите «Канал» или «Группа или чат». Затем откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
+                    "Во втором способе нажмите «Канал», «ЛС - личный чат» или «Группа или чат». Затем откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
                     "перейдите к чату и скопируйте ссылку из меню.\n\n"
                     "<b>Вариант 1 · Ваш аккаунт MAX</b>\n"
                     "<blockquote><b>Через QR-код:</b>\n\nПосле отправки ссылки бот пришлёт QR-код. Отсканируйте его в приложении MAX и нажмите "
