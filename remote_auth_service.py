@@ -33,11 +33,17 @@ h1{font-size:22px;margin:0 0 6px}
 .inputCard label{display:block;font-weight:750;font-size:15px;margin-bottom:7px;color:#fff}
 .inputHint{font-size:12px;color:#b9c9e4;margin-top:7px}
 .inputRow{display:flex;gap:8px;align-items:stretch}
+.editActions{display:flex;gap:8px;margin-top:8px}
+.editActions button{flex:1;background:#40526d}
 #keyboard{display:block;flex:1;min-width:0;width:100%;height:58px;border:2px solid #7895bd;border-radius:10px;background:#0e1726;color:#fff;padding:12px;font:18px system-ui,sans-serif;resize:vertical}
 #keyboard::placeholder{color:#aab8ce}
 button{border:0;border-radius:10px;background:#3275d9;color:white;padding:11px 14px;font-weight:700;font-size:15px;touch-action:manipulation;cursor:pointer}
 button:disabled{opacity:.6}
 #sendButton{min-width:142px;min-height:58px;background:#16845a}
+.guide{background:#172235;border:1px solid #394a65;border-radius:12px;padding:10px 12px;margin:10px 0;color:#dce6f7}
+.guide summary{font-weight:700;cursor:pointer}
+.guide ol{margin:8px 0 0;padding-left:22px}
+.guide li{margin:6px 0}
 .toolbar{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}
 .toolbar button{background:#34435b}
 #screenTip{color:#e2eafe;font-weight:650;margin:8px 0}
@@ -51,6 +57,7 @@ main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
 .inputCard{padding:10px;margin:8px 0}.inputCard label{font-size:14px}
 .inputRow{gap:6px}#keyboard{height:56px;padding:10px;font-size:17px}
 #sendButton{min-width:108px;padding:9px;font-size:14px}
+.editActions{gap:6px}.editActions button{padding:10px 8px;font-size:13px}
 .toolbar{gap:6px}.toolbar button{padding:9px 10px;font-size:13px}
 #screenFrame{max-height:50dvh}#screen{max-height:50dvh}
 .warning{padding:10px;font-size:12px}
@@ -58,38 +65,56 @@ main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
 </style></head>
 <body><main>
 <h1>🔐 Вход в MAX по номеру телефона</h1>
-<p class="notice">Сначала нажмите на экране MAX «Войти по номеру телефона». Номер, код и пароль вводите только в MAX: через заметное поле выше или нажимая прямо на экран.</p>
+<p class="notice">Сначала выберите на экране MAX «Войти по номеру телефона». Поле ввода MAX активируется само — нажимать на него не нужно. Введите номер из 10 цифр, начиная с 9, без +7 и 8; затем нажимайте кнопки MAX.</p>
 <section class="inputCard">
-<label for="keyboard">⌨️ Введите сюда номер, код или пароль</label>
+<label for="keyboard">⌨️ Номер, код или пароль (номер — без +7 и 8)</label>
 <div class="inputRow">
-<textarea id="keyboard" rows="1" maxlength="256" placeholder="Например: +7 912 345-67-89" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Текст для ввода в MAX"></textarea>
+<textarea id="keyboard" rows="1" maxlength="256" placeholder="Например: 9123456789" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Текст для ввода в MAX"></textarea>
 <button id="sendButton" type="button">📨 Ввести в MAX</button>
 </div>
-<div class="inputHint">Текст сначала появится в этом поле. Нажмите зелёную кнопку, чтобы передать его в выбранное поле на экране MAX. Перед отправкой черновик можно исправить.</div>
+<div class="editActions">
+<button id="backspaceButton" type="button" title="Удалить последний символ в поле MAX">⌫ Стереть символ</button>
+<button id="clearButton" type="button" title="Очистить активное поле MAX">🧹 Очистить поле MAX</button>
+</div>
+<div class="inputHint">Сначала текст можно исправить здесь. Нажмите зелёную кнопку — он попадёт в уже выбранное поле MAX. Если ошиблись после ввода в MAX, используйте кнопки удаления ниже.</div>
 </section>
 <div class="toolbar">
 <button id="refreshButton" type="button">🔄 Обновить экран</button>
 <button id="reloadButton" type="button">↻ Перезагрузить MAX</button>
 <button id="zoomButton" type="button">🔍 Увеличить экран</button>
 </div>
-<p id="screenTip">👆 Экран MAX кликабельный: нажимайте на поля, ссылки и кнопки прямо на изображении.</p>
+<p id="screenTip">👆 Нажимайте на кнопки и ссылки MAX прямо на экране. Поле телефона, кода или пароля выбирается автоматически.</p>
 <div id="screenFrame"><img id="screen" alt="Интерактивный экран входа MAX"></div>
 <div id="state">Подключаем защищённую сессию…</div>
+<details class="guide">
+<summary>📘 Подробная инструкция по входу</summary>
+<ol>
+<li>На экране MAX нажмите «Войти по номеру телефона». Нажимайте на синюю кнопку или ссылку на самом экране — вводить данные туда вручную не нужно.</li>
+<li>Когда появится поле телефона, оно выберется автоматически. Введите 10 цифр номера, начиная с 9. Не добавляйте +7 или 8. Затем нажмите на экране MAX кнопку «Продолжить».</li>
+<li>Если MAX попросит подтвердить, что вы человек, отметьте нужный пункт на экране. Если проверка не помещается, прокрутите именно область с экраном или нажмите «Увеличить экран».</li>
+<li>Введите код, который прислал MAX. Удобнее набрать его в поле сверху и нажать «Ввести в MAX». Поле кода также выбирается автоматически.</li>
+<li>Если MAX запросит пароль, введите пароль входа. Если вместо этого MAX просит сначала установить пароль на устройстве, где аккаунт уже открыт, откройте в приложении MAX «Настройки» → «Безопасность» → «Пароль для входа» и задайте его.</li>
+<li>После установки пароля вернитесь на эту страницу и нажмите на экране MAX кнопку «Попробовать войти снова». Если надпись будет на английском, ищите «Try signing in again». Кнопку нажимайте на изображении MAX, не в сообщении Telegram.</li>
+<li>Оставьте страницу открытой, пока MAX не завершит вход. Бот сообщит об успехе только после подтверждения авторизации.</li>
+</ol>
+</details>
 <div class="warning">Одноразовая ссылка действует 10 минут. Не пересылайте её. Страница и удалённый браузер обрабатывают введённые данные; сервис не записывает текст в базу и не пересылает его в Telegram. MAX-сессия сохраняется только после подтверждённого входа.</div>
 </main><script>
 const screen=document.getElementById("screen"),screenFrame=document.getElementById("screenFrame"),box=document.getElementById("keyboard"),state=document.getElementById("state"),sendButton=document.getElementById("sendButton"),zoomButton=document.getElementById("zoomButton");
 let stopped=false,ready=false,previousImageUrl=null;
-let actionQueue=Promise.resolve(),pendingActions=0,sendingDraft=false;
-function httpError(prefix,status){const reasons={400:"поле MAX не найдено; нажмите на поле ввода телефона или кода",401:"сессия авторизации не найдена",403:"сервер отклонил запрос страницы",404:"маршрут API не найден",410:"удалённая сессия завершена",500:"ошибка удалённого браузера",504:"удалённый браузер не ответил вовремя"};return prefix+": "+(reasons[status]||"ошибка сервера")+" (HTTP "+status+")";}
+let actionQueue=Promise.resolve(),pendingActions=0,sendingDraft=false,snapshotInFlight=false,snapshotQueued=false;
+function httpError(prefix,status){const reasons={400:"MAX пока не показал поле ввода; нажмите нужную кнопку на экране MAX",401:"сессия авторизации не найдена",403:"сервер отклонил запрос страницы",404:"маршрут API не найден",410:"удалённая сессия завершена",500:"ошибка удалённого браузера",504:"удалённый браузер не ответил вовремя"};return prefix+": "+(reasons[status]||"ошибка сервера")+" (HTTP "+status+")";}
 async function post(path,data={}){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok)throw new Error(httpError("Не удалось управлять MAX",r.status));return r.json().catch(()=>({}));}
-function action(name,values={}){if(!ready)return Promise.resolve(false);const run=async()=>{try{await post("/api/action",{action:name,...values});return true;}catch(e){if(e.message.includes("HTTP 401")){const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}}state.textContent=e.message;return false;}finally{pendingActions--;}};pendingActions++;const queued=actionQueue.then(run,run);actionQueue=queued.catch(()=>false);return queued;}
+function action(name,values={}){if(!ready)return Promise.resolve(false);const run=async()=>{let succeeded=false;try{await post("/api/action",{action:name,...values});succeeded=true;return true;}catch(e){if(e.message.includes("HTTP 401")){const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}}state.textContent=e.message;return false;}finally{pendingActions--;if(succeeded)setTimeout(()=>refreshScreen(true),25);}};pendingActions++;const queued=actionQueue.then(run,run);actionQueue=queued.catch(()=>false);return queued;}
 async function sendDraft(andEnter=false){if(sendingDraft||!ready)return false;const text=box.value;if(!text&&!andEnter){state.textContent="Сначала введите текст в поле выше.";box.focus({preventScroll:true});return false;}sendingDraft=true;sendButton.disabled=true;let ok=true;if(text){ok=await action("text",{text});if(ok&&box.value.startsWith(text))box.value=box.value.slice(text.length);}if(ok&&andEnter)ok=await action("key",{key:"Enter"});sendingDraft=false;sendButton.disabled=false;if(ok){state.textContent=text?"✅ Текст введён в MAX.":"↵ Enter отправлен в MAX.";box.focus({preventScroll:true});}return ok;}
-async function refreshScreen(manual=false){if(stopped||!ready)return false;if(manual)await actionQueue;else if(pendingActions)return false;try{const r=await fetch("/api/snapshot",{cache:"no-store",credentials:"same-origin"});if(r.ok){const nextUrl=URL.createObjectURL(await r.blob());screen.onload=()=>{if(previousImageUrl)URL.revokeObjectURL(previousImageUrl);previousImageUrl=nextUrl;};screen.src=nextUrl;if(manual)state.textContent="Экран MAX обновлён.";return true;}const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}state.textContent=httpError("Не удалось получить экран MAX",r.status);if(r.status===401||r.status===410)stopped=true;return false;}catch(e){state.textContent="Нет связи с сервером удалённого входа: "+e.message;return false;}}
+async function refreshScreen(manual=false){if(stopped||!ready)return false;if(manual)await actionQueue;else if(pendingActions)return false;if(snapshotInFlight){snapshotQueued=true;return false;}snapshotInFlight=true;try{const r=await fetch("/api/snapshot",{cache:"no-store",credentials:"same-origin"});if(r.ok){const nextUrl=URL.createObjectURL(await r.blob());screen.onload=()=>{if(previousImageUrl)URL.revokeObjectURL(previousImageUrl);previousImageUrl=nextUrl;};screen.src=nextUrl;if(manual)state.textContent="Экран MAX обновлён.";return true;}const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}state.textContent=httpError("Не удалось получить экран MAX",r.status);if(r.status===401||r.status===410)stopped=true;return false;}catch(e){state.textContent="Нет связи с сервером удалённого входа: "+e.message;return false;}finally{snapshotInFlight=false;if(snapshotQueued&&!stopped){snapshotQueued=false;setTimeout(()=>refreshScreen(true),35);}}}
 async function reloadMax(){if(stopped||!ready)return;state.textContent="Перезагружаю страницу MAX…";const ok=await action("refresh");if(ok){const refreshed=await refreshScreen(true);if(refreshed)state.textContent="Страница MAX перезагружена. Продолжите вход на экране ниже.";}}
-async function poll(){if(stopped||!ready)return;await refreshScreen();if(!stopped)setTimeout(poll,1700);}
+async function poll(){if(stopped||!ready)return;await refreshScreen();if(!stopped)setTimeout(poll,1000);}
 sendButton.onclick=()=>{box.focus({preventScroll:true});sendDraft(false);};
 document.getElementById("refreshButton").onclick=()=>refreshScreen(true);
 document.getElementById("reloadButton").onclick=reloadMax;
+document.getElementById("backspaceButton").onclick=()=>action("backspace");
+document.getElementById("clearButton").onclick=()=>action("clear");
 zoomButton.onclick=()=>{const zoomed=screenFrame.classList.toggle("zoomed");zoomButton.textContent=zoomed?"🔎 Уменьшить экран":"🔍 Увеличить экран";};
 screen.addEventListener("click",e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/1280,r.height/800),ox=(r.width-1280*scale)/2,oy=(r.height-800*scale)/2,x=Math.round((e.clientX-r.left-ox)/scale),y=Math.round((e.clientY-r.top-oy)/scale);if(x>=0&&x<1280&&y>=0&&y<800)action("click",{x,y});});
 box.addEventListener("keydown",async e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();await sendDraft(true);return;}if(box.value)return;const allowed=["Tab","Backspace","Delete","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Home","End","PageUp","PageDown"];if(allowed.includes(e.key)){e.preventDefault();await action("key",{key:e.key});}});

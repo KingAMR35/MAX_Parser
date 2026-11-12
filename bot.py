@@ -2681,14 +2681,24 @@ def _build_auth_check_keyboard(target_chat_id):
     return kb
 
 
+def _build_auth_human_keyboard(target_chat_id, reason):
+    if reason == "device_password_setup":
+        # The next action is on the MAX screen, not another Telegram check.
+        return _build_password_keyboard(target_chat_id)
+    return _build_auth_check_keyboard(target_chat_id)
+
+
 def _auth_human_check_text(session, reason):
     if reason == "device_password_setup":
         return (
-            "⚠️ MAX не завершил вход: сначала нужно задать пароль для входа на устройстве, "
-            "где ваш аккаунт MAX уже открыт. В приложении MAX откройте «Настройки» → "
-            "«Безопасность» → «Пароль для входа» и задайте пароль. Затем вернитесь на защищённую "
-            "страницу, нажмите кнопку на экране MAX для повторной попытки и пройдите вход ещё раз. "
-            "Пока MAX не подтвердит вход, сессия не сохранится и парсинг не включится."
+            "⚠️ MAX пока не завершил вход.\n\n"
+            "1. На телефоне или другом устройстве, где ваш аккаунт MAX уже открыт, зайдите в "
+            "«Настройки» → «Безопасность» → «Пароль для входа» и задайте пароль.\n\n"
+            "2. Вернитесь в открытую защищённую страницу входа. На самом экране MAX нажмите "
+            "«Попробовать войти снова» (если надпись на английском — «Try signing in again»).\n\n"
+            "3. Продолжите шаги, которые покажет MAX. Не нажимайте «Проверить вход» в Telegram: "
+            "повторная проверка сама по себе не завершает вход.\n\n"
+            "Бот сохранит сессию и включит парсинг только после того, как MAX действительно откроет аккаунт."
         )
     if reason == "captcha":
         return (
@@ -2822,7 +2832,7 @@ def _monitor_remote_login(target_chat_id, session, output_chat_id):
                     bot.send_message(
                         output_chat_id,
                         _auth_human_check_text(session, data),
-                        reply_markup=_build_auth_check_keyboard(target_chat_id),
+                        reply_markup=_build_auth_human_keyboard(target_chat_id, data),
                         **NO_PREVIEW,
                     )
                 except Exception as error:
@@ -8913,7 +8923,7 @@ def _handle_auth_result(target_chat_id, user_id, status, data, stage):
         bot.send_message(
             user_id,
             _auth_human_check_text(session, data),
-            reply_markup=_build_auth_check_keyboard(target_chat_id),
+            reply_markup=_build_auth_human_keyboard(target_chat_id, data),
             **NO_PREVIEW,
         )
     elif status == "waiting":
@@ -10247,10 +10257,31 @@ def admin_callbacks(call):
             )
             _track_auth_message(target_id, auth_message)
         elif status == "awaiting_human":
+            if data == "device_password_setup":
+                try:
+                    bot.edit_message_text(
+                        _auth_human_check_text(session, data),
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=_build_auth_human_keyboard(target_id, data),
+                        **NO_PREVIEW,
+                    )
+                except Exception:
+                    try:
+                        bot.edit_message_reply_markup(
+                            call.message.chat.id,
+                            call.message.message_id,
+                            reply_markup=_build_auth_human_keyboard(target_id, data),
+                        )
+                    except Exception:
+                        pass
+                # Keep the existing notice in place; do not send the same
+                # password-setup explanation again after a Telegram check.
+                return
             auth_message = bot.send_message(
                 call.message.chat.id,
                 _auth_human_check_text(session, data),
-                reply_markup=_build_auth_check_keyboard(target_id),
+                reply_markup=_build_auth_human_keyboard(target_id, data),
                 **NO_PREVIEW,
             )
             _track_auth_message(target_id, auth_message)

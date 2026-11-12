@@ -546,6 +546,113 @@ def _get_login_code_input(page):
     return None
 
 
+def _focus_max_auth_input(page) -> bool:
+    """Focus the visible MAX auth field without a chain of slow locator waits."""
+    try:
+        return bool(page.evaluate("""() => {
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+            };
+            const fields = [...document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')]
+                .filter(el => visible(el) && !el.disabled && !el.readOnly);
+            if (!fields.length) return false;
+            const info = el => [el.type, el.name, el.id, el.placeholder,
+                el.getAttribute('aria-label'), el.getAttribute('autocomplete'),
+                el.getAttribute('inputmode'), el.getAttribute('data-testid')].join(' ').toLowerCase();
+            const pageText = (document.body?.innerText || '').toLowerCase();
+            if (/set a password on the device|you've signed in to max on|задать пароль на устройстве|установите пароль на устройстве/.test(pageText)) return false;
+            if (/captcha|i'm not a robot|i am not a robot|verify you are human|я не робот|подтвердите, что вы человек|проверка безопасности/.test(pageText)) return false;
+            const codePrompt = /verification code|enter code|code was sent|we sent a code|sms code|код подтверждения|введите код|код отправлен|проверьте телефон|смс/.test(pageText);
+            const semanticCode = fields.find(el => /one-time-code|otp|verification|verify|sms|(?:^|[ _-])code(?:$|[ _-])|код подтверждения|код проверки/.test(info(el)) && !/phone|телефон|номер/.test(info(el)));
+            const phone = fields.find(el => el.type === 'tel' || /autocomplete=["']?tel|phone|телефон|номер/.test(info(el)));
+            const password = fields.find(el => el.type === 'password' || /current-password|password|пароль/.test(info(el)));
+            const segmentedCode = codePrompt && fields.find(el => el.maxLength === 1 && !/phone|телефон|номер/.test(info(el)));
+            const numericCode = codePrompt && fields.find(el => /numeric|one-time-code/.test(info(el)) && !/phone|телефон|номер/.test(info(el)));
+            const target = semanticCode || phone || password || segmentedCode || numericCode;
+            if (!target) return false;
+            target.focus({preventScroll: true});
+            return document.activeElement === target;
+        }"""))
+    except Exception:
+        return False
+
+
+def _clear_max_auth_input(page) -> bool:
+    """Clear the current auth field, including MAX's segmented code boxes."""
+    code_input = _get_login_code_input(page)
+    if code_input:
+        try:
+            if str(code_input.get_attribute("maxlength") or "") == "1":
+                fields = page.locator("input[maxlength='1']")
+                visible_fields = []
+                for index in range(fields.count()):
+                    field = fields.nth(index)
+                    try:
+                        if field.is_visible(timeout=100):
+                            visible_fields.append(field)
+                    except Exception:
+                        continue
+                if visible_fields:
+                    for field in visible_fields:
+                        field.fill("", timeout=700)
+                    _focus_max_auth_input(page)
+                    return True
+            code_input.fill("", timeout=1000)
+            _focus_max_auth_input(page)
+            return True
+        except Exception:
+            return False
+    target = _get_password_input(page) or _get_phone_input(page)
+    if not target:
+        return False
+    try:
+        target.fill("", timeout=1000)
+        _focus_max_auth_input(page)
+        return True
+    except Exception:
+        return False
+
+
+def _backspace_max_auth_input(page) -> bool:
+    """Delete one character from MAX's active phone, code, or password field."""
+    code_input = _get_login_code_input(page)
+    try:
+        if code_input and str(code_input.get_attribute("maxlength") or "") == "1":
+            fields = page.locator("input[maxlength='1']")
+            visible_fields = []
+            for index in range(fields.count()):
+                field = fields.nth(index)
+                try:
+                    if field.is_visible(timeout=100):
+                        visible_fields.append(field)
+                except Exception:
+                    continue
+            if visible_fields:
+                target = next(
+                    (field for field in reversed(visible_fields) if field.input_value(timeout=200)),
+                    visible_fields[-1],
+                )
+                target.focus(timeout=300)
+                target.press("Backspace", timeout=300)
+                return True
+        target = code_input or _get_password_input(page) or _get_phone_input(page)
+        if not target:
+            return False
+        target.evaluate("""el => {
+            el.focus({preventScroll: true});
+            if (typeof el.setSelectionRange === 'function') {
+                const end = el.value.length;
+                el.setSelectionRange(end, end);
+            }
+        }""", timeout=300)
+        target.press("Backspace", timeout=300)
+        return True
+    except Exception:
+        return False
+
+
 def _fill_login_code(page, code_input, digits: str) -> bool:
     try:
         if str(code_input.get_attribute("maxlength") or "") == "1":
@@ -765,7 +872,7 @@ class QRLoginSession:
         args = args if isinstance(args, dict) else {}
         if action == "screenshot":
             return self.page.screenshot(
-                full_page=False, type="jpeg", quality=68, animations="disabled"
+                full_page=False, type="jpeg", quality=55, animations="disabled"
             )
         if action == "click":
             x, y = int(args.get("x", -1)), int(args.get("y", -1))
@@ -774,6 +881,12 @@ class QRLoginSession:
             # Playwright Mouse.click does not accept a timeout keyword.
             # Passing one raises TypeError, which made every remote click fail.
             self.page.mouse.click(x, y)
+            # MAX often renders the phone/code input just after the user
+            # presses its button. Focus it immediately so no extra tap is needed.
+            for _ in range(2):
+                if _focus_max_auth_input(self.page):
+                    break
+                self.page.wait_for_timeout(60)
             return True
         if action == "key":
             key = str(args.get("key", ""))
@@ -786,10 +899,45 @@ class QRLoginSession:
                 raise ValueError("Клавиша не разрешена")
             self.page.keyboard.press(key)
             return True
+        if action == "backspace":
+            if not _backspace_max_auth_input(self.page):
+                raise ValueError("Поле телефона, кода или пароля MAX не найдено")
+            return True
+        if action == "clear":
+            if not _clear_max_auth_input(self.page):
+                raise ValueError("Активное поле телефона, кода или пароля MAX не найдено")
+            return True
         if action == "text":
             value = args.get("text")
             if not isinstance(value, str) or not value or len(value) > 256 or "\x00" in value:
                 raise ValueError("Недопустимый текст ввода")
+            # Use the actual auth controls where possible. Locator.fill sends
+            # one ordered input event without a per-character network-like delay.
+            code_input = _get_login_code_input(self.page)
+            if code_input:
+                digits = re.sub(r"\D", "", value)
+                if str(code_input.get_attribute("maxlength") or "") == "1" and digits:
+                    if not _fill_login_code(self.page, code_input, digits):
+                        raise ValueError("Не удалось заполнить все поля кода MAX")
+                else:
+                    code_input.fill(value, timeout=1500)
+                _focus_max_auth_input(self.page)
+                return True
+            password_input = _get_password_input(self.page)
+            if password_input:
+                password_input.fill(value, timeout=1500)
+                _focus_max_auth_input(self.page)
+                return True
+            phone_input = _get_phone_input(self.page)
+            if phone_input:
+                digits = re.sub(r"\D", "", value)
+                if len(digits) == 11 and digits[0] in {"7", "8"}:
+                    value = digits[1:]
+                elif len(digits) == 10 and digits[0] == "9":
+                    value = digits
+                phone_input.fill(value, timeout=1500)
+                _focus_max_auth_input(self.page)
+                return True
             focused = self.page.evaluate("""() => {
                 const isVisible = el => {
                     const rect = el.getBoundingClientRect();
@@ -843,10 +991,8 @@ class QRLoginSession:
             }""")
             if not focused:
                 raise ValueError("Поле ввода MAX не найдено; откройте форму телефона или кода")
-            # Use real, ordered key events so MAX's code/phone inputs process
-            # each character. A single insert_text call behaves like paste
-            # and is ignored by some of MAX's segmented verification fields.
-            self.page.keyboard.type(value, delay=8)
+            # Fallback for an auth field whose selector changed in MAX Web.
+            self.page.keyboard.insert_text(value)
             return True
         if action == "scroll":
             delta_y = int(args.get("deltaY", 0))
@@ -857,6 +1003,7 @@ class QRLoginSession:
         if action == "refresh":
             self.page.reload(wait_until="domcontentloaded", timeout=12000)
             self.page.wait_for_timeout(1500)
+            _focus_max_auth_input(self.page)
             return True
         raise ValueError("Неизвестное действие")
 
