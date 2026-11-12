@@ -521,6 +521,28 @@ def _get_login_code_input(page):
         except Exception:
             continue
 
+    phone_input = _get_phone_input(page)
+    # MAX sometimes renders the OTP control as a lone one-character input and
+    # does not show any recognizable prompt text. Once the phone field is gone,
+    # that control is still the code input and must receive the whole code path.
+    if code_prompt_visible or not phone_input:
+        try:
+            candidates = page.locator("input[maxlength='1']")
+            for index in range(candidates.count()):
+                element = candidates.nth(index)
+                if not element.is_visible(timeout=150):
+                    continue
+                hints = " ".join(
+                    str(element.get_attribute(attribute) or "")
+                    for attribute in (
+                        "type", "name", "placeholder", "aria-label",
+                        "autocomplete", "inputmode", "data-testid",
+                    )
+                )
+                if not re.search(r"phone|телефон|номер|\btel\b|search|поиск", hints, re.I):
+                    return element
+        except Exception:
+            pass
     if not code_prompt_visible:
         return None
     # Some MAX screens keep the phone field in the DOM after switching to the
@@ -545,13 +567,50 @@ def _get_login_code_input(page):
                     "autocomplete", "inputmode", "data-testid",
                 )
             )
-            if re.search(r"phone|телефон|номер", hints, re.I):
+            if re.search(r"phone|телефон|номер|\btel\b|tel-national", hints, re.I):
                 continue
             if re.search(r"search|поиск", hints, re.I) and not re.search(
                 r"otp|verification|code|код|one-time", hints, re.I
             ):
                 continue
             return element
+        except Exception:
+            continue
+    return None
+
+
+def _get_unlabeled_otp_input(page, value: str):
+    """Find a code cell when MAX omits code-related labels and prompt text."""
+    if not re.fullmatch(r"\d{4,8}", value or "") or _get_password_input(page):
+        return None
+    for selector in (
+        "input[autocomplete='one-time-code']",
+        "input[name*='otp' i]",
+        "input[maxlength='1']",
+        "input[inputmode='numeric']",
+        "input[type='number']",
+        "input[type='text']",
+        "[role='textbox']",
+        "[contenteditable='true']",
+    ):
+        try:
+            candidates = page.locator(selector)
+            for index in range(candidates.count()):
+                element = candidates.nth(index)
+                if not element.is_visible(timeout=150):
+                    continue
+                hints = " ".join(
+                    str(element.get_attribute(attribute) or "")
+                    for attribute in (
+                        "type", "name", "placeholder", "aria-label",
+                        "autocomplete", "inputmode", "data-testid",
+                    )
+                )
+                if element.get_attribute("type") == "tel":
+                    continue
+                if re.search(r"phone|телефон|номер|\btel\b|tel-national|search|поиск|password|пароль", hints, re.I):
+                    continue
+                return element
         except Exception:
             continue
     return None
@@ -579,9 +638,9 @@ def _focus_max_auth_input(page) -> bool:
             const semanticCode = fields.find(el => /one-time-code|otp|verification|verify|sms|(?:^|[ _-])code(?:$|[ _-])|код подтверждения|код проверки/.test(info(el)) && !/phone|телефон|номер/.test(info(el)));
             const phone = fields.find(el => el.type === 'tel' || /autocomplete=["']?tel|phone|телефон|номер/.test(info(el)));
             const password = fields.find(el => el.type === 'password' || /current-password|password|пароль/.test(info(el)));
-            const segmentedCode = codePrompt && fields.find(el => el.maxLength === 1 && !/phone|телефон|номер/.test(info(el)));
+            const segmentedCode = fields.find(el => el.maxLength === 1 && !/phone|телефон|номер|search|поиск/.test(info(el)));
             const numericCode = codePrompt && fields.find(el => /numeric|one-time-code/.test(info(el)) && !/phone|телефон|номер/.test(info(el)));
-            const target = semanticCode || phone || password || segmentedCode || numericCode;
+            const target = semanticCode || (codePrompt || !phone ? segmentedCode : null) || phone || password || numericCode;
             if (!target) return false;
             target.focus({preventScroll: true});
             return document.activeElement === target;
@@ -691,7 +750,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 except Exception:
                     # MAX may submit automatically and remove the OTP cells as
                     # soon as the last digit arrives.
-                    if not _get_login_code_input(page):
+                    if _max_login_advanced_after_code(page, code_input):
                         return True
                     values = []
                 if "".join(values[:len(digits)]) == digits:
@@ -705,17 +764,31 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 try:
                     values = [field.input_value(timeout=300) for field in fields]
                 except Exception:
-                    if not _get_login_code_input(page):
+                    if _max_login_advanced_after_code(page, code_input):
                         return True
                     values = []
                 if "".join(values[:len(digits)]) == digits:
                     return True
+
+            if len(fields) < len(digits):
+                # MAX may expose only the active digit cell at a time. In that
+                # layout, give its real key handler time to advance focus.
+                try:
+                    code_input.fill("", timeout=700)
+                    code_input.focus(timeout=700)
+                    page.keyboard.type(digits, delay=110)
+                    page.wait_for_timeout(80)
+                    if _login_code_value_accepted(page, code_input, digits):
+                        return True
+                except Exception:
+                    pass
 
             # Some MAX versions display six boxes but expose just one input
             # with maxlength=1. A normal fill is truncated to its first digit.
             # First send a paste event (many OTP widgets distribute it), then
             # set the complete value and dispatch the input events MAX listens to.
             try:
+                code_input.fill("", timeout=700)
                 code_input.evaluate("""(el, code) => {
                     el.focus({preventScroll: true});
                     const clipboard = new DataTransfer();
@@ -744,7 +817,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 page.wait_for_timeout(50)
                 return _login_code_value_accepted(page, code_input, digits)
             except Exception:
-                return not _get_login_code_input(page)
+                return _max_login_advanced_after_code(page, code_input)
         code_input.fill(digits, timeout=5000)
         page.wait_for_timeout(35)
         return _login_code_value_accepted(page, code_input, digits)
@@ -755,12 +828,37 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
 def _login_code_value_accepted(page, code_input, digits: str) -> bool:
     """Confirm all code digits reached the input, or MAX advanced from it."""
     try:
+        cells = page.locator("input[maxlength='1']")
+        cell_values = []
+        for index in range(cells.count()):
+            cell = cells.nth(index)
+            if cell.is_visible(timeout=100):
+                cell_values.append(re.sub(r"\D", "", cell.input_value(timeout=200)))
+        if len(cell_values) >= len(digits) and "".join(cell_values[:len(digits)]) == digits:
+            return True
+    except Exception:
+        pass
+    try:
         value = re.sub(r"\D", "", code_input.input_value(timeout=300))
         if value == digits:
             return True
     except Exception:
         pass
-    return not _get_login_code_input(page)
+    return _max_login_advanced_after_code(page, code_input)
+
+
+def _max_login_advanced_after_code(page, code_input) -> bool:
+    """Accept a detached code input only after MAX actually moved to the next step."""
+    try:
+        if code_input.is_visible(timeout=100):
+            return False
+    except Exception:
+        pass
+    if _get_login_code_input(page):
+        return False
+    if _get_password_input(page) or _needs_device_password_setup(page) or _has_auth_captcha(page):
+        return True
+    return _is_logged_in(page)
 
 
 def _click_phone_login_option(page):
@@ -1001,6 +1099,8 @@ class QRLoginSession:
             # Use the actual auth controls where possible. Locator.fill sends
             # one ordered input event without a per-character network-like delay.
             code_input = _get_login_code_input(self.page)
+            if not code_input:
+                code_input = _get_unlabeled_otp_input(self.page, value)
             if code_input:
                 digits = re.sub(r"\D", "", value)
                 if str(code_input.get_attribute("maxlength") or "") == "1" and digits:
@@ -1015,6 +1115,11 @@ class QRLoginSession:
                 password_input.fill(value, timeout=1500)
                 _focus_max_auth_input(self.page)
                 return True
+            if re.fullmatch(r"\d{4,8}", value):
+                raise ValueError(
+                    "Не нашёл поле для полного кода MAX и не стал вводить только первую цифру. "
+                    "Убедитесь, что на экране MAX открыта форма кода, затем попробуйте ещё раз."
+                )
             phone_input = _get_phone_input(self.page)
             if phone_input:
                 digits = re.sub(r"\D", "", value)
