@@ -617,7 +617,7 @@ def _get_unlabeled_otp_input(page, value: str):
     return None
 
 
-def _visible_otp_cells(page, reference_input=None):
+def _visible_otp_cells(page, reference_input=None, deduplicate=True):
     """Return visible single-character OTP inputs in visual (left-to-right) order."""
     try:
         reference_box = reference_input.bounding_box() if reference_input else None
@@ -645,7 +645,19 @@ def _visible_otp_cells(page, reference_input=None):
         except Exception:
             continue
     fields.sort(key=lambda item: (item[0], item[1]))
-    return [item[2] for item in fields]
+    if not deduplicate:
+        return [item[2] for item in fields]
+    # Some MAX layouts expose several inputs over the same visual box. Treat
+    # those as one native field and use paste/typing instead of clicking the
+    # same spot repeatedly (which would overwrite the first cell).
+    unique_fields = []
+    seen_positions = []
+    for y, x, field in fields:
+        if any(abs(y - seen_y) < 3 and abs(x - seen_x) < 3 for seen_y, seen_x in seen_positions):
+            continue
+        seen_positions.append((y, x))
+        unique_fields.append(field)
+    return unique_fields
 
 
 def _focus_max_auth_input(page) -> bool:
@@ -749,63 +761,71 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
         if not re.fullmatch(r"\d{4,8}", digits or ""):
             return False
 
-        if str(code_input.get_attribute("maxlength") or "") == "1":
-            # Use real key events on each visible cell. MAX's OTP widget can
-            # ignore Locator.fill() on its controlled inputs, leaving just the
-            # final character in the active cell.
-            cells = _visible_otp_cells(page, code_input)
-            if len(cells) >= len(digits):
-                cells = cells[:len(digits)]
-                for cell in cells:
-                    cell.fill("", timeout=700)
-                page.wait_for_timeout(80)
-                for cell, digit in zip(cells, digits):
-                    cell.click(timeout=1000)
-                    page.keyboard.press(digit)
-                    page.wait_for_timeout(45)
-                    if re.sub(r"\D", "", cell.input_value(timeout=300)) != digit:
-                        # Some MAX builds use a controlled input without a
-                        # reliable key handler. Try filling that specific cell,
-                        # then still verify its actual value.
-                        cell.fill(digit, timeout=700)
-                        page.wait_for_timeout(60)
-                    if re.sub(r"\D", "", cell.input_value(timeout=300)) != digit:
-                        break
-                if _login_code_value_accepted(page, code_input, digits):
-                    return True
-                if _max_login_advanced_after_code(page, code_input):
-                    return True
+        # First handle six genuinely separate cells. Click and send one real
+        # key event per cell, left-to-right; never fill the whole code into the
+        # first one-character box.
+        cells = _visible_otp_cells(page, code_input)
+        if len(cells) >= len(digits):
+            cells = cells[:len(digits)]
+            for cell in cells:
+                cell.fill("", timeout=700)
+            page.wait_for_timeout(80)
+            for cell, digit in zip(cells, digits):
+                cell.click(timeout=1000)
+                page.keyboard.press(digit)
+                page.wait_for_timeout(45)
+                if re.sub(r"\D", "", cell.input_value(timeout=300)) != digit:
+                    break
+            if _login_code_value_accepted(page, code_input, digits):
+                return True
+            if _max_login_advanced_after_code(page, code_input):
+                return True
 
-            # Some versions expose one real input behind six visual boxes. A
-            # single native paste lets MAX distribute the full OTP itself.
-            cells = _visible_otp_cells(page, code_input)
-            if cells:
-                for cell in cells:
-                    try:
-                        cell.fill("", timeout=500)
-                    except Exception:
-                        pass
-            if _paste_full_otp_code(page, code_input, digits):
-                page.wait_for_timeout(120)
-                if _login_code_value_accepted(page, code_input, digits):
-                    return True
-                if _max_login_advanced_after_code(page, code_input):
-                    return True
+        # One native paste handles MAX widgets that draw six boxes over one
+        # input, including inputs whose maxlength is absent or not reported.
+        _clear_otp_fields(page, code_input)
+        if _paste_full_otp_code(page, code_input, digits):
+            page.wait_for_timeout(120)
+            if _login_code_value_accepted(page, code_input, digits):
+                return True
+            if _max_login_advanced_after_code(page, code_input):
+                return True
 
-            # Don't leave a partial or misleading code in MAX.
-            cells = _visible_otp_cells(page, code_input)
-            if cells:
-                for cell in cells:
-                    try:
-                        cell.fill("", timeout=500)
-                    except Exception:
-                        pass
-            return False
-        code_input.fill(digits, timeout=5000)
-        page.wait_for_timeout(35)
-        return _login_code_value_accepted(page, code_input, digits)
+        # Last fallback for a standard single input: send ordered key events.
+        # Avoid Locator.fill(digits), which can make MAX's custom OTP handler
+        # place only the last character into its first visual cell.
+        _clear_otp_fields(page, code_input)
+        try:
+            code_input.click(timeout=1000)
+        except Exception:
+            code_input.focus(timeout=1000)
+        for digit in digits:
+            page.keyboard.press(digit)
+            page.wait_for_timeout(35)
+        if _login_code_value_accepted(page, code_input, digits):
+            return True
+        if _max_login_advanced_after_code(page, code_input):
+            return True
+
+        # Don't leave a partial or misleading code in MAX.
+        _clear_otp_fields(page, code_input)
+        return False
     except Exception:
         return False
+
+
+def _clear_otp_fields(page, code_input) -> None:
+    cells = _visible_otp_cells(page, code_input, deduplicate=False)
+    if cells:
+        for cell in cells:
+            try:
+                cell.fill("", timeout=500)
+            except Exception:
+                pass
+    try:
+        code_input.fill("", timeout=500)
+    except Exception:
+        pass
 
 
 def _paste_full_otp_code(page, code_input, digits: str) -> bool:
@@ -836,7 +856,7 @@ def _paste_full_otp_code(page, code_input, digits: str) -> bool:
 def _login_code_value_accepted(page, code_input, digits: str) -> bool:
     """Confirm all code digits reached the input, or MAX advanced from it."""
     try:
-        cells = _visible_otp_cells(page, code_input)
+        cells = _visible_otp_cells(page, code_input, deduplicate=False)
         values = [re.sub(r"\D", "", cell.input_value(timeout=200)) for cell in cells]
         if len(values) >= len(digits) and "".join(values[:len(digits)]) == digits:
             return True
@@ -1100,14 +1120,14 @@ class QRLoginSession:
             value = args.get("text")
             if not isinstance(value, str) or not value or len(value) > 256 or "\x00" in value:
                 raise ValueError("Недопустимый текст ввода")
-            # Use the actual auth controls where possible. Locator.fill sends
-            # one ordered input event without a per-character network-like delay.
+            # OTP codes have their own verified entry path below; phone numbers
+            # and passwords continue to use their regular controls.
             code_input = _get_login_code_input(self.page)
             if not code_input:
                 code_input = _get_unlabeled_otp_input(self.page, value)
             if code_input:
                 digits = re.sub(r"\D", "", value)
-                if str(code_input.get_attribute("maxlength") or "") == "1" and digits:
+                if re.fullmatch(r"\d{4,8}", digits or ""):
                     if not _fill_login_code(self.page, code_input, digits):
                         raise ValueError("Не удалось заполнить все поля кода MAX")
                 else:
