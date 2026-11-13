@@ -761,8 +761,10 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
         if not re.fullmatch(r"\d{4,8}", digits or ""):
             return False
 
-        # First handle six genuinely separate cells. Click and send one real
-        # key event per cell, left-to-right; never fill the whole code into the
+        max_length = str(code_input.get_attribute("maxlength") or "")
+
+        # Handle genuinely separate cells first. Click and send one real key
+        # event per visible cell, left-to-right; never send a whole code to the
         # first one-character box.
         cells = _visible_otp_cells(page, code_input)
         if len(cells) >= len(digits):
@@ -781,8 +783,29 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             if _max_login_advanced_after_code(page, code_input):
                 return True
 
-        # One native paste handles MAX widgets that draw six boxes over one
-        # input, including inputs whose maxlength is absent or not reported.
+        # A regular input or contenteditable should accept the complete value
+        # directly. This is the primary path when there are no separate cells.
+        if max_length != "1":
+            _clear_otp_fields(page, code_input)
+            try:
+                code_input.click(timeout=1000)
+            except Exception:
+                try:
+                    code_input.focus(timeout=700)
+                except Exception:
+                    pass
+            try:
+                code_input.fill(digits, timeout=1500)
+                page.wait_for_timeout(100)
+                if _login_code_value_accepted(page, code_input, digits):
+                    return True
+                if _max_login_advanced_after_code(page, code_input):
+                    return True
+            except Exception:
+                pass
+
+        # A native paste is how MAX's one-control OTP widgets normally
+        # distribute a full code across their visual cells.
         _clear_otp_fields(page, code_input)
         if _paste_full_otp_code(page, code_input, digits):
             page.wait_for_timeout(120)
@@ -813,20 +836,20 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
         except Exception:
             pass
 
-        # MAX may use one normal OTP input without maxlength=1. In that case
-        # a single fill is the correct browser operation; never do this for a
-        # one-character cell, where it would retain only one digit.
+        # Insert the string as one ordered text-input event. This works with
+        # controlled inputs and contenteditable controls when fill/paste is
+        # intercepted by MAX's frontend.
+        _clear_otp_fields(page, code_input)
         try:
-            if str(code_input.get_attribute("maxlength") or "") != "1":
-                _clear_otp_fields(page, code_input)
-                code_input.fill(digits, timeout=1500)
-                page.wait_for_timeout(100)
-                if _login_code_value_accepted(page, code_input, digits):
-                    return True
-                if _max_login_advanced_after_code(page, code_input):
-                    return True
+            code_input.click(timeout=1000)
         except Exception:
-            pass
+            code_input.focus(timeout=1000)
+        page.keyboard.insert_text(digits)
+        page.wait_for_timeout(100)
+        if _login_code_value_accepted(page, code_input, digits):
+            return True
+        if _max_login_advanced_after_code(page, code_input):
+            return True
 
         # Last fallback for a standard single input: send ordered key events.
         # Avoid Locator.fill(digits), which can make MAX's custom OTP handler
@@ -927,16 +950,28 @@ def _login_code_control_summary(page, control) -> str:
             tag: el.tagName,
             type: el.getAttribute('type') || '',
             role: el.getAttribute('role') || '',
+            name: el.getAttribute('name') || '',
+            placeholder: el.getAttribute('placeholder') || '',
+            autocomplete: el.getAttribute('autocomplete') || '',
+            inputmode: el.getAttribute('inputmode') || '',
             maxLength: el.getAttribute('maxlength') || '',
+            disabled: !!el.disabled,
+            readOnly: !!el.readOnly,
+            focused: document.activeElement === el,
             editable: !!el.isContentEditable,
             textLength: (('value' in el && typeof el.value === 'string') ? el.value : (el.innerText || el.textContent || '')).length
         })""", timeout=300)
     except Exception:
-        details = {"tag": "unknown", "type": "", "role": "", "maxLength": "", "editable": False, "textLength": 0}
+        details = {"tag": "unknown", "type": "", "role": "", "name": "", "placeholder": "", "autocomplete": "", "inputmode": "", "maxLength": "", "disabled": False, "readOnly": False, "focused": False, "editable": False, "textLength": 0}
     cell_count = len(_visible_otp_cells(page, control, deduplicate=False))
+    hints = ", ".join(
+        f"{key}={str(details[key])[:40]}" for key in ("autocomplete", "inputmode", "placeholder") if details[key]
+    ) or "без подсказок"
     return (
         f"поле={details['tag']}/{details['type'] or details['role'] or 'без типа'}, "
         f"maxlength={details['maxLength'] or 'не задан'}, "
+        f"disabled={details['disabled']}, readonly={details['readOnly']}, "
+        f"focus={details['focused']}, {hints}, "
         f"символов в поле={details['textLength']}, ячеек={cell_count}"
     )
 
