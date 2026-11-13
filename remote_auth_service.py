@@ -57,7 +57,7 @@ button.busy::after{content:"";position:absolute;right:12px;top:50%;width:15px;he
 #screen{display:block;width:100%;height:auto;max-height:64vh;object-fit:contain;user-select:none;-webkit-user-select:none;touch-action:pan-x pan-y;cursor:crosshair;transition:filter .1s ease}
 #screen:active,#screenFrame.busy #screen{filter:brightness(.82)}
 #screenFrame.zoomed #screen{width:160%;max-height:none}
-#state{min-height:24px;margin-top:8px;color:#cbd6eb}
+#state{min-height:24px;margin-top:8px;padding:8px 10px;border-radius:8px;background:#0e1726;color:#cbd6eb;font-size:14px}
 .warning{background:#282231;border:1px solid #644653;padding:12px;border-radius:10px;font-size:13px;margin-top:12px}
 @media(max-width:600px){
 main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
@@ -84,6 +84,7 @@ main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
 <button id="clearButton" type="button" title="Очистить активное поле MAX">🧹 Очистить поле MAX</button>
 </div>
 <div class="inputHint"><b>Одно поле на весь вход:</b> сначала номер из 10 цифр без +7 и 8, затем весь код сразу, потом пароль, если MAX его попросит. Для каждого шага нажмите «Ввести в MAX».</div>
+<div id="state" role="status" aria-live="polite">Подключаем защищённую сессию…</div>
 </section>
 <div class="toolbar">
 <button id="refreshButton" type="button">🔄 Обновить экран</button>
@@ -92,7 +93,6 @@ main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
 </div>
 <p id="screenTip">👆 Нажимайте на кнопки и ссылки MAX прямо на экране. Поле телефона, кода или пароля выбирается автоматически.</p>
 <div id="screenFrame"><img id="screen" alt="Интерактивный экран входа MAX"></div>
-<div id="state">Подключаем защищённую сессию…</div>
 <details class="guide">
 <summary>📘 Подробная инструкция по входу</summary>
 <ol>
@@ -108,10 +108,10 @@ const screen=document.getElementById("screen"),screenFrame=document.getElementBy
 let stopped=false,ready=false,previousImageUrl=null;
 let actionQueue=Promise.resolve(),pendingActions=0,sendingDraft=false,snapshotInFlight=false,snapshotQueued=false;
 function httpError(prefix,status){const reasons={400:"MAX пока не показал поле ввода; нажмите нужную кнопку на экране MAX",401:"сессия авторизации не найдена",403:"сервер отклонил запрос страницы",404:"маршрут API не найден",410:"удалённая сессия завершена",500:"ошибка удалённого браузера",504:"удалённый браузер не ответил вовремя"};return prefix+": "+(reasons[status]||"ошибка сервера")+" (HTTP "+status+")";}
-async function post(path,data={}){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok){const details=await r.json().catch(()=>({}));throw new Error(details.error||httpError("Не удалось управлять MAX",r.status));}return r.json().catch(()=>({}));}
+async function post(path,data={}){const controller=new AbortController(),timeoutMs=path==="/api/action"&&data.action==="text"?18000:10000,timeoutSeconds=Math.round(timeoutMs/1000),timer=setTimeout(()=>controller.abort(),timeoutMs);try{const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),signal:controller.signal});if(!r.ok){const details=await r.json().catch(()=>({}));throw new Error(details.error||httpError("Не удалось управлять MAX",r.status));}return r.json().catch(()=>({}));}catch(e){if(e.name==="AbortError")throw new Error("Запрос к MAX не ответил за "+timeoutSeconds+" секунд. Проверьте соединение и попробуйте ещё раз.");throw e;}finally{clearTimeout(timer);}}
 async function runButton(button,operation,busyText){if(!button||button.dataset.busy==="1")return false;const wasDisabled=button.disabled;button.dataset.busy="1";button.classList.add("busy");button.setAttribute("aria-busy","true");button.disabled=true;if(busyText)state.textContent=busyText;try{return await operation();}catch(e){state.textContent=e.message||"Не удалось выполнить действие.";return false;}finally{button.classList.remove("busy");button.removeAttribute("aria-busy");delete button.dataset.busy;button.disabled=wasDisabled;}}
-function action(name,values={}){if(!ready)return Promise.resolve(false);const run=async()=>{let succeeded=false;try{await post("/api/action",{action:name,...values});succeeded=true;return true;}catch(e){if(e.message.includes("HTTP 401")){const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}}state.textContent=e.message;return false;}finally{pendingActions--;if(succeeded)setTimeout(()=>refreshScreen(true),25);}};pendingActions++;const queued=actionQueue.then(run,run);actionQueue=queued.catch(()=>false);return queued;}
-async function sendDraft(andEnter=false){if(sendingDraft||!ready)return false;const text=box.value;if(!text&&!andEnter){state.textContent="Сначала введите текст в поле выше.";box.focus({preventScroll:true});return false;}sendingDraft=true;let ok=true;if(text){ok=await action("text",{text});if(ok&&box.value.startsWith(text))box.value=box.value.slice(text.length);}if(ok&&andEnter)ok=await action("key",{key:"Enter"});sendingDraft=false;if(ok){state.textContent=text?"✅ Весь введённый текст передан в MAX.":"↵ Enter отправлен в MAX.";box.focus({preventScroll:true});}return ok;}
+function action(name,values={}){if(!ready){state.textContent=stopped?"Ссылка или сессия входа недоступна. Запросите новую в боте.":"Секунду, подключаю страницу к MAX…";return Promise.resolve(false);}const run=async()=>{let succeeded=false;try{const result=await post("/api/action",{action:name,...values});if(result.ok===false)throw new Error(result.error||"Браузер MAX не подтвердил действие.");succeeded=true;return true;}catch(e){if(e.message.includes("HTTP 401")){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2500);const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin",signal:controller.signal}).then(x=>x.json()).catch(()=>({})).finally(()=>clearTimeout(timer));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}}state.textContent=e.message;return false;}finally{pendingActions--;if(succeeded)setTimeout(()=>refreshScreen(false),25);}};pendingActions++;const queued=actionQueue.then(run,run);actionQueue=queued.catch(()=>false);return queued;}
+async function sendDraft(andEnter=false){if(sendingDraft)return false;if(!ready){state.textContent=stopped?"Ссылка или сессия входа недоступна. Запросите новую в боте.":"Секунду, подключаю страницу к MAX…";return false;}const text=box.value;if(!text&&!andEnter){state.textContent="Сначала введите текст в поле выше.";box.focus({preventScroll:true});return false;}sendingDraft=true;try{let ok=true;if(text){ok=await action("text",{text});if(ok&&box.value.startsWith(text))box.value=box.value.slice(text.length);}if(ok&&andEnter)ok=await action("key",{key:"Enter"});if(ok){state.textContent=text?"✅ Весь введённый текст передан в MAX.":"↵ Enter отправлен в MAX.";box.focus({preventScroll:true});}return ok;}catch(e){state.textContent=e.message||"Не удалось передать текст в MAX.";return false;}finally{sendingDraft=false;}}
 async function refreshScreen(manual=false){if(stopped||!ready)return false;if(manual)await actionQueue;else if(pendingActions)return false;if(snapshotInFlight){snapshotQueued=true;return false;}snapshotInFlight=true;try{const r=await fetch("/api/snapshot",{cache:"no-store",credentials:"same-origin"});if(r.ok){const nextUrl=URL.createObjectURL(await r.blob());screen.onload=()=>{if(previousImageUrl)URL.revokeObjectURL(previousImageUrl);previousImageUrl=nextUrl;};screen.src=nextUrl;if(manual)state.textContent="Экран MAX обновлён.";return true;}const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}state.textContent=httpError("Не удалось получить экран MAX",r.status);if(r.status===401||r.status===410)stopped=true;return false;}catch(e){state.textContent="Нет связи с сервером удалённого входа: "+e.message;return false;}finally{snapshotInFlight=false;if(snapshotQueued&&!stopped){snapshotQueued=false;setTimeout(()=>refreshScreen(true),35);}}}
 async function reloadMax(){if(stopped||!ready)return;state.textContent="Перезагружаю страницу MAX…";const ok=await action("refresh");if(ok){const refreshed=await refreshScreen(true);if(refreshed)state.textContent="Страница MAX перезагружена. Продолжите вход на экране ниже.";}}
 async function poll(){if(stopped||!ready)return;await refreshScreen();if(!stopped)setTimeout(poll,1000);}
@@ -285,17 +285,19 @@ class RemoteAuthService:
                     return
                 try:
                     action_name = body.get("action")
-                    action_timeout = 20 if action_name == "text" else 8
+                    action_timeout = 15 if action_name == "text" else 8
                     result = record["session"].remote_action(action_name, body, timeout=action_timeout)
+                    if not result:
+                        raise ValueError("Удалённый браузер MAX не подтвердил действие")
                     self._send(200, json.dumps({"ok": bool(result)}).encode("utf-8"))
                 except ValueError as error:
-                    print(f"REMOTE_AUTH_ACTION_REJECTED error_type={type(error).__name__}")
+                    print(f"REMOTE_AUTH_ACTION_REJECTED action={body.get('action')} error={str(error)[:160]}")
                     self._send(400, json.dumps({"error": str(error)}, ensure_ascii=False))
                 except RuntimeError as error:
                     print(f"REMOTE_AUTH_ACTION_CLOSED error_type={type(error).__name__}")
                     self._send(410)
                 except TimeoutError as error:
-                    print(f"REMOTE_AUTH_ACTION_TIMEOUT error_type={type(error).__name__}")
+                    print(f"REMOTE_AUTH_ACTION_TIMEOUT action={body.get('action')}")
                     self._send(504)
                 except Exception as error:
                     print(f"REMOTE_AUTH_ACTION_FAILED error_type={type(error).__name__}")
