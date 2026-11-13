@@ -108,7 +108,7 @@ const screen=document.getElementById("screen"),screenFrame=document.getElementBy
 let stopped=false,ready=false,previousImageUrl=null;
 let actionQueue=Promise.resolve(),pendingActions=0,sendingDraft=false,snapshotInFlight=false,snapshotQueued=false;
 function httpError(prefix,status){const reasons={400:"MAX пока не показал поле ввода; нажмите нужную кнопку на экране MAX",401:"сессия авторизации не найдена",403:"сервер отклонил запрос страницы",404:"маршрут API не найден",410:"удалённая сессия завершена",500:"ошибка удалённого браузера",504:"удалённый браузер не ответил вовремя"};return prefix+": "+(reasons[status]||"ошибка сервера")+" (HTTP "+status+")";}
-async function post(path,data={}){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok)throw new Error(httpError("Не удалось управлять MAX",r.status));return r.json().catch(()=>({}));}
+async function post(path,data={}){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok){const details=await r.json().catch(()=>({}));throw new Error(details.error||httpError("Не удалось управлять MAX",r.status));}return r.json().catch(()=>({}));}
 async function runButton(button,operation,busyText){if(!button||button.dataset.busy==="1")return false;const wasDisabled=button.disabled;button.dataset.busy="1";button.classList.add("busy");button.setAttribute("aria-busy","true");button.disabled=true;if(busyText)state.textContent=busyText;try{return await operation();}catch(e){state.textContent=e.message||"Не удалось выполнить действие.";return false;}finally{button.classList.remove("busy");button.removeAttribute("aria-busy");delete button.dataset.busy;button.disabled=wasDisabled;}}
 function action(name,values={}){if(!ready)return Promise.resolve(false);const run=async()=>{let succeeded=false;try{await post("/api/action",{action:name,...values});succeeded=true;return true;}catch(e){if(e.message.includes("HTTP 401")){const s=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"}).then(x=>x.json()).catch(()=>({}));if(s.status==="complete"){state.textContent="✅ Вход подтверждён. Можно закрыть эту страницу.";stopped=true;return false;}}state.textContent=e.message;return false;}finally{pendingActions--;if(succeeded)setTimeout(()=>refreshScreen(true),25);}};pendingActions++;const queued=actionQueue.then(run,run);actionQueue=queued.catch(()=>false);return queued;}
 async function sendDraft(andEnter=false){if(sendingDraft||!ready)return false;const text=box.value;if(!text&&!andEnter){state.textContent="Сначала введите текст в поле выше.";box.focus({preventScroll:true});return false;}sendingDraft=true;let ok=true;if(text){ok=await action("text",{text});if(ok&&box.value.startsWith(text))box.value=box.value.slice(text.length);}if(ok&&andEnter)ok=await action("key",{key:"Enter"});sendingDraft=false;if(ok){state.textContent=text?"✅ Весь введённый текст передан в MAX.":"↵ Enter отправлен в MAX.";box.focus({preventScroll:true});}return ok;}
@@ -284,11 +284,13 @@ class RemoteAuthService:
                     self._send(404)
                     return
                 try:
-                    result = record["session"].remote_action(body.get("action"), body, timeout=6)
+                    action_name = body.get("action")
+                    action_timeout = 20 if action_name == "text" else 8
+                    result = record["session"].remote_action(action_name, body, timeout=action_timeout)
                     self._send(200, json.dumps({"ok": bool(result)}).encode("utf-8"))
                 except ValueError as error:
                     print(f"REMOTE_AUTH_ACTION_REJECTED error_type={type(error).__name__}")
-                    self._send(400)
+                    self._send(400, json.dumps({"error": str(error)}, ensure_ascii=False))
                 except RuntimeError as error:
                     print(f"REMOTE_AUTH_ACTION_CLOSED error_type={type(error).__name__}")
                     self._send(410)
