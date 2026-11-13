@@ -528,10 +528,12 @@ def _get_login_code_input(page):
     # that control is still the code input and must receive the whole code path.
     if code_prompt_visible or not phone_input:
         try:
-            candidates = page.locator("input[maxlength='1']")
+            candidates = page.locator("input")
             for index in range(candidates.count()):
                 element = candidates.nth(index)
                 if not element.is_visible(timeout=150):
+                    continue
+                if element.evaluate("el => el.maxLength === 1", timeout=200) is not True:
                     continue
                 hints = " ".join(
                     str(element.get_attribute(attribute) or "")
@@ -624,12 +626,16 @@ def _visible_otp_cells(page, reference_input=None, deduplicate=True):
     except Exception:
         reference_box = None
 
-    candidates = page.locator("input[maxlength='1']")
+    # Read the DOM property too; some frameworks apply maxLength at runtime
+    # without leaving a stable attribute selector for Playwright.
+    candidates = page.locator("input")
     fields = []
     for index in range(candidates.count()):
         field = candidates.nth(index)
         try:
             if not field.is_visible(timeout=150):
+                continue
+            if field.evaluate("el => el.maxLength === 1", timeout=200) is not True:
                 continue
             box = field.bounding_box()
             if not box:
@@ -668,6 +674,59 @@ def _auth_control_has_focus(control) -> bool:
             return el.matches(':focus') || document.activeElement === el ||
                 (root && root.activeElement === el);
         }""", timeout=300))
+    except Exception:
+        return False
+
+
+def _auth_control_is_single_cell(control) -> bool:
+    try:
+        return bool(control.evaluate("el => el.maxLength === 1", timeout=200))
+    except Exception:
+        return False
+
+
+def _focus_auth_control(control, caret="end") -> bool:
+    """Focus an auth control in the document or an open Shadow DOM root."""
+    try:
+        return bool(control.evaluate("""(el, caret) => {
+            el.focus({preventScroll: true});
+            if (typeof el.setSelectionRange === 'function') {
+                const point = caret === 'start' ? 0 : el.value.length;
+                el.setSelectionRange(point, point);
+            }
+            const root = el.getRootNode();
+            return el.matches(':focus') || document.activeElement === el ||
+                (root && root.activeElement === el);
+        }""", caret, timeout=500))
+    except Exception:
+        return False
+
+
+def _clear_single_otp_control(page, target, repeats=8) -> bool:
+    """Clear OTP state with keyboard events, including MAX's custom OTP widgets."""
+    if not target:
+        return False
+    if not _focus_auth_control(target):
+        # Avoid repeated physical clicks: MAX may reset its OTP widget on click.
+        try:
+            target.click(timeout=800, force=True)
+        except Exception:
+            pass
+        _focus_auth_control(target)
+    try:
+        page.keyboard.press("Meta+A" if sys.platform == "darwin" else "Control+A")
+        page.keyboard.press("Backspace")
+        for _ in range(repeats):
+            _focus_auth_control(target)
+            page.keyboard.press("Backspace")
+            page.wait_for_timeout(20)
+        if not re.sub(r"\D", "", _read_auth_input_text(target)):
+            return True
+    except Exception:
+        pass
+    try:
+        target.fill("", timeout=700)
+        return not re.sub(r"\D", "", _read_auth_input_text(target))
     except Exception:
         return False
 
@@ -729,14 +788,15 @@ def _clear_max_auth_input(page) -> bool:
     code_input = _get_login_code_input(page)
     if code_input:
         try:
-            if str(code_input.get_attribute("maxlength") or "") == "1":
+            if _auth_control_is_single_cell(code_input):
                 visible_fields = _visible_otp_cells(page, code_input)
                 if visible_fields:
                     for field in visible_fields:
-                        field.fill("", timeout=700)
+                        _clear_single_otp_control(page, field, repeats=2)
                     _focus_max_auth_input(page)
                     return True
-            code_input.fill("", timeout=1000)
+            if not _clear_single_otp_control(page, code_input):
+                return False
             _focus_max_auth_input(page)
             return True
         except Exception:
@@ -756,27 +816,35 @@ def _backspace_max_auth_input(page) -> bool:
     """Delete one character from MAX's active phone, code, or password field."""
     code_input = _get_login_code_input(page)
     try:
-        if code_input and str(code_input.get_attribute("maxlength") or "") == "1":
+        if code_input and _auth_control_is_single_cell(code_input):
             visible_fields = _visible_otp_cells(page, code_input)
             if visible_fields:
                 target = next(
                     (field for field in reversed(visible_fields) if field.input_value(timeout=200)),
                     visible_fields[-1],
                 )
-                target.focus(timeout=300)
-                target.press("Backspace", timeout=300)
+                if not _focus_auth_control(target):
+                    target.click(timeout=500, force=True)
+                    _focus_auth_control(target)
+                page.keyboard.press("Backspace")
                 return True
         target = code_input or _get_password_input(page) or _get_phone_input(page)
         if not target:
             return False
-        target.evaluate("""el => {
-            el.focus({preventScroll: true});
-            if (typeof el.setSelectionRange === 'function') {
-                const end = el.value.length;
-                el.setSelectionRange(end, end);
-            }
-        }""", timeout=300)
-        target.press("Backspace", timeout=300)
+        if code_input:
+            if not _focus_auth_control(target):
+                target.click(timeout=800, force=True)
+                _focus_auth_control(target)
+            page.keyboard.press("Backspace")
+        else:
+            target.evaluate("""el => {
+                el.focus({preventScroll: true});
+                if (typeof el.setSelectionRange === 'function') {
+                    const end = el.value.length;
+                    el.setSelectionRange(end, end);
+                }
+            }""", timeout=300)
+            target.press("Backspace", timeout=300)
         return True
     except Exception:
         return False
@@ -798,7 +866,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             page._max_login_code_attempts.append(f"{method}={len(value)}/{len(digits)}@focus:{int(focused)}")
             return value
 
-        max_length = str(code_input.get_attribute("maxlength") or "")
+        max_length = "1" if _auth_control_is_single_cell(code_input) else str(code_input.get_attribute("maxlength") or "")
 
         # Handle genuinely separate cells first. Click and send one real key
         # event per visible cell, left-to-right; never send a whole code to the
@@ -1113,14 +1181,9 @@ def _clear_otp_fields(page, code_input) -> None:
     cells = _visible_otp_cells(page, code_input, deduplicate=False)
     if cells:
         for cell in cells:
-            try:
-                cell.fill("", timeout=500)
-            except Exception:
-                pass
-    try:
-        code_input.fill("", timeout=500)
-    except Exception:
-        pass
+            _clear_single_otp_control(page, cell, repeats=2)
+        return
+    _clear_single_otp_control(page, code_input)
 
 
 def _paste_full_otp_code(page, code_input, digits: str) -> bool:
@@ -1190,15 +1253,54 @@ def _login_code_control_summary(page, control) -> str:
             autocomplete: el.getAttribute('autocomplete') || '',
             inputmode: el.getAttribute('inputmode') || '',
             maxLength: el.getAttribute('maxlength') || '',
+            maxLengthProperty: typeof el.maxLength === 'number' ? el.maxLength : null,
             disabled: !!el.disabled,
             readOnly: !!el.readOnly,
             focused: el.matches(':focus') || document.activeElement === el ||
                 (el.getRootNode() && el.getRootNode().activeElement === el),
+            rootType: el.getRootNode()?.constructor?.name || '',
+            selectionStart: typeof el.selectionStart === 'number' ? el.selectionStart : null,
+            selectionEnd: typeof el.selectionEnd === 'number' ? el.selectionEnd : null,
             editable: !!el.isContentEditable,
-            textLength: (('value' in el && typeof el.value === 'string') ? el.value : (el.innerText || el.textContent || '')).length
+            textLength: (('value' in el && typeof el.value === 'string') ? el.value : (el.innerText || el.textContent || '')).length,
+            peers: (() => {
+                const collect = root => {
+                    const found = [...root.querySelectorAll('input, textarea, [role="textbox"], [contenteditable="true"]')];
+                    for (const host of root.querySelectorAll('*')) if (host.shadowRoot) found.push(...collect(host.shadowRoot));
+                    return found;
+                };
+                const visible = collect(document).filter(field => {
+                    const rect = field.getBoundingClientRect(), style = getComputedStyle(field);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                });
+                return visible.slice(0, 8).map(field => {
+                    const rect = field.getBoundingClientRect();
+                    const value = ('value' in field && typeof field.value === 'string') ? field.value : (field.innerText || field.textContent || '');
+                    return [field.tagName.toLowerCase(), field.getAttribute('type') || field.getAttribute('role') || '',
+                        field.getAttribute('autocomplete') || '', field.getAttribute('inputmode') || '',
+                        `len:${value.length}`, `max:${field.maxLength ?? ''}`, `box:${Math.round(rect.width)}x${Math.round(rect.height)}`,
+                        field.className?.baseVal || field.className || ''].join('/').slice(0, 100);
+                });
+            })(),
+            containers: (() => {
+                const chain = [];
+                let node = el;
+                for (let depth = 0; node && depth < 6; depth++) {
+                    const rect = node.getBoundingClientRect();
+                    const text = node.innerText || node.textContent || '';
+                    chain.push([node.tagName?.toLowerCase() || node.constructor?.name || '',
+                        node.className?.baseVal || node.className || '',
+                        `children:${node.childElementCount || 0}`, `textlen:${text.length}`,
+                        `digits:${(text.match(/\\d/g) || []).length}`,
+                        `box:${Math.round(rect.width)}x${Math.round(rect.height)}`].join('/').slice(0, 90));
+                    if (node.parentElement) node = node.parentElement;
+                    else node = node.getRootNode()?.host || null;
+                }
+                return chain;
+            })()
         })""", timeout=300)
     except Exception:
-        details = {"tag": "unknown", "type": "", "role": "", "name": "", "placeholder": "", "autocomplete": "", "inputmode": "", "maxLength": "", "disabled": False, "readOnly": False, "focused": False, "editable": False, "textLength": 0}
+        details = {"tag": "unknown", "type": "", "role": "", "name": "", "placeholder": "", "autocomplete": "", "inputmode": "", "maxLength": "", "maxLengthProperty": None, "disabled": False, "readOnly": False, "focused": False, "rootType": "", "selectionStart": None, "selectionEnd": None, "editable": False, "textLength": 0, "peers": [], "containers": []}
     cell_count = len(_visible_otp_cells(page, control, deduplicate=False))
     hints = ", ".join(
         f"{key}={str(details[key])[:40]}" for key in ("autocomplete", "inputmode", "placeholder") if details[key]
@@ -1206,9 +1308,13 @@ def _login_code_control_summary(page, control) -> str:
     return (
         f"поле={details['tag']}/{details['type'] or details['role'] or 'без типа'}, "
         f"maxlength={details['maxLength'] or 'не задан'}, "
+        f"maxLength.prop={details['maxLengthProperty']}, root={details['rootType']}, "
         f"disabled={details['disabled']}, readonly={details['readOnly']}, "
         f"focus={details['focused']}, {hints}, "
-        f"символов в поле={details['textLength']}, ячеек={cell_count}"
+        f"символов в поле={details['textLength']}, ячеек={cell_count}, "
+        f"selection={details['selectionStart']}:{details['selectionEnd']}, "
+        f"видимые поля={';'.join(details.get('peers', []))[:400]}, "
+        f"контейнеры={';'.join(details.get('containers', []))[:450]}"
     )
 
 
