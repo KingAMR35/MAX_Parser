@@ -797,6 +797,53 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             if _max_login_advanced_after_code(page, code_input):
                 return True
 
+        # MAX can blur/remount its single one-time-code input after every
+        # character. Reacquire and focus the input before EACH digit, then put
+        # the caret at the end so the next key appends instead of replacing
+        # the first one. A single `press_sequentially` call only focuses once,
+        # which is insufficient for that UI behavior.
+        if max_length != "1":
+            _clear_otp_fields(page, code_input)
+            for index, digit in enumerate(digits, start=1):
+                current_input = _get_login_code_input(page) or code_input
+                if _max_login_advanced_after_code(page, current_input):
+                    return True
+                try:
+                    current_value = re.sub(r"\D", "", _read_auth_input_text(current_input))
+                except Exception:
+                    current_value = ""
+                expected_prefix = digits[:index]
+                if current_value == expected_prefix:
+                    continue
+                try:
+                    current_input.click(timeout=1000, force=True)
+                except Exception:
+                    pass
+                try:
+                    current_input.evaluate("""el => {
+                        el.focus({preventScroll: true});
+                        if (typeof el.setSelectionRange === 'function') {
+                            const end = el.value.length;
+                            el.setSelectionRange(end, end);
+                        }
+                    }""", timeout=500)
+                except Exception:
+                    try:
+                        current_input.focus(timeout=700)
+                    except Exception:
+                        pass
+                try:
+                    current_input.press(digit, timeout=1000)
+                except Exception:
+                    page.keyboard.press(digit)
+                page.wait_for_timeout(80)
+                record_attempt(f"refocus-{index}")
+            page.wait_for_timeout(120)
+            if _login_code_value_accepted(page, _get_login_code_input(page) or code_input, digits):
+                return True
+            if _max_login_advanced_after_code(page, _get_login_code_input(page) or code_input):
+                return True
+
         # Prefer a real, ordered keystroke sequence for MAX's native
         # one-time-code input. Several MAX builds advertise
         # autocomplete=one-time-code but silently clear values set through
