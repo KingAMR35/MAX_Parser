@@ -825,6 +825,46 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             except Exception:
                 pass
 
+        # Some controlled OTP widgets discard a bulk replacement and only
+        # update their state when receiving one insertText event at a time.
+        # Set the cumulative prefix before each event so the component always
+        # sees the full value reached so far, even if it rerenders the input.
+        if max_length != "1" and "one-time-code" in autocomplete:
+            _clear_otp_fields(page, code_input)
+            stepwise_ok = True
+            for index, digit in enumerate(digits, start=1):
+                current_input = _get_login_code_input(page) or code_input
+                try:
+                    current_input.evaluate("""(el, payload) => {
+                        const {prefix, digit} = payload;
+                        el.focus({preventScroll: true});
+                        const proto = el.tagName === 'TEXTAREA'
+                            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                        if (setter) setter.call(el, prefix); else el.value = prefix;
+                        el.dispatchEvent(new InputEvent('input', {
+                            bubbles: true, inputType: 'insertText', data: digit
+                        }));
+                    }""", {"prefix": digits[:index], "digit": digit}, timeout=1000)
+                except Exception:
+                    stepwise_ok = False
+                    break
+                page.wait_for_timeout(60)
+                record_attempt(f"otp-digit-{index}")
+                if _max_login_advanced_after_code(page, current_input):
+                    return True
+            if stepwise_ok:
+                current_input = _get_login_code_input(page) or code_input
+                try:
+                    current_input.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))", timeout=500)
+                except Exception:
+                    pass
+                page.wait_for_timeout(120)
+                if _login_code_value_accepted(page, current_input, digits):
+                    return True
+                if _max_login_advanced_after_code(page, current_input):
+                    return True
+
         # MAX can blur/remount its single one-time-code input after every
         # character. Reacquire and focus the input before EACH digit, then put
         # the caret at the end so the next key appends instead of replacing
