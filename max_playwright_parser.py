@@ -761,6 +761,20 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
         if not re.fullmatch(r"\d{4,8}", digits or ""):
             return False
 
+        # Keep a safe trace of which input mechanisms MAX accepted. Never
+        # record the code itself; this is used only in an error returned to
+        # the login page if every method fails.
+        page._max_login_code_attempts = []
+
+        def record_attempt(method):
+            value = re.sub(r"\D", "", _read_auth_input_text(code_input))
+            try:
+                focused = bool(code_input.evaluate("el => document.activeElement === el", timeout=200))
+            except Exception:
+                focused = False
+            page._max_login_code_attempts.append(f"{method}={len(value)}/{len(digits)}@focus:{int(focused)}")
+            return value
+
         max_length = str(code_input.get_attribute("maxlength") or "")
 
         # Handle genuinely separate cells first. Click and send one real key
@@ -783,6 +797,50 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             if _max_login_advanced_after_code(page, code_input):
                 return True
 
+        # Prefer a real, ordered keystroke sequence for MAX's native
+        # one-time-code input. Several MAX builds advertise
+        # autocomplete=one-time-code but silently clear values set through
+        # fill()/paste; key events are handled by the login widget itself.
+        if max_length != "1":
+            _clear_otp_fields(page, code_input)
+            try:
+                code_input.click(timeout=1200, force=True)
+            except Exception:
+                try:
+                    code_input.focus(timeout=1000)
+                except Exception:
+                    pass
+            try:
+                code_input.press_sequentially(digits, delay=85, timeout=4000)
+            except Exception:
+                # Older Playwright versions may not provide
+                # press_sequentially; type one trusted key at a time.
+                _clear_otp_fields(page, code_input)
+                try:
+                    code_input.click(timeout=1000, force=True)
+                except Exception:
+                    try:
+                        code_input.focus(timeout=700)
+                    except Exception:
+                        pass
+                for digit in digits:
+                    page.keyboard.press(digit)
+                    page.wait_for_timeout(75)
+            page.wait_for_timeout(150)
+            record_attempt("keyboard-first")
+            if _login_code_value_accepted(page, code_input, digits):
+                return True
+            if _max_login_advanced_after_code(page, code_input):
+                return True
+            # MAX may validate immediately and rerender the same challenge.
+            # Give the transition a short window before trying a different
+            # input mechanism, to avoid typing into a stale locator.
+            transition_deadline = time.monotonic() + 1.0
+            while time.monotonic() < transition_deadline:
+                if _max_login_advanced_after_code(page, code_input):
+                    return True
+                page.wait_for_timeout(100)
+
         # A regular input or contenteditable should accept the complete value
         # directly. This is the primary path when there are no separate cells.
         if max_length != "1":
@@ -797,6 +855,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             try:
                 code_input.fill(digits, timeout=1500)
                 page.wait_for_timeout(100)
+                record_attempt("fill")
                 if _login_code_value_accepted(page, code_input, digits):
                     return True
                 if _max_login_advanced_after_code(page, code_input):
@@ -809,6 +868,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
         _clear_otp_fields(page, code_input)
         if _paste_full_otp_code(page, code_input, digits):
             page.wait_for_timeout(120)
+            record_attempt("paste")
             if _login_code_value_accepted(page, code_input, digits):
                 return True
             if _max_login_advanced_after_code(page, code_input):
@@ -829,6 +889,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 }));
             }""", digits, timeout=1200)
             page.wait_for_timeout(120)
+            record_attempt("paste-event")
             if _login_code_value_accepted(page, code_input, digits):
                 return True
             if _max_login_advanced_after_code(page, code_input):
@@ -846,29 +907,63 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             code_input.focus(timeout=1000)
         page.keyboard.insert_text(digits)
         page.wait_for_timeout(100)
+        record_attempt("insert-text")
         if _login_code_value_accepted(page, code_input, digits):
             return True
         if _max_login_advanced_after_code(page, code_input):
             return True
 
-        # Last fallback for a standard single input: send ordered key events.
-        # Avoid Locator.fill(digits), which can make MAX's custom OTP handler
-        # place only the last character into its first visual cell.
+        # Send actual, ordered keyboard events to MAX's one-time-code input.
+        # Some builds ignore programmatic fill/paste but accept normal typing.
         _clear_otp_fields(page, code_input)
         try:
-            code_input.click(timeout=1000)
+            code_input.click(timeout=1200, force=True)
         except Exception:
-            code_input.focus(timeout=1000)
-        for digit in digits:
-            page.keyboard.press(digit)
-            page.wait_for_timeout(35)
+            try:
+                code_input.focus(timeout=1000)
+            except Exception:
+                pass
+        try:
+            # Playwright's sequential locator typing sends keydown/keypress/
+            # input per digit in order, unlike setting one bulk value.
+            code_input.press_sequentially(digits, delay=65, timeout=3000)
+        except Exception:
+            # Keep a per-key fallback for older Playwright versions.
+            for digit in digits:
+                page.keyboard.press(digit)
+                page.wait_for_timeout(55)
+        page.wait_for_timeout(120)
+        record_attempt("keyboard")
         if _login_code_value_accepted(page, code_input, digits):
             return True
         if _max_login_advanced_after_code(page, code_input):
             return True
 
-        # Don't leave a partial or misleading code in MAX.
+        # A native setter plus bubbling input/change events is the final
+        # fallback for React-style controlled inputs that reject Playwright's
+        # fill implementation. Leave the resulting value visible if MAX still
+        # rejects it so diagnostics and manual correction remain possible.
         _clear_otp_fields(page, code_input)
+        try:
+            code_input.evaluate("""(el, code) => {
+                el.focus({preventScroll: true});
+                const proto = el.tagName === 'TEXTAREA'
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(el, code); else el.value = code;
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertText', data: code
+                }));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""", digits, timeout=1000)
+            page.wait_for_timeout(120)
+            record_attempt("native-input")
+            if _login_code_value_accepted(page, code_input, digits):
+                return True
+            if _max_login_advanced_after_code(page, code_input):
+                return True
+        except Exception:
+            pass
         return False
     except Exception:
         return False
@@ -1235,7 +1330,9 @@ class QRLoginSession:
                 if re.fullmatch(r"\d{4,8}", digits or ""):
                     if not _fill_login_code(self.page, code_input, digits):
                         state = _login_code_control_summary(self.page, code_input)
-                        raise ValueError(f"MAX не подтвердил полный код ({state})")
+                        attempts = " → ".join(getattr(self.page, "_max_login_code_attempts", []))
+                        attempt_state = f"; способы ввода: {attempts}" if attempts else ""
+                        raise ValueError(f"MAX не подтвердил полный код ({state}{attempt_state})")
                 else:
                     code_input.fill(value, timeout=1500)
                 _focus_max_auth_input(self.page)
@@ -1470,7 +1567,9 @@ class QRLoginSession:
                     return
             if not _fill_login_code(self.page, code_input, digits):
                 state = _login_code_control_summary(self.page, code_input)
-                self.result_queue.put(("error", f"MAX не подтвердил полный код ({state})"))
+                attempts = " → ".join(getattr(self.page, "_max_login_code_attempts", []))
+                attempt_state = f"; способы ввода: {attempts}" if attempts else ""
+                self.result_queue.put(("error", f"MAX не подтвердил полный код ({state}{attempt_state})"))
                 return
             if not _click_submit_button(self.page):
                 self.page.keyboard.press("Enter")

@@ -49,8 +49,12 @@ button.busy::after{content:"";position:absolute;right:12px;top:50%;width:15px;he
 .guide summary:active{background:#ffffff18;transform:scale(.99)}
 .guide ol{margin:8px 0 0;padding-left:22px}
 .guide li{margin:6px 0}
-.toolbar{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}
-.toolbar button{background:#34435b}
+.toolbar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:10px 0}
+.toolbar button{min-height:46px;padding:10px 12px;line-height:1.2;box-shadow:0 3px 10px #05070b55}
+#refreshButton{background:#087e8b}
+#reloadButton{background:#9a5b16}
+#zoomButton{background:#6546a5}
+#zoomButton.zoomed{background:#365c91}
 #screenTip{color:#e2eafe;font-weight:650;margin:8px 0}
 #screenFrame{position:relative;width:100%;max-height:64vh;overflow:auto;background:#05070b;border:1px solid #3c4960;border-radius:12px;transition:border-color .1s ease,box-shadow .1s ease}
 #screenFrame.busy{border-color:#69a5ff;box-shadow:0 0 0 3px #69a5ff66}
@@ -65,7 +69,8 @@ main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
 .inputRow{gap:6px}#keyboard{height:56px;padding:10px;font-size:17px}
 #sendButton{min-width:108px;padding:9px;font-size:14px}
 .editActions{gap:6px}.editActions button{padding:10px 8px;font-size:13px}
-.toolbar{gap:6px}.toolbar button{padding:9px 10px;font-size:13px}
+.toolbar{grid-template-columns:1fr 1fr;gap:7px}.toolbar button{min-height:44px;padding:9px 7px;font-size:13px}
+#zoomButton{grid-column:1/-1}
 #screenFrame{max-height:50dvh}#screen{max-height:50dvh}
 .warning{padding:10px;font-size:12px}
 }
@@ -120,7 +125,7 @@ document.getElementById("refreshButton").onclick=e=>runButton(e.currentTarget,()
 document.getElementById("reloadButton").onclick=e=>runButton(e.currentTarget,reloadMax,"Перезагружаю страницу MAX…");
 document.getElementById("backspaceButton").onclick=e=>runButton(e.currentTarget,async()=>{const ok=await action("backspace");if(ok)state.textContent="✅ Удалён последний символ в поле MAX.";return ok;},"Стираю последний символ в MAX…");
 document.getElementById("clearButton").onclick=e=>runButton(e.currentTarget,async()=>{const ok=await action("clear");if(ok)state.textContent="✅ Поле MAX очищено.";return ok;},"Очищаю активное поле MAX…");
-zoomButton.onclick=e=>runButton(e.currentTarget,async()=>{const zoomed=screenFrame.classList.toggle("zoomed");zoomButton.textContent=zoomed?"🔎 Уменьшить экран":"🔍 Увеличить экран";state.textContent=zoomed?"Экран увеличен.":"Обычный размер экрана.";await new Promise(resolve=>setTimeout(resolve,140));return true;},"Меняю размер экрана…");
+zoomButton.onclick=e=>runButton(e.currentTarget,async()=>{const zoomed=screenFrame.classList.toggle("zoomed");zoomButton.classList.toggle("zoomed",zoomed);zoomButton.textContent=zoomed?"🔎 Уменьшить экран":"🔍 Увеличить экран";state.textContent=zoomed?"Экран увеличен.":"Обычный размер экрана.";await new Promise(resolve=>setTimeout(resolve,140));return true;},"Меняю размер экрана…");
 screen.addEventListener("click",async e=>{if(screenFrame.classList.contains("busy"))return;const r=screen.getBoundingClientRect(),scale=Math.min(r.width/1280,r.height/800),ox=(r.width-1280*scale)/2,oy=(r.height-800*scale)/2,x=Math.round((e.clientX-r.left-ox)/scale),y=Math.round((e.clientY-r.top-oy)/scale);if(x<0||x>=1280||y<0||y>=800)return;screenFrame.classList.add("busy");state.textContent="⏳ Передаю нажатие в MAX…";try{const ok=await action("click",{x,y});if(ok)state.textContent="✅ Нажатие выполнено на экране MAX.";}finally{screenFrame.classList.remove("busy");}});
 box.addEventListener("keydown",async e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();await runButton(sendButton,()=>sendDraft(true),"Передаю данные и нажимаю Enter в MAX…");return;}if(box.value)return;const allowed=["Tab","Backspace","Delete","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Home","End","PageUp","PageDown"];if(allowed.includes(e.key)){e.preventDefault();await action("key",{key:e.key});}});
 screen.addEventListener("wheel",e=>{if(screenFrame.classList.contains("zoomed"))return;e.preventDefault();action("scroll",{deltaY:Math.max(-900,Math.min(900,Math.round(e.deltaY)))});},{passive:false});
