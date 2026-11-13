@@ -620,22 +620,59 @@ def _get_unlabeled_otp_input(page, value: str):
 
 
 def _visible_otp_cells(page, reference_input=None, deduplicate=True):
-    """Return visible single-character OTP inputs in visual (left-to-right) order."""
+    """Return OTP cells, including MAX's six numeric inputs without maxlength."""
     try:
         reference_box = reference_input.bounding_box() if reference_input else None
     except Exception:
         reference_box = None
 
-    # Read the DOM property too; some frameworks apply maxLength at runtime
-    # without leaving a stable attribute selector for Playwright.
-    candidates = page.locator("input")
+    # MAX's current code screen is a row of six numeric inputs. Only the first
+    # advertises autocomplete=one-time-code; none has maxlength=1. Find their
+    # nearest shared row by layout and numeric inputmode instead of treating
+    # the first input as the entire OTP field.
+    if reference_input:
+        try:
+            reference_input.evaluate("""reference => {
+                const visible = el => {
+                    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                        s.visibility !== 'hidden' && !el.disabled && !el.readOnly;
+                };
+                let parent = reference.parentElement;
+                for (let depth = 0; parent && depth < 7; depth++, parent = parent.parentElement) {
+                    const inputs = [...parent.querySelectorAll('input')].filter(el =>
+                        visible(el) && el.inputMode === 'numeric' && el.type !== 'password');
+                    if (inputs.length < 4 || inputs.length > 8 || !inputs.includes(reference)) continue;
+                    const ordered = inputs.map(el => ({el, rect: el.getBoundingClientRect()}))
+                        .sort((a,b) => a.rect.left - b.rect.left);
+                    const first = ordered[0].rect;
+                    const sameRow = ordered.every(item =>
+                        Math.abs(item.rect.top - first.top) <= Math.max(12, first.height * 0.3));
+                    const similarSize = ordered.every(item =>
+                        item.rect.width >= 18 && item.rect.width <= 100 &&
+                        Math.abs(item.rect.height - first.height) <= Math.max(8, first.height * 0.25));
+                    if (!sameRow || !similarSize) continue;
+                    ordered.forEach((item, index) => item.el.setAttribute('data-maxparser-otp-cell', String(index)));
+                    return ordered.length;
+                }
+                return 0;
+            }""", timeout=500)
+        except Exception:
+            pass
+
+    marked = page.locator("input[data-maxparser-otp-cell]")
+    try:
+        marked_count = marked.count()
+    except Exception:
+        marked_count = 0
+    candidates = marked if marked_count >= 4 else page.locator("input")
     fields = []
     for index in range(candidates.count()):
         field = candidates.nth(index)
         try:
             if not field.is_visible(timeout=150):
                 continue
-            if field.evaluate("el => el.maxLength === 1", timeout=200) is not True:
+            if marked_count < 4 and field.evaluate("el => el.maxLength === 1", timeout=200) is not True:
                 continue
             box = field.bounding_box()
             if not box:
@@ -788,10 +825,15 @@ def _clear_max_auth_input(page) -> bool:
     code_input = _get_login_code_input(page)
     if code_input:
         try:
+            otp_cells = _visible_otp_cells(page, code_input)
+            if len(otp_cells) >= 4:
+                for cell in otp_cells:
+                    cell.fill("", timeout=700)
+                _focus_max_auth_input(page)
+                return True
             if _auth_control_is_single_cell(code_input):
-                visible_fields = _visible_otp_cells(page, code_input)
-                if visible_fields:
-                    for field in visible_fields:
+                if otp_cells:
+                    for field in otp_cells:
                         _clear_single_otp_control(page, field, repeats=2)
                     _focus_max_auth_input(page)
                     return True
@@ -816,6 +858,18 @@ def _backspace_max_auth_input(page) -> bool:
     """Delete one character from MAX's active phone, code, or password field."""
     code_input = _get_login_code_input(page)
     try:
+        if code_input:
+            otp_cells = _visible_otp_cells(page, code_input)
+            if len(otp_cells) >= 4:
+                target = next(
+                    (field for field in reversed(otp_cells) if field.input_value(timeout=200)),
+                    otp_cells[-1],
+                )
+                if not _focus_auth_control(target):
+                    target.click(timeout=500, force=True)
+                    _focus_auth_control(target)
+                page.keyboard.press("Backspace")
+                return True
         if code_input and _auth_control_is_single_cell(code_input):
             visible_fields = _visible_otp_cells(page, code_input)
             if visible_fields:
@@ -1181,7 +1235,10 @@ def _clear_otp_fields(page, code_input) -> None:
     cells = _visible_otp_cells(page, code_input, deduplicate=False)
     if cells:
         for cell in cells:
-            _clear_single_otp_control(page, cell, repeats=2)
+            try:
+                cell.fill("", timeout=500)
+            except Exception:
+                _clear_single_otp_control(page, cell, repeats=2)
         return
     _clear_single_otp_control(page, code_input)
 
