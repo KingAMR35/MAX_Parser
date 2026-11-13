@@ -660,16 +660,42 @@ def _visible_otp_cells(page, reference_input=None, deduplicate=True):
     return unique_fields
 
 
+def _auth_control_has_focus(control) -> bool:
+    """Check focus correctly for controls inside an open Shadow DOM root."""
+    try:
+        return bool(control.evaluate("""el => {
+            const root = el.getRootNode();
+            return el.matches(':focus') || document.activeElement === el ||
+                (root && root.activeElement === el);
+        }""", timeout=300))
+    except Exception:
+        return False
+
+
 def _focus_max_auth_input(page) -> bool:
     """Focus the visible MAX auth field without a chain of slow locator waits."""
     try:
         return bool(page.evaluate("""() => {
+            const deepActive = () => {
+                let active = document.activeElement;
+                while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+                    active = active.shadowRoot.activeElement;
+                }
+                return active;
+            };
+            const collectFields = root => {
+                const found = [...root.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')];
+                for (const host of root.querySelectorAll('*')) {
+                    if (host.shadowRoot) found.push(...collectFields(host.shadowRoot));
+                }
+                return found;
+            };
             const visible = el => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
                 return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
             };
-            const fields = [...document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')]
+            const fields = collectFields(document)
                 .filter(el => visible(el) && !el.disabled && !el.readOnly);
             if (!fields.length) return false;
             const info = el => [el.type, el.name, el.id, el.placeholder,
@@ -692,7 +718,7 @@ def _focus_max_auth_input(page) -> bool:
             const target = semanticCode || (codePrompt || !phone ? segmentedCode : null) || phone || password || numericCode;
             if (!target) return false;
             target.focus({preventScroll: true});
-            return document.activeElement === target;
+            return target.matches(':focus') || deepActive() === target;
         }"""))
     except Exception:
         return False
@@ -768,10 +794,7 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
 
         def record_attempt(method):
             value = re.sub(r"\D", "", _read_auth_input_text(code_input))
-            try:
-                focused = bool(code_input.evaluate("el => document.activeElement === el", timeout=200))
-            except Exception:
-                focused = False
+            focused = _auth_control_has_focus(code_input)
             page._max_login_code_attempts.append(f"{method}={len(value)}/{len(digits)}@focus:{int(focused)}")
             return value
 
@@ -890,7 +913,9 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                             const end = el.value.length;
                             el.setSelectionRange(end, end);
                         }
-                        return document.activeElement === el;
+                        const root = el.getRootNode();
+                        return el.matches(':focus') || document.activeElement === el ||
+                            (root && root.activeElement === el);
                     }""", timeout=500)
                 except Exception:
                     focused = False
@@ -1167,7 +1192,8 @@ def _login_code_control_summary(page, control) -> str:
             maxLength: el.getAttribute('maxlength') || '',
             disabled: !!el.disabled,
             readOnly: !!el.readOnly,
-            focused: document.activeElement === el,
+            focused: el.matches(':focus') || document.activeElement === el ||
+                (el.getRootNode() && el.getRootNode().activeElement === el),
             editable: !!el.isContentEditable,
             textLength: (('value' in el && typeof el.value === 'string') ? el.value : (el.innerText || el.textContent || '')).length
         })""", timeout=300)
