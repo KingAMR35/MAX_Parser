@@ -816,26 +816,26 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
                 if current_value == expected_prefix:
                     continue
                 try:
-                    current_input.click(timeout=1000, force=True)
-                except Exception:
-                    pass
-                try:
-                    current_input.evaluate("""el => {
+                    focused = current_input.evaluate("""el => {
                         el.focus({preventScroll: true});
                         if (typeof el.setSelectionRange === 'function') {
                             const end = el.value.length;
                             el.setSelectionRange(end, end);
                         }
+                        return document.activeElement === el;
                     }""", timeout=500)
                 except Exception:
+                    focused = False
+                if not focused:
                     try:
-                        current_input.focus(timeout=700)
+                        current_input.click(timeout=1000, force=True)
+                        current_input.evaluate("el => el.focus({preventScroll: true})", timeout=300)
                     except Exception:
                         pass
-                try:
-                    current_input.press(digit, timeout=1000)
-                except Exception:
-                    page.keyboard.press(digit)
+                # Use the page keyboard after explicit focus. Locator.press()
+                # can refocus by clicking; MAX's code widget may clear its
+                # one-time-code state in response to an extra click.
+                page.keyboard.press(digit)
                 page.wait_for_timeout(80)
                 record_attempt(f"refocus-{index}")
             page.wait_for_timeout(120)
