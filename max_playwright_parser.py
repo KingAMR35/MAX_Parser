@@ -797,6 +797,34 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             if _max_login_advanced_after_code(page, code_input):
                 return True
 
+        # The single MAX control explicitly advertises autocomplete=one-time-code.
+        # Treat the six digits as one browser OTP autofill replacement event,
+        # rather than six ordinary character events (which MAX currently
+        # reduces to the first digit in this UI).
+        autocomplete = str(code_input.get_attribute("autocomplete") or "").casefold()
+        if max_length != "1" and "one-time-code" in autocomplete:
+            _clear_otp_fields(page, code_input)
+            try:
+                code_input.evaluate("""(el, code) => {
+                    el.focus({preventScroll: true});
+                    const proto = el.tagName === 'TEXTAREA'
+                        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, code); else el.value = code;
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertReplacementText', data: code
+                    }));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }""", digits, timeout=1000)
+                page.wait_for_timeout(120)
+                record_attempt("otp-autofill")
+                if _login_code_value_accepted(page, code_input, digits):
+                    return True
+                if _max_login_advanced_after_code(page, code_input):
+                    return True
+            except Exception:
+                pass
+
         # MAX can blur/remount its single one-time-code input after every
         # character. Reacquire and focus the input before EACH digit, then put
         # the caret at the end so the next key appends instead of replacing
