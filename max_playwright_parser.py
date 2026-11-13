@@ -791,6 +791,43 @@ def _fill_login_code(page, code_input, digits: str) -> bool:
             if _max_login_advanced_after_code(page, code_input):
                 return True
 
+        # Some MAX builds consume the paste event in their own handler but do
+        # not expose clipboard access in the headless browser. Dispatch the
+        # same bubbling event to the detected OTP control as a fallback.
+        _clear_otp_fields(page, code_input)
+        try:
+            code_input.evaluate("""(el, code) => {
+                el.focus({preventScroll: true});
+                const data = new DataTransfer();
+                data.setData('text/plain', code);
+                data.setData('text', code);
+                el.dispatchEvent(new ClipboardEvent('paste', {
+                    bubbles: true, cancelable: true, clipboardData: data
+                }));
+            }""", digits, timeout=1200)
+            page.wait_for_timeout(120)
+            if _login_code_value_accepted(page, code_input, digits):
+                return True
+            if _max_login_advanced_after_code(page, code_input):
+                return True
+        except Exception:
+            pass
+
+        # MAX may use one normal OTP input without maxlength=1. In that case
+        # a single fill is the correct browser operation; never do this for a
+        # one-character cell, where it would retain only one digit.
+        try:
+            if str(code_input.get_attribute("maxlength") or "") != "1":
+                _clear_otp_fields(page, code_input)
+                code_input.fill(digits, timeout=1500)
+                page.wait_for_timeout(100)
+                if _login_code_value_accepted(page, code_input, digits):
+                    return True
+                if _max_login_advanced_after_code(page, code_input):
+                    return True
+        except Exception:
+            pass
+
         # Last fallback for a standard single input: send ordered key events.
         # Avoid Locator.fill(digits), which can make MAX's custom OTP handler
         # place only the last character into its first visual cell.
@@ -862,13 +899,46 @@ def _login_code_value_accepted(page, code_input, digits: str) -> bool:
             return True
     except Exception:
         pass
+    value = _read_auth_input_text(code_input)
+    if re.sub(r"\D", "", value) == digits:
+        return True
+    return _max_login_advanced_after_code(page, code_input)
+
+
+def _read_auth_input_text(control) -> str:
+    """Read OTP value from input, textarea, or MAX's contenteditable textbox."""
     try:
-        value = re.sub(r"\D", "", code_input.input_value(timeout=300))
-        if value == digits:
-            return True
+        return str(control.input_value(timeout=300) or "")
     except Exception:
         pass
-    return _max_login_advanced_after_code(page, code_input)
+    try:
+        return str(control.evaluate("""el => {
+            if ('value' in el && typeof el.value === 'string') return el.value;
+            return el.innerText || el.textContent || '';
+        }""", timeout=300) or "")
+    except Exception:
+        return ""
+
+
+def _login_code_control_summary(page, control) -> str:
+    """Return structural diagnostics without exposing any code characters."""
+    try:
+        details = control.evaluate("""el => ({
+            tag: el.tagName,
+            type: el.getAttribute('type') || '',
+            role: el.getAttribute('role') || '',
+            maxLength: el.getAttribute('maxlength') || '',
+            editable: !!el.isContentEditable,
+            textLength: (('value' in el && typeof el.value === 'string') ? el.value : (el.innerText || el.textContent || '')).length
+        })""", timeout=300)
+    except Exception:
+        details = {"tag": "unknown", "type": "", "role": "", "maxLength": "", "editable": False, "textLength": 0}
+    cell_count = len(_visible_otp_cells(page, control, deduplicate=False))
+    return (
+        f"поле={details['tag']}/{details['type'] or details['role'] or 'без типа'}, "
+        f"maxlength={details['maxLength'] or 'не задан'}, "
+        f"символов в поле={details['textLength']}, ячеек={cell_count}"
+    )
 
 
 def _max_login_advanced_after_code(page, code_input) -> bool:
@@ -1129,7 +1199,8 @@ class QRLoginSession:
                 digits = re.sub(r"\D", "", value)
                 if re.fullmatch(r"\d{4,8}", digits or ""):
                     if not _fill_login_code(self.page, code_input, digits):
-                        raise ValueError("Не удалось заполнить все поля кода MAX")
+                        state = _login_code_control_summary(self.page, code_input)
+                        raise ValueError(f"MAX не подтвердил полный код ({state})")
                 else:
                     code_input.fill(value, timeout=1500)
                 _focus_max_auth_input(self.page)
@@ -1363,7 +1434,8 @@ class QRLoginSession:
                     self.result_queue.put(("error", "Поле кода подтверждения не найдено"))
                     return
             if not _fill_login_code(self.page, code_input, digits):
-                self.result_queue.put(("error", "Не удалось заполнить поле кода MAX полностью"))
+                state = _login_code_control_summary(self.page, code_input)
+                self.result_queue.put(("error", f"MAX не подтвердил полный код ({state})"))
                 return
             if not _click_submit_button(self.page):
                 self.page.keyboard.press("Enter")
