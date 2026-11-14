@@ -13,6 +13,7 @@ import subprocess
 import uuid
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode, urlsplit
 from telebot import types
 from dotenv import load_dotenv
@@ -56,7 +57,12 @@ _current_cycle_hashes = {}
 NO_PREVIEW = {"disable_web_page_preview": True}
 active_logins = {}
 auth_login_review_events = {}
+auth_completion_lock = threading.Lock()
 auth_qr_message_ids = {}
+auth_qr_wait_notices = set()
+auth_qr_wait_notice_lock = threading.Lock()
+project_access_verifying = set()
+project_access_verifying_lock = threading.Lock()
 awaiting_password_from = {}
 awaiting_phone_from = {}
 awaiting_code_from = {}
@@ -560,6 +566,7 @@ def _record_parser_sent_post(
         "has_media": bool(post.get("media_files")),
         "media_hashes": _post_media_hashes(post),
         "source_id_is_index": bool(post.get("source_id_is_index")),
+        "is_outgoing": bool(post.get("is_outgoing")),
         "name": str(post.get("name") or "")[:100],
         "date": str(post.get("date") or "")[:32],
         "time": str(post.get("time") or "")[:24],
@@ -1845,6 +1852,8 @@ def _process_posts(
     debug_logger.info("CHAT_PROCESS_START chat_id=%s title=%s posts=%s", chat_id, log_preview(title, 100), len(posts))
     cycle_ids = set()
     for post in posts:
+        if bool(post.get("is_outgoing")):
+            _mark_parser_record_outgoing(chat_id, destination_chat_id, post)
         source_id = str(post.get("source_id") or "").strip()
         if post.get("source_id_is_index"):
             cycle_key = get_message_hash(post)
@@ -1928,7 +1937,8 @@ def _process_posts(
                 )
                 continue
             if sent_message_id:
-                latest_sent_message_id = int(sent_message_id)
+                if not bool(post.get("is_outgoing")):
+                    latest_sent_message_id = int(sent_message_id)
             _commit_successful_post(chat_id, post)
             increment_message_count(chat_id)
             new_count += 1
@@ -2730,6 +2740,23 @@ def _clear_auth_qr_controls(target_chat_id):
             pass
 
 
+def _claim_qr_wait_notice(target_chat_id, session):
+    key = (str(target_chat_id), id(session))
+    with auth_qr_wait_notice_lock:
+        if key in auth_qr_wait_notices:
+            return False
+        auth_qr_wait_notices.add(key)
+        return True
+
+
+def _clear_qr_wait_notices(target_chat_id):
+    target = str(target_chat_id)
+    with auth_qr_wait_notice_lock:
+        auth_qr_wait_notices.difference_update(
+            key for key in tuple(auth_qr_wait_notices) if key[0] == target
+        )
+
+
 def _track_auth_message(target_chat_id, message):
     if message:
         auth_qr_message_ids.setdefault(target_chat_id, set()).add(
@@ -2738,8 +2765,18 @@ def _track_auth_message(target_chat_id, message):
 
 
 def _complete_login(target_chat_id, output_chat_id):
-    review_event_id = auth_login_review_events.pop(target_chat_id, None)
-    active_logins.pop(target_chat_id, None)
+    with auth_completion_lock:
+        login_session = active_logins.get(target_chat_id)
+        review_event_id = auth_login_review_events.get(target_chat_id)
+        if login_session is None and review_event_id is None:
+            debug_logger.info(
+                "MAX_LOGIN_COMPLETION_DUPLICATE_IGNORED target=%s",
+                target_chat_id,
+            )
+            return False
+        active_logins.pop(target_chat_id, None)
+        review_event_id = auth_login_review_events.pop(target_chat_id, None)
+    _clear_qr_wait_notices(target_chat_id)
     _clear_auth_waiters(target_chat_id)
     _clear_auth_qr_controls(target_chat_id)
     chat = get_chat_by_id(target_chat_id) if target_chat_id != "project_account" else None
@@ -2887,6 +2924,7 @@ def do_qr_login(target_chat_id, admin_chat_id):
         bot.send_message(admin_chat_id, "❌ Чат не найден", **NO_PREVIEW)
         return
     title = "готового аккаунта" if is_project_account else chat["title"]
+    _clear_qr_wait_notices(target_chat_id)
     _clear_auth_qr_controls(target_chat_id)
     auth_login_review_events.pop(target_chat_id, None)
     session = active_logins.pop(target_chat_id, None)
@@ -3002,7 +3040,7 @@ def _sent_record_time_label(record):
         sent_at = datetime.fromisoformat(str(record.get("sent_at") or "").replace("Z", "+00:00"))
         if sent_at.tzinfo is None:
             sent_at = sent_at.replace(tzinfo=timezone.utc)
-        return sent_at.astimezone().strftime("%d.%m %H:%M")
+        return sent_at.astimezone(ZoneInfo("Europe/Samara")).strftime("%d.%m %H:%M")
     except (TypeError, ValueError):
         return "время неизвестно"
 
@@ -5782,6 +5820,7 @@ def _cancel_customer_connection(user_id, chat_id=None, callback_message=None):
 
     session = active_logins.pop(chat_id, None) if chat_id is not None else None
     if chat_id is not None:
+        _clear_qr_wait_notices(chat_id)
         auth_login_review_events.pop(chat_id, None)
         _clear_auth_waiters(chat_id)
 
@@ -6471,7 +6510,7 @@ def _max_send_anchor_is_parser_post(chat_id, message_id):
     except (TypeError, ValueError):
         return False
     for record in _sent_parser_records_snapshot():
-        if str(record.get("origin") or "") == "bot":
+        if str(record.get("origin") or "") == "bot" or bool(record.get("is_outgoing")):
             continue
         try:
             if int(record.get("chat_id") or 0) == chat_id and message_id in {
@@ -6519,7 +6558,7 @@ def _clear_max_send_anchor(chat_id, destination_chat_id, message_id):
 def _latest_parser_send_anchor(chat_id, destination_chat_id):
     candidates = []
     for record in _sent_parser_records_snapshot():
-        if str(record.get("origin") or "") == "bot":
+        if str(record.get("origin") or "") == "bot" or bool(record.get("is_outgoing")):
             continue
         try:
             if int(record.get("chat_id") or 0) != int(chat_id):
@@ -6536,6 +6575,57 @@ def _latest_parser_send_anchor(chat_id, destination_chat_id):
         except (TypeError, ValueError):
             continue
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _mark_parser_record_outgoing(chat_id, destination_chat_id, post):
+    source_id = str(post.get("source_id") or post.get("idx") or "").strip()
+    if not source_id:
+        return False
+    changed = False
+    with _sent_parser_messages_lock:
+        for index, record in enumerate(_sent_parser_messages):
+            try:
+                matches_record = (
+                    record.get("origin") != "bot"
+                    and str(record.get("source_id") or "").strip() == source_id
+                    and int(record.get("chat_id") or 0) == int(chat_id)
+                    and int(record.get("destination_chat_id") or record.get("chat_id") or 0)
+                    == int(destination_chat_id)
+                    and not bool(record.get("is_outgoing"))
+                )
+            except (AttributeError, TypeError, ValueError):
+                matches_record = False
+            if not matches_record:
+                continue
+            updated = dict(record)
+            updated["is_outgoing"] = True
+            _sent_parser_messages[index] = updated
+            changed = True
+        if changed:
+            _save_sent_parser_messages_locked()
+    return changed
+
+
+def _sent_record_is_outgoing_anchor(chat_id, destination_chat_id, message_id):
+    try:
+        target_id = int(message_id)
+    except (TypeError, ValueError):
+        return False
+    with _sent_parser_messages_lock:
+        for record in _sent_parser_messages:
+            try:
+                if (
+                    record.get("origin") != "bot"
+                    and bool(record.get("is_outgoing"))
+                    and int(record.get("chat_id") or 0) == int(chat_id)
+                    and int(record.get("destination_chat_id") or record.get("chat_id") or 0)
+                    == int(destination_chat_id)
+                    and target_id in {int(value) for value in record.get("message_ids") or []}
+                ):
+                    return True
+            except (AttributeError, TypeError, ValueError):
+                continue
+    return False
 
 
 def _remove_max_send_button(chat_id, preserve_anchor=False):
@@ -6660,9 +6750,14 @@ def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=N
     existing_id = chat.get("max_send_button_message_id")
     keyboard = _public_max_send_button_keyboard(chat_id)
 
-    target_id = anchor_message_id or _latest_parser_send_anchor(
-        int(chat_id), destination_chat_id
-    ) or chat.get("max_send_button_message_id")
+    latest_anchor = _latest_parser_send_anchor(int(chat_id), destination_chat_id)
+    target_id = anchor_message_id or latest_anchor
+    if not target_id and existing_id and _sent_record_is_outgoing_anchor(
+        int(chat_id), destination_chat_id, existing_id
+    ):
+        _remove_max_send_button(chat_id)
+        return False
+    target_id = target_id or existing_id
     if not target_id:
         debug_logger.info(
             "MAX_SEND_BUTTON_NO_ANCHOR chat_id=%s destination_chat_id=%s",
@@ -7818,7 +7913,7 @@ def _edit_setup_prompt(owner_id, setup_state, text, reply_markup=None, parse_mod
     return sent.message_id
 
 
-def _verify_project_chat_access(
+def _verify_project_chat_access_impl(
     chat_id, notify_chat_id=None, progress_message_id=None, refresh_list_message_id=None
 ):
     chat = get_chat_by_id(chat_id)
@@ -8061,6 +8156,27 @@ def _verify_project_chat_access(
             except Exception:
                 pass
         return False
+
+
+def _verify_project_chat_access(
+    chat_id, notify_chat_id=None, progress_message_id=None, refresh_list_message_id=None
+):
+    chat_id = int(chat_id)
+    with project_access_verifying_lock:
+        if chat_id in project_access_verifying:
+            debug_logger.info("PROJECT_ACCESS_DUPLICATE_CHECK_IGNORED chat_id=%s", chat_id)
+            return False
+        project_access_verifying.add(chat_id)
+    try:
+        return _verify_project_chat_access_impl(
+            chat_id,
+            notify_chat_id=notify_chat_id,
+            progress_message_id=progress_message_id,
+            refresh_list_message_id=refresh_list_message_id,
+        )
+    finally:
+        with project_access_verifying_lock:
+            project_access_verifying.discard(chat_id)
 
 
 def _verify_project_chats_after_login(notify_chat_id):
@@ -10296,14 +10412,38 @@ def admin_callbacks(call):
             )
             _track_auth_message(target_id, auth_message)
         elif status == "waiting":
-            auth_message = bot.send_message(
-                call.message.chat.id,
+            if not _claim_qr_wait_notice(target_id, session):
+                # The QR warning is already visible on this login session.
+                # Repeated taps still run the MAX check, but do not add another
+                # copy of the same warning to the Telegram conversation.
+                return
+            waiting_text = (
                 "⚠️ MAX пока не подтвердил вход. Убедитесь, что QR-код отсканирован в приложении MAX, "
-                "и нажмите кнопку ещё раз. Либо откройте защищённую страницу для входа по номеру телефона.",
-                reply_markup=_build_qr_keyboard(target_id),
-                **NO_PREVIEW,
+                "и нажмите кнопку ещё раз. Либо откройте защищённую страницу для входа по номеру телефона."
             )
-            _track_auth_message(target_id, auth_message)
+            try:
+                if getattr(call.message, "photo", None):
+                    bot.edit_message_caption(
+                        waiting_text,
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=_build_qr_keyboard(target_id),
+                    )
+                else:
+                    bot.edit_message_text(
+                        waiting_text,
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=_build_qr_keyboard(target_id),
+                        **NO_PREVIEW,
+                    )
+                _track_auth_message(target_id, call.message)
+            except Exception as edit_error:
+                # Keep repeated clicks from producing a stack of identical warnings.
+                debug_logger.info(
+                    "QR_WAIT_NOTICE_EDIT_FAILED target=%s error_type=%s",
+                    target_id, type(edit_error).__name__,
+                )
         else:
             bot.send_message(
                 call.message.chat.id,

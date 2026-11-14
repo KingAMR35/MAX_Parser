@@ -16,6 +16,7 @@ import traceback
 import tempfile
 from datetime import datetime, timedelta
 from typing import List, Dict, Union
+from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 from debug_log import logger as debug_logger, preview as log_preview
 
@@ -25,7 +26,6 @@ PHOTO_CACHE_FILE = "seen_images.json"
 # Scan a bounded catch-up window so bursts are not silently truncated. The
 # per-chat cache and age checks below suppress already-sent and stale history.
 MAX_MESSAGES_TO_PARSE = 100
-MAX_FIRST_CONNECTION_MESSAGES = 3
 MAX_UNCACHED_MESSAGE_AGE = timedelta(hours=36)
 MAX_MEDIA_DOWNLOAD_BYTES = 47 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_BYTES = 9 * 1024 * 1024
@@ -52,6 +52,45 @@ def _strip_browser_video_fallback(text: str) -> str:
         " ", text, flags=re.I,
     )
     return _normalize_message_lines(text)
+
+
+def _strip_document_tile_metadata(text: str, media_files: list[dict]) -> str:
+    """Remove MAX's file-card labels while preserving the actual message caption."""
+    documents = []
+    for media in media_files or []:
+        if not isinstance(media, dict):
+            continue
+        media_type = str(media.get("type") or "").casefold()
+        mime_type = str(media.get("content_type") or media.get("mime_type") or "").casefold()
+        if media_type in {"document", "file", "unknown"} or mime_type.startswith("application/"):
+            documents.append(media)
+    if not documents:
+        return str(text or "")
+
+    filenames = {
+        os.path.basename(str(item.get("filename") or "")).strip().casefold()
+        for item in documents
+        if str(item.get("filename") or "").strip()
+    }
+    cleaned_lines = []
+    for raw_line in str(text or "").replace("\r", "").split("\n"):
+        line = " ".join(raw_line.split())
+        normalized = line.casefold().strip(" .:·•")
+        if not normalized:
+            cleaned_lines.append("")
+            continue
+        if normalized in filenames:
+            continue
+        if re.fullmatch(r"(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp|файл|документ)", normalized):
+            continue
+        if re.fullmatch(r"(?:document|file)(?:\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp|bin))?", normalized):
+            continue
+        if re.fullmatch(r"(?:скачать|download)(?:\s*[·•|]\s*.*)?", normalized):
+            continue
+        if re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:bytes?|b|kb|mb|gb|кб|мб|гб)", normalized):
+            continue
+        cleaned_lines.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
 
 
 def _auth_browser_should_be_headless() -> bool:
@@ -177,6 +216,20 @@ def _message_datetime(message: dict):
     return datetime.combine(parsed_date, parsed_time)
 
 
+def _is_yesterday_or_today(message: dict, today=None) -> bool:
+    """Initial startup may replay only MAX messages dated today or yesterday."""
+    message_datetime = _message_datetime(message)
+    if message_datetime is None:
+        return False
+    if today is None:
+        try:
+            today = datetime.now(ZoneInfo(MAX_TIMEZONE_ID)).date()
+        except Exception:
+            today = datetime.now().astimezone().date()
+    message_date = message_datetime.date()
+    return today - timedelta(days=1) <= message_date <= today
+
+
 def _message_baseline_identity(message: dict) -> str:
     """Identity used only to keep a chat's initial history boundary."""
     source_id = str((message or {}).get("source_id") or "").strip()
@@ -207,7 +260,7 @@ def _build_message_baseline(messages: list[dict], initial_candidates: list[dict]
 
 
 def _message_is_before_initial_boundary(message: dict, baseline: dict) -> bool:
-    """Suppress pre-connection history while allowing the first three rows and later posts."""
+    """Suppress pre-connection history while allowing the recent initial batch and later posts."""
     identity = _message_baseline_identity(message)
     initial_keys = set(baseline.get("initial_keys") or [])
     if identity in initial_keys:
@@ -7825,14 +7878,13 @@ def parse_max_group_media(
 
             if cached_source_ids:
                 # Upgrade an existing cache without replaying history, while
-                # still catching up posts newer than its last known stable ID.
-                initial_candidates = []
-                baseline_state = _build_message_baseline(all_messages, initial_candidates)
-                baseline_state["high_water_id"] = max(cached_source_ids)
+                # only catching up messages from today and yesterday.
+                migration_boundary = _build_message_baseline(all_messages, [])
+                migration_boundary["high_water_id"] = max(cached_source_ids)
                 baseline_messages = []
                 migrated_new = []
                 for candidate in all_messages:
-                    if _message_is_before_initial_boundary(candidate, baseline_state):
+                    if _message_is_before_initial_boundary(candidate, migration_boundary):
                         mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
                         baseline_messages.append(candidate)
                     elif (
@@ -7840,9 +7892,14 @@ def parse_max_group_media(
                         and not is_new_message(_message_cache_stub(candidate), chat_id=chat_id)
                     ):
                         migrated_known += 1
-                    else:
+                    elif _is_yesterday_or_today(candidate):
                         migrated_new.append(candidate)
+                    else:
+                        mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
+                        baseline_messages.append(candidate)
                 initial_candidates = migrated_new
+                baseline_state = _build_message_baseline(all_messages, initial_candidates)
+                baseline_state["high_water_id"] = max(cached_source_ids)
             elif has_legacy_cache:
                 # If old cache entries cannot be matched to the visible stable
                 # IDs, prefer a quiet baseline over risking a replay of history.
@@ -7852,9 +7909,12 @@ def parse_max_group_media(
                     mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
                 baseline_state = _build_message_baseline(all_messages, initial_candidates)
             else:
-                # A genuinely new chat starts with exactly its latest three
-                # messages.
-                initial_candidates = all_messages[-MAX_FIRST_CONNECTION_MESSAGES:]
+                # On first startup only replay the current and previous MAX
+                # calendar day. Older and undated history becomes the baseline.
+                initial_candidates = [
+                    candidate for candidate in all_messages
+                    if _is_yesterday_or_today(candidate)
+                ]
                 initial_candidate_ids = {id(candidate) for candidate in initial_candidates}
                 baseline_messages = [
                     candidate for candidate in all_messages
@@ -7868,7 +7928,7 @@ def parse_max_group_media(
             save_message_cache()
             all_messages = initial_candidates
             debug_logger.info(
-                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s legacy_cache=%s history_marked=%s known=%s initial_delivery=%s high_water_id=%s",
+                "MAX_FIRST_CONNECTION_BASELINE chat_id=%s legacy_cache=%s history_marked=%s known=%s initial_delivery=%s date_window=yesterday_today high_water_id=%s",
                 chat_id, has_legacy_cache, len(baseline_messages), migrated_known, len(all_messages),
                 baseline_state.get("high_water_id"),
             )
@@ -8367,6 +8427,8 @@ def parse_max_group_media(
                 unique_media.append(media)
                 if media.get("type") == "image" and visual_hash:
                     seen_direct_visual_hashes.append(visual_hash)
+            message_text = "" if msg.get("_captured_animated_emoji") else msg.get("text", "")
+            message_text = _strip_document_tile_metadata(message_text, unique_media)
             human_posts.append({
                 "source_id": msg.get("source_id", ""),
                 "source_id_is_index": bool(msg.get("source_id_is_index")),
@@ -8375,7 +8437,7 @@ def parse_max_group_media(
                 "mid": msg.get("mid", ""),
                 "data_id": msg.get("data_id", ""),
                 "name": msg.get("name", "Аноним"),
-                "text": "" if msg.get("_captured_animated_emoji") else msg.get("text", ""),
+                "text": message_text,
                 "inline_links": msg.get("inline_links", []),
                 "emoji_texts": [] if msg.get("_captured_animated_emoji") else msg.get("emoji_texts", []),
                 "emoji_image_urls": sorted(emoji_image_urls),
@@ -8396,6 +8458,7 @@ def parse_max_group_media(
                 "photo_visual_hint": bool(msg.get("photo_visual_hint")),
                 "voice_hint": bool(msg.get("voice_hint")),
                 "video_note_hint": bool(msg.get("video_note_hint")),
+                "is_outgoing": bool(msg.get("is_outgoing")),
                 "media_duration_seconds": float(msg.get("media_duration_seconds") or 0),
 
             })

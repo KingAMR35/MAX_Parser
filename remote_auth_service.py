@@ -29,13 +29,13 @@ body{margin:0;background:#101522;color:#f4f6fb;font:16px/1.45 system-ui,-apple-s
 main{max-width:1080px;margin:auto;padding:clamp(9px,2vw,18px)}
 h1{font-size:22px;margin:0 0 6px}
 .notice{color:#d9e0ef;font-size:14px;margin:0 0 10px}
-.inputCard{position:sticky;top:0;z-index:5;background:#172235;border:1px solid #4b83d4;border-radius:13px;padding:12px;margin:10px 0;box-shadow:0 6px 24px #05070b99}
+.inputCard{position:relative;background:#172235;border:1px solid #4b83d4;border-radius:13px;padding:10px;margin:8px 0;box-shadow:0 4px 14px #05070b66}
 .inputCard label{display:block;font-weight:750;font-size:15px;margin-bottom:7px;color:#fff}
 .inputHint{font-size:12px;color:#b9c9e4;margin-top:7px}
 .inputRow{display:flex;gap:8px;align-items:stretch}
 .editActions{display:flex;gap:8px;margin-top:8px}
 .editActions button{flex:1;background:#40526d}
-#keyboard{display:block;flex:1;min-width:0;width:100%;height:58px;border:2px solid #7895bd;border-radius:10px;background:#0e1726;color:#fff;padding:12px;font:18px system-ui,sans-serif;resize:vertical}
+#keyboard{display:block;flex:1;min-width:0;width:100%;height:54px;min-height:54px;box-sizing:border-box;border:2px solid #7895bd;border-radius:10px;background:#0e1726;color:#fff;padding:10px;font:18px system-ui,sans-serif;resize:none}
 #keyboard::placeholder{color:#aab8ce}
 button{position:relative;border:0;border-radius:10px;background:#3275d9;color:white;padding:11px 14px;font-weight:700;font-size:15px;touch-action:manipulation;cursor:pointer;transition:transform .1s ease,filter .1s ease,box-shadow .1s ease}
 button:active{transform:scale(.98);filter:brightness(1.18)}
@@ -65,8 +65,8 @@ button.busy::after{content:"";position:absolute;right:12px;top:50%;width:15px;he
 .warning{background:#282231;border:1px solid #644653;padding:12px;border-radius:10px;font-size:13px;margin-top:12px}
 @media(max-width:600px){
 main{padding:9px}h1{font-size:19px}.notice{font-size:13px;line-height:1.35}
-.inputCard{padding:10px;margin:8px 0}.inputCard label{font-size:14px}
-.inputRow{gap:6px}#keyboard{height:56px;padding:10px;font-size:17px}
+.inputCard{padding:9px;margin:8px 0}.inputCard label{font-size:14px}
+.inputRow{gap:6px}#keyboard{height:52px;min-height:52px;padding:9px;font-size:17px}
 #sendButton{min-width:108px;padding:9px;font-size:14px}
 .editActions{gap:6px}.editActions button{padding:10px 8px;font-size:13px}
 .toolbar{grid-template-columns:1fr 1fr;gap:7px}.toolbar button{min-height:44px;padding:9px 7px;font-size:13px}
