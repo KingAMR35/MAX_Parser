@@ -190,6 +190,63 @@ def _coalesce_leading_emoji_lines(text: str, emoji_values) -> str:
     return " ".join(emoji_lines)
 
 
+def _coalesce_embedded_animated_emoji_lines(text: str, emoji_values) -> str:
+    """Join MAX's block-wrapped animated emoji rows back into message text."""
+    values = sorted(
+        {str(value).strip() for value in (emoji_values or []) if str(value).strip()},
+        key=len,
+        reverse=True,
+    )
+    if not values:
+        return text
+
+    lines = str(text or "").split("\n")
+
+    def is_emoji_line(value):
+        remainder = str(value or "").strip()
+        if not remainder:
+            return False
+        for emoji in values:
+            remainder = remainder.replace(emoji, "")
+        remainder = re.sub(r"[\s\u200d\u20e3\ufe0e\ufe0f\u200b\u2060]+", "", remainder)
+        return not remainder
+
+    output = []
+    index = 0
+    while index < len(lines):
+        if not is_emoji_line(lines[index]):
+            output.append(lines[index])
+            index += 1
+            continue
+
+        emoji_rows = [lines[index].strip()]
+        next_index = index + 1
+        while next_index < len(lines):
+            while next_index < len(lines) and not lines[next_index].strip():
+                next_index += 1
+            if next_index >= len(lines) or not is_emoji_line(lines[next_index]):
+                break
+            emoji_rows.append(lines[next_index].strip())
+            next_index += 1
+
+        # Blank lines around MAX's animated emoji blocks are layout artifacts.
+        while output and not output[-1].strip():
+            output.pop()
+        emoji_text = " ".join(emoji_rows)
+        if output:
+            output[-1] = f"{output[-1].rstrip()} {emoji_text}".strip()
+        else:
+            output.append(emoji_text)
+
+        if next_index < len(lines) and lines[next_index].strip():
+            output[-1] = f"{output[-1]} {lines[next_index].strip()}".strip()
+            index = next_index + 1
+        else:
+            index = next_index
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(output)).strip()
+
+
 def _message_datetime(message: dict):
     """Parse MAX's displayed date/time when available; return None if uncertain."""
     date_text = str((message or {}).get("date") or "").strip()
@@ -7778,6 +7835,10 @@ def parse_max_group_media(
         for msg in raw_messages:
             text = _normalize_message_lines(msg.get("text") or "")
             text = _coalesce_leading_emoji_lines(text, msg.get("emoji_texts") or [])
+            if msg.get("animated_emoji_hint"):
+                text = _coalesce_embedded_animated_emoji_lines(
+                    text, msg.get("emoji_texts") or []
+                )
             text = _strip_browser_video_fallback(text)
             name = " ".join((msg.get("name") or "").split()).strip()
             source_id = str(msg.get("source_id") or "").strip()
