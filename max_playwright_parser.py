@@ -5417,6 +5417,88 @@ def _detect_max_chat_source_type(page) -> str | None:
     return None
 
 
+def _scroll_max_message_feed_to_latest(page, chat_id):
+    """Move MAX's inner message scroller to the newest edge, not just the window."""
+    try:
+        state = page.evaluate(r"""() => {
+            const rows = [...document.querySelectorAll('.item')];
+            const idAttributes = ['data-message-id', 'data-mid', 'data-id', 'data-index'];
+            let direction = 'ascending';
+            for (const attr of idAttributes) {
+                const ids = rows.map(row => {
+                    const value = String(row.getAttribute(attr) || '').trim();
+                    try { return /^-?\d+$/.test(value) ? BigInt(value) : null; }
+                    catch (e) { return null; }
+                }).filter(value => value !== null);
+                if (ids.length >= 2) {
+                    direction = ids[0] > ids[ids.length - 1] ? 'descending' : 'ascending';
+                    break;
+                }
+            }
+
+            const candidates = new Map();
+            for (const row of rows) {
+                let node = row.parentElement;
+                let depth = 1;
+                while (node && node !== document.body && depth <= 24) {
+                    const range = Math.max(0, node.scrollHeight - node.clientHeight);
+                    const style = getComputedStyle(node);
+                    const overflowY = String(style.overflowY || '').toLowerCase();
+                    if (range > 30 && /auto|scroll|overlay|hidden/.test(overflowY)) {
+                        const count = node.querySelectorAll('.item').length;
+                        const current = candidates.get(node);
+                        if (!current || depth < current.depth) {
+                            candidates.set(node, {node, depth, count, range});
+                        }
+                    }
+                    node = node.parentElement;
+                    depth += 1;
+                }
+            }
+
+            const ranked = [...candidates.values()].sort((a, b) =>
+                (b.count - a.count) || (a.depth - b.depth) || (b.range - a.range)
+            );
+            const target = ranked[0];
+            let method = 'window';
+            if (target) {
+                target.node.scrollTop = direction === 'descending' ? 0 : target.node.scrollHeight;
+                target.node.dispatchEvent(new Event('scroll', {bubbles: true}));
+                method = 'message-ancestor';
+            }
+            if (direction === 'descending') window.scrollTo(0, 0);
+            else window.scrollTo(0, document.documentElement.scrollHeight || document.body.scrollHeight);
+
+            return {
+                rows: rows.length,
+                direction,
+                method,
+                containerDepth: target ? target.depth : 0,
+                containerRows: target ? target.count : rows.length,
+                scrollTop: target ? Math.round(target.node.scrollTop) : Math.round(window.scrollY),
+                scrollRange: target ? target.range : Math.max(0, document.documentElement.scrollHeight - innerHeight),
+                firstId: rows[0] ? idAttributes.map(a => rows[0].getAttribute(a)).find(Boolean) || '' : '',
+                lastId: rows.length ? idAttributes.map(a => rows[rows.length - 1].getAttribute(a)).find(Boolean) || '' : '',
+            };
+        }""")
+        if not isinstance(state, dict):
+            state = {"state": str(state)[:200]}
+        debug_logger.info(
+            "MAX_MESSAGE_FEED_SCROLL chat_id=%s rows=%s direction=%s method=%s container_depth=%s container_rows=%s scroll_top=%s scroll_range=%s first_id=%s last_id=%s",
+            chat_id, state.get("rows", 0), state.get("direction", "unknown"),
+            state.get("method", "unknown"), state.get("containerDepth", 0),
+            state.get("containerRows", 0), state.get("scrollTop", 0),
+            state.get("scrollRange", 0), state.get("firstId", ""), state.get("lastId", ""),
+        )
+        return state
+    except Exception as error:
+        debug_logger.warning(
+            "MAX_MESSAGE_FEED_SCROLL_FAILED chat_id=%s error_type=%s error=%s",
+            chat_id, type(error).__name__, log_preview(error, 180),
+        )
+        return {}
+
+
 def parse_max_group_media(
     group_url: str,
     chat_id: int,
@@ -5519,12 +5601,19 @@ def parse_max_group_media(
         try:
             page.keyboard.press("End")
             page.wait_for_timeout(700)
+            feed_state = _scroll_max_message_feed_to_latest(page, chat_id)
+            page.wait_for_timeout(700)
             last_marker=""
             stable=0
             for _ in range(12):
                 page.wait_for_timeout(250)
                 try:
-                    marker=page.locator(".item").last.evaluate("""el => ({
+                    newest_row = (
+                        page.locator(".item").first
+                        if feed_state.get("direction") == "descending"
+                        else page.locator(".item").last
+                    )
+                    marker=newest_row.evaluate("""el => ({
                         id: el.getAttribute('data-message-id') || el.getAttribute('data-mid') || el.getAttribute('data-id') || '',
                         index: el.getAttribute('data-index') || '', text: (el.innerText||'').slice(0,180)
                     })""")
@@ -5554,6 +5643,7 @@ def parse_max_group_media(
                 for(const row of rows){try{row.scrollIntoView({block:'center',inline:'nearest'});}catch(e){} await new Promise(r=>setTimeout(r,45));}
                 window.scrollTo(0,document.body.scrollHeight);
             }""", MAX_MESSAGES_TO_PARSE)
+            _scroll_max_message_feed_to_latest(page, chat_id)
             page.wait_for_timeout(700)
         except Exception as e:
             print(f"[{chat_id}] ⚠️ Не удалось загрузить/прогреть последние сообщения: {e}")
