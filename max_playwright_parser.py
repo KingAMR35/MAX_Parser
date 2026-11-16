@@ -27,6 +27,7 @@ PHOTO_CACHE_FILE = "seen_images.json"
 # Scan a bounded catch-up window so bursts are not silently truncated. The
 # per-chat cache and age checks below suppress already-sent and stale history.
 MAX_MESSAGES_TO_PARSE = 100
+MAX_INITIAL_MESSAGES_TO_DELIVER = 5
 MAX_UNCACHED_MESSAGE_AGE = timedelta(hours=36)
 MAX_MEDIA_DOWNLOAD_BYTES = 47 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_BYTES = 9 * 1024 * 1024
@@ -288,6 +289,14 @@ def _is_yesterday_or_today(message: dict, today=None) -> bool:
     return today - timedelta(days=1) <= message_date <= today
 
 
+def _cap_initial_message_batch(messages: list[dict]) -> list[dict]:
+    """Initial catch-up is limited to the five newest eligible messages."""
+    ordered = list(messages or [])
+    if len(ordered) <= MAX_INITIAL_MESSAGES_TO_DELIVER:
+        return ordered
+    return ordered[-MAX_INITIAL_MESSAGES_TO_DELIVER:]
+
+
 def _is_older_than_uncached_window(message: dict, now=None) -> bool:
     """Reject stale catch-up rows after a chat already has an initial baseline."""
     message_datetime = _message_datetime(message)
@@ -336,6 +345,20 @@ def _build_message_baseline(messages: list[dict], initial_candidates: list[dict]
         "older_keys": sorted({_message_baseline_identity(message) for message in older_messages}),
         "boundary_datetime": newest_datetime.isoformat(timespec="minutes") if newest_datetime else "",
     }
+
+
+def _baseline_for_connection_generation(baseline: dict, generation: str):
+    """Reset only when a known connection generation has actually changed."""
+    state = dict(baseline or {})
+    generation = str(generation or "").strip()
+    if not generation or not state.get("initialized"):
+        return state, False
+    stored_generation = str(state.get("connection_generation") or "").strip()
+    if stored_generation and stored_generation != generation:
+        return {}, True
+    if not stored_generation:
+        state["connection_generation"] = generation
+    return state, False
 
 
 def _message_is_before_initial_boundary(message: dict, baseline: dict) -> bool:
@@ -5712,6 +5735,7 @@ def parse_max_group_media(
     navigation_attempts: int = 4,
     post_callback=None,
     source_type_callback=None,
+    connection_generation: str = None,
 ) -> Union[List[Dict], Dict[str, object]]:
     """Парсит чат MAX через точные карточки .item[data-index]."""
     debug_logger.info("MAX_PARSE_START chat_id=%s", chat_id)
@@ -5823,15 +5847,39 @@ def parse_max_group_media(
                 if card_count:
                     break
                 page.wait_for_timeout(500)
-            if not card_count:
+            composer_visible = page.evaluate("""() => {
+                const visible = el => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                        s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+                };
+                return [...document.querySelectorAll(
+                    'textarea,[contenteditable="true"],[role="textbox"]'
+                )].some(el => {
+                    if (!visible(el) || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.top < window.innerHeight * 0.58 || r.left < window.innerWidth * 0.20 ||
+                        r.width < 180 || r.height > 220) return false;
+                    const label = [el.getAttribute('aria-label'), el.getAttribute('placeholder'),
+                        el.getAttribute('data-placeholder'), el.getAttribute('title')]
+                        .filter(Boolean).join(' ').toLowerCase();
+                    return !/поиск|search|найти/.test(label);
+                });
+            }""")
+            if not card_count and not composer_visible:
                 debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
                 page.screenshot(path=debug_path, full_page=True)
                 raise Exception(f"MAX_CHAT_NO_MESSAGES|{debug_path}")
             debug_logger.info(
-                "MAX_CHAT_ACCESS_VERIFIED chat_id=%s visible_message_cards=%s",
-                chat_id, card_count,
+                "MAX_CHAT_ACCESS_VERIFIED chat_id=%s visible_message_cards=%s composer_visible=%s",
+                chat_id, card_count, bool(composer_visible),
             )
-            return {"message_cards": card_count, "source_type": detected_source_type}
+            return {
+                "message_cards": card_count,
+                "composer_visible": bool(composer_visible),
+                "source_type": detected_source_type,
+            }
         print(f"[{chat_id}] Ожидание загрузки последних сообщений...")
         try:
             page.keyboard.press("End")
@@ -6434,6 +6482,70 @@ def parse_max_group_media(
                         ].forEach(selector => {
                             try { clone.querySelectorAll(selector).forEach(el => el.remove()); } catch(e) {}
                         });
+                        // Link cards are UI previews, not part of the author's
+                        // message. Strip their title/description/coordinate
+                        // text while preserving the URL written in the bubble.
+                        const linkPreviewSelectors = [
+                            '[class*="preview" i]', '[data-testid*="preview" i]',
+                            '[aria-label*="preview" i]', '[aria-label*="предпросмотр" i]',
+                            '[class*="webpage" i]', '[class*="web-page" i]',
+                            '[class*="link-card" i]', '[data-testid*="webpage" i]',
+                        ].join(",");
+                        try {
+                            clone.querySelectorAll(linkPreviewSelectors).forEach(el => {
+                                if (!clone.contains(el)) return;
+                                const source = el.matches('a[href]') ? el : el.querySelector('a[href]');
+                                const href = source ? safeAttr(source, 'href') : '';
+                                if (!/^https?:/i.test(href)) {
+                                    el.remove();
+                                    return;
+                                }
+                                const alreadyInMessage = Array.from(clone.querySelectorAll('a[href]')).some(anchor =>
+                                    anchor !== source && !el.contains(anchor) && safeAttr(anchor, 'href') === href
+                                );
+                                if (alreadyInMessage) {
+                                    el.remove();
+                                    return;
+                                }
+                                const keptLink = document.createElement('a');
+                                keptLink.setAttribute('href', href);
+                                keptLink.textContent = /maps\.google\.|google\.[^/]+\/maps|yandex\.[^/]+\/maps|2gis/i.test(href)
+                                    ? `Карта: ${href}` : href;
+                                el.replaceWith(keptLink);
+                            });
+                        } catch(e) {}
+                        // MAX's map card may not have a semantic preview class;
+                        // retain its direct URL while dropping the card's title,
+                        // coordinates, and thumbnail from extracted message text.
+                        try {
+                            for (const anchor of [...clone.querySelectorAll('a[href]')]) {
+                                const href = safeAttr(anchor, 'href');
+                                if (!/maps\.google\.|google\.[^/]+\/maps|yandex\.[^/]+\/maps/i.test(href)) continue;
+                                let node = anchor;
+                                let card = null;
+                                for (let depth = 0; node && node !== clone && depth < 6; depth++, node = node.parentElement) {
+                                    const meta = `${safeAttr(node, 'class')} ${safeAttr(node, 'data-testid')} ${safeAttr(node, 'aria-label')}`;
+                                    if (/preview|кар|map|location|карта|геопозиц/i.test(meta) &&
+                                        node.querySelector('img,picture,canvas,[style*="background-image" i]')) {
+                                        card = node;
+                                        break;
+                                    }
+                                }
+                                if (card && card !== clone) {
+                                    const alreadyInMessage = Array.from(clone.querySelectorAll('a[href]')).some(existing =>
+                                        !card.contains(existing) && safeAttr(existing, 'href') === href
+                                    );
+                                    if (alreadyInMessage) {
+                                        card.remove();
+                                    } else {
+                                        const keptLink = document.createElement('a');
+                                        keptLink.setAttribute('href', href);
+                                        keptLink.textContent = `Карта: ${href}`;
+                                        card.replaceWith(keptLink);
+                                    }
+                                }
+                            }
+                        } catch(e) {}
                         clone.querySelectorAll(".link").forEach(el => {
                             if (!el.matches("a[href]") && !el.querySelector("a[href]")) el.remove();
                         });
@@ -6625,6 +6737,31 @@ def parse_max_group_media(
                     return out;
                 }
 
+                function isLinkPreviewMedia(el, row) {
+                    try {
+                        let node = el;
+                        for (let depth = 0; node && node !== row && depth < 9; depth++, node = node.parentElement) {
+                            const meta = `${safeAttr(node,"class")} ${safeAttr(node,"data-testid")} ${safeAttr(node,"aria-label")} ${safeAttr(node,"title")}`;
+                            const hasAsset = Boolean(node.querySelector(
+                                "img,picture,canvas,video,[style*='background-image' i]"
+                            ));
+                            if (!hasAsset) continue;
+                            const hasLink = Array.from(node.querySelectorAll("a[href]")).some(anchor =>
+                                /^https?:/i.test(safeAttr(anchor,"href"))
+                            );
+                            const mapAnchor = node.matches("a[href]") &&
+                                /maps\.google\.|google\.[^/]+\/maps|yandex\.[^/]+\/maps|2gis/i.test(safeAttr(node,"href"));
+                            const hasMapLink = Array.from(node.querySelectorAll("a[href]")).some(anchor =>
+                                /maps\.google\.|google\.[^/]+\/maps|yandex\.[^/]+\/maps|2gis/i.test(safeAttr(anchor,"href"))
+                            );
+                            const semanticCard = /link[-_\s]?(?:preview|card)|web[-_\s]?page|preview[-_\s]?card|map[-_\s]?(?:preview|card)|location[-_\s]?(?:preview|card)/i.test(meta);
+                            const genericPreview = /preview|предпросмотр/i.test(meta) && hasLink;
+                            if (mapAnchor || (hasMapLink && semanticCard) || (hasLink && (semanticCard || genericPreview))) return true;
+                        }
+                    } catch(e) {}
+                    return false;
+                }
+
                 function getImageCandidateCount(row) {
                     let count = 0;
                     const seen = new Set();
@@ -6637,6 +6774,7 @@ def parse_max_group_media(
                     }
                     try {
                         row.querySelectorAll("img,picture source").forEach(img => {
+                            if (isLinkPreviewMedia(img, row)) return;
                             const meta = `${safeAttr(img,"class")} ${safeAttr(img,"data-testid")} ${safeAttr(img,"aria-label")} ${safeAttr(img,"alt")} ${safeAttr(img,"title")} ${safeAttr(img,"data-type")}`.toLowerCase();
                             if (/avatar|userpic|profile|favicon|spacer|blank/.test(meta) || isEmoji(img)) return;
                             const r = img.getBoundingClientRect();
@@ -6648,6 +6786,7 @@ def parse_max_group_media(
                     } catch(e) {}
                     try {
                         row.querySelectorAll("a[href],div[data-image-url],div[data-photo-url],div[data-media-url],[style*='background-image' i]").forEach(el=>{
+                            if (isLinkPreviewMedia(el, row)) return;
                             const meta=`${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el,"data-type")}`;
                             if (/avatar|userpic|profile|favicon|spacer|blank/i.test(meta) || isEmoji(el)) return;
                             const url=safeAttr(el,"href")||safeAttr(el,"data-image-url")||safeAttr(el,"data-photo-url")||safeAttr(el,"data-media-url");
@@ -6680,6 +6819,7 @@ def parse_max_group_media(
                         return !text.replace(/[\s\uFE0E\uFE0F\u200D]/g, "");
                     };
                     row.querySelectorAll('img,video,canvas,[role="img"],[class*="emoji" i],[class*="animated" i],[data-type*="emoji" i],[data-testid*="emoji" i],[data-emoji],[data-emoji-char],[data-animated-emoji],[data-custom-emoji],[data-emoji-id],[data-emoji-name],[data-emoji-code],[data-emoji-codepoint],[data-codepoint],[data-codepoints],[data-unicode]').forEach(el=>{
+                        if (isLinkPreviewMedia(el, row)) return;
                         const meta=emojiMeta(el);
                         if(/sticker|стикер/.test(meta)) return;
                         if(/avatar|userpic|profile|favicon|spacer|blank/i.test(meta)) return;
@@ -6737,6 +6877,7 @@ def parse_max_group_media(
                     }
                     try {
                         row.querySelectorAll("img").forEach(img => {
+                            if (isLinkPreviewMedia(img, row)) return;
                             const meta = metaOf(img);
                             if (/avatar|userpic|profile|favicon|spacer|blank/.test(meta)) return;
                             if (isEmojiNode(img)) return;
@@ -6755,6 +6896,7 @@ def parse_max_group_media(
                     } catch(e) {}
                     try {
                         row.querySelectorAll("picture source, source").forEach(el => {
+                            if (isLinkPreviewMedia(el, row)) return;
                             const meta = metaOf(el);
                             if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи/.test(meta) || isEmojiNode(el, false)) return;
                             const srcset = safeAttr(el,"srcset") || safeAttr(el,"data-srcset");
@@ -6765,6 +6907,7 @@ def parse_max_group_media(
                     } catch(e) {}
                     try {
                         row.querySelectorAll("*").forEach(el => {
+                            if (isLinkPreviewMedia(el, row)) return;
                             const meta = metaOf(el);
                             if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи/.test(meta) || isEmojiNode(el, false)) return;
                             ["data-image-url","data-photo-url","data-media-url","data-image","data-photo","data-original","data-original-src","data-src","data-lazy-src","data-attachment-url","data-content-url","data-file-url"].forEach(a=>add(safeAttr(el,a)));
@@ -6787,6 +6930,7 @@ def parse_max_group_media(
                     } catch(e) {}
                     try {
                         row.querySelectorAll("a[href]").forEach(a => {
+                            if (isLinkPreviewMedia(a, row)) return;
                             const href = safeAttr(a,"href");
                             const meta = metaOf(a);
                             if (/avatar|userpic|profile|favicon/.test(meta) || isEmojiNode(a)) return;
@@ -6873,7 +7017,7 @@ def parse_max_group_media(
                     const mediaOwners = Array.from(row.querySelectorAll("video, audio"));
                     const videoOwnerAttachments = new Map();
                     mediaOwners.forEach(el => {
-                        if (isEmojiAttachment(el)) return;
+                        if (isLinkPreviewMedia(el, row) || isEmojiAttachment(el)) return;
                         const tagName = String(el.tagName || "").toLowerCase();
                         try {
                             const rect = el.getBoundingClientRect();
@@ -7000,7 +7144,7 @@ def parse_max_group_media(
                     elements.forEach(el => {
                         // Attributes nested in an actual media element are alternate
                         // URLs for that same clip, already handled above.
-                        if (el.closest && el.closest("video, audio")) return;
+                        if (isLinkPreviewMedia(el, row) || (el.closest && el.closest("video, audio"))) return;
                         if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         const url = candidate(el);
@@ -7015,7 +7159,7 @@ def parse_max_group_media(
                     });
                     // Некоторые версии MAX держат медиа в div/span как background-image.
                     row.querySelectorAll("div,span,a,canvas").forEach(el => {
-                        if (isEmojiAttachment(el)) return;
+                        if (isLinkPreviewMedia(el, row) || isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|sticker|media)/i.test(meta)) return;
                         if (el.closest && el.closest("video, audio")) return;
@@ -8042,7 +8186,20 @@ def parse_max_group_media(
             all_messages and all_messages[0].get("dom_order_descending")
         )
         all_messages = _order_max_messages(all_messages)
-        baseline_state = message_baseline_by_chat.get(chat_id) or {}
+        current_generation = str(connection_generation or "").strip()
+        baseline_state, generation_changed = _baseline_for_connection_generation(
+            message_baseline_by_chat.get(chat_id) or {}, current_generation
+        )
+        if generation_changed:
+            debug_logger.info(
+                "MAX_CONNECTION_GENERATION_CHANGED chat_id=%s current=%s",
+                chat_id, current_generation[:12],
+            )
+        elif baseline_state.get("initialized") and current_generation:
+            # Keep existing users' baseline when deploying this field for the
+            # first time; only a later generation change starts a new catch-up.
+            with MESSAGE_CACHE_LOCK:
+                message_baseline_by_chat[chat_id] = baseline_state
         first_connection = not bool(baseline_state.get("initialized"))
         if first_connection:
             # Persist the boundary independently of delivery cache entries.
@@ -8087,6 +8244,12 @@ def parse_max_group_media(
                     else:
                         mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
                         baseline_messages.append(candidate)
+                if len(migrated_new) > MAX_INITIAL_MESSAGES_TO_DELIVER:
+                    capped_history = migrated_new[:-MAX_INITIAL_MESSAGES_TO_DELIVER]
+                    for baseline_msg in capped_history:
+                        mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
+                    baseline_messages.extend(capped_history)
+                    migrated_new = _cap_initial_message_batch(migrated_new)
                 initial_candidates = migrated_new
                 baseline_state = _build_message_baseline(all_messages, initial_candidates)
                 baseline_state["high_water_id"] = max(cached_source_ids)
@@ -8101,10 +8264,11 @@ def parse_max_group_media(
             else:
                 # On first startup only replay the current and previous MAX
                 # calendar day. Older and undated history becomes the baseline.
-                initial_candidates = [
+                recent_candidates = [
                     candidate for candidate in all_messages
                     if _is_yesterday_or_today(candidate)
                 ]
+                initial_candidates = _cap_initial_message_batch(recent_candidates)
                 initial_candidate_ids = {id(candidate) for candidate in initial_candidates}
                 baseline_messages = [
                     candidate for candidate in all_messages
@@ -8113,6 +8277,8 @@ def parse_max_group_media(
                 for baseline_msg in baseline_messages:
                     mark_message_seen(_message_cache_stub(baseline_msg), chat_id=chat_id)
                 baseline_state = _build_message_baseline(all_messages, initial_candidates)
+            if current_generation:
+                baseline_state["connection_generation"] = current_generation
             with MESSAGE_CACHE_LOCK:
                 message_baseline_by_chat[chat_id] = baseline_state
             save_message_cache()
@@ -9177,6 +9343,17 @@ def _new_max_upload_rows(rows, before_ids, before_signatures,
     return candidates
 
 
+def _max_upload_state_is_ready(state: dict, expected_count: int) -> bool:
+    """Accept MAX's rendered filename preview even when its file input is empty."""
+    state = state if isinstance(state, dict) else {}
+    return bool(
+        int(state.get("composerPreview") or 0) > 0
+        or int(state.get("nearComposerMedia") or 0) > 0
+        or len(state.get("composerUploadNames") or []) >= max(1, int(expected_count or 1))
+        or int(state.get("selectedFiles") or 0) >= max(1, int(expected_count or 1))
+    )
+
+
 def send_message_to_max(
     group_url: str,
     text: str,
@@ -9521,12 +9698,25 @@ def send_message_to_max(
                 signature = str(row.get("signature") or "")
                 return f"id:{row_id}" if row_id else f"sig:{signature}"
 
+            def semantic_key(row):
+                kind = str(row.get("media_kind") or "").casefold()
+                filename = os.path.basename(str(row.get("filename") or "")).casefold().strip()
+                row_text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip().casefold()
+                if filename:
+                    return f"{kind}|file:{filename}"
+                if row_text:
+                    return f"{kind}|text:{row_text}"
+                return f"{kind}|time:{str(row.get('time') or '').strip()}"
+
             initial_keys = {row_key(row) for row in initial_rows if row_key(row) not in {"id:", "sig:"}}
-            if not initial_keys:
+            initial_semantics = {semantic_key(row) for row in initial_rows if semantic_key(row)}
+            if not initial_keys and not initial_semantics:
                 raise RuntimeError("MAX_SEND_NOT_CONFIRMED: outgoing media has no stable identity")
 
             previous_keys = None
+            previous_semantics = None
             stable_samples = 0
+            empty_composer_samples = 0
             stable_rows = []
             for _ in range(16):
                 page.wait_for_timeout(250)
@@ -9536,19 +9726,42 @@ def send_message_to_max(
                         "MAX_PHOTO_UPLOAD_FAILED" if has_photo_upload
                         else f"MAX_MEDIA_UPLOAD_FAILED: {upload_error}"
                     )
+                candidates = new_upload_media_rows(require_outgoing=True)
                 current_rows = [
-                    row for row in new_upload_media_rows(require_outgoing=True)
-                    if row_key(row) in initial_keys
+                    row for row in candidates
+                    if row_key(row) in initial_keys or semantic_key(row) in initial_semantics
                 ]
                 current_keys = tuple(sorted(row_key(row) for row in current_rows))
+                current_semantics = tuple(sorted(semantic_key(row) for row in current_rows))
                 if current_keys and current_keys == previous_keys:
+                    stable_samples += 1
+                    if stable_samples >= 7:
+                        return current_rows
+                elif current_semantics and current_semantics == previous_semantics:
                     stable_samples += 1
                     if stable_samples >= 7:
                         return current_rows
                 else:
                     stable_samples = 0
-                    previous_keys = current_keys
                     stable_rows = current_rows
+                previous_keys = current_keys
+                previous_semantics = current_semantics
+
+                if not current_rows and initial_rows:
+                    state = send_debug_state()
+                    no_preview = (
+                        int(state.get("selectedFiles") or 0) == 0
+                        and int(state.get("composerPreview") or 0) == 0
+                        and int(state.get("nearComposerMedia") or 0) == 0
+                        and len(state.get("composerUploadNames") or []) == 0
+                    )
+                    empty_composer_samples = empty_composer_samples + 1 if no_preview else 0
+                    if empty_composer_samples >= 7:
+                        debug_logger.info(
+                            "MAX_OUTGOING_MEDIA_ROW_TRANSIENT_CONFIRMED initial=%s",
+                            len(initial_rows),
+                        )
+                        return initial_rows
 
             raise RuntimeError(
                 "MAX_SEND_NOT_CONFIRMED: outgoing media row did not remain stable "
@@ -9600,7 +9813,13 @@ def send_message_to_max(
 
         def send_debug_state():
             try:
-                return page.evaluate("""() => {
+                payload_items = upload_payload if isinstance(upload_payload, (list, tuple)) else [upload_payload]
+                expected_names = [
+                    os.path.basename(str(item.get("name") or "")).strip()
+                    for item in payload_items
+                    if isinstance(item, dict) and str(item.get("name") or "").strip()
+                ]
+                return page.evaluate("""({expectedNames}) => {
                     const c=document.querySelector('[data-max-parser-send-composer="true"]');
                     const visible=el=>{
                         const r=el.getBoundingClientRect(),s=getComputedStyle(el);
@@ -9643,6 +9862,23 @@ def send_message_to_max(
                             return r.bottom>cr.top-420&&r.top<cr.bottom+20&&
                                 r.right>=cr.left-40&&r.left<=cr.right+240;
                         }).length:0;
+                    const expected=[...new Set((expectedNames||[]).map(x=>String(x||'').trim()).filter(Boolean))];
+                    const composerText=String(composerRoot?.innerText||composerRoot?.textContent||'').toLowerCase();
+                    const nearbyFileNodes=[...document.querySelectorAll(
+                        '[class*="attach" i],[class*="file" i],[class*="attachment" i],[data-testid*="file" i],[data-testid*="attachment" i]'
+                    )].filter(el=>visible(el)&&!el.closest('.item')).filter(el=>{
+                        const r=el.getBoundingClientRect();
+                        return c&&r.top>cr.top-420&&r.top<window.innerHeight&&
+                            r.right>=cr.left-40&&r.left<=cr.right+240;
+                    });
+                    const composerUploadNames=expected.filter(name=>{
+                        const needle=name.toLowerCase();
+                        if(composerText.includes(needle))return true;
+                        return nearbyFileNodes.some(el=>[
+                            el.innerText,el.textContent,el.getAttribute('aria-label'),el.title,
+                            el.getAttribute('download'),el.getAttribute('data-filename')
+                        ].filter(Boolean).join(' ').toLowerCase().includes(needle));
+                    });
                     const nearComposerMedia=c?[...document.querySelectorAll(previewSelector)]
                         .filter(el=>visible(el)&&!el.closest('.item')).filter(el=>{
                             const r=el.getBoundingClientRect();
@@ -9654,11 +9890,12 @@ def send_message_to_max(
                         composerBox:cr?[Math.round(cr.x),Math.round(cr.y),Math.round(cr.width),Math.round(cr.height)]:null,
                         focused:Boolean(c&&c===document.activeElement),
                         globalPreview,composerPreview,nearComposerMedia,
+                        composerUploadNames,
                         selectedFiles:inputs.reduce((n,x)=>n+x.files,0),inputs,
                         chatRows:rows.length,lastRowMedia:rows.length?rows[rows.length-1].querySelectorAll('img,video,audio,canvas').length:0,
                         nearby
                     };
-                }""")
+                }""", {"expectedNames": expected_names})
             except Exception as error:
                 return {"diagnostic_error": type(error).__name__}
 
@@ -9726,12 +9963,7 @@ def send_message_to_max(
                     upload_ready = True
                     break
                 upload_state = send_debug_state()
-                selected_files = int(upload_state.get("selectedFiles") or 0)
-                if (
-                    int(upload_state.get("composerPreview") or 0) > 0
-                    or int(upload_state.get("nearComposerMedia") or 0) > 0
-                    or selected_files >= expected_count
-                ):
+                if _max_upload_state_is_ready(upload_state, expected_count):
                     upload_ready = True
                     break
                 page.wait_for_timeout(250)

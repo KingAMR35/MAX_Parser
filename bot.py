@@ -63,6 +63,11 @@ auth_qr_wait_notices = set()
 auth_qr_wait_notice_lock = threading.Lock()
 project_access_verifying = set()
 project_access_verifying_lock = threading.Lock()
+self_chat_access_verifying = set()
+self_chat_access_verifying_lock = threading.Lock()
+_MAX_SOURCE_ACCESS_FAILURES = {}
+_MAX_SOURCE_ACCESS_FAILURES_LOCK = threading.Lock()
+_MAX_SOURCE_ACCESS_FAILURE_LIMIT = 3
 awaiting_password_from = {}
 awaiting_phone_from = {}
 awaiting_code_from = {}
@@ -221,6 +226,7 @@ public_max_send_flow_lock = threading.RLock()
 public_max_send_albums = {}
 _send_to_max_command_menu_state = {}
 _send_to_max_command_menu_lock = threading.RLock()
+_max_send_button_sync_lock = threading.RLock()
 max_outbound_suppressions = {}
 max_outbound_suppressions_lock = threading.RLock()
 project_access_message_ids = {}
@@ -2178,6 +2184,86 @@ def _notify_session_expired(chat, error=None):
     return True
 
 
+def _clear_max_source_access_failures(chat_id):
+    with _MAX_SOURCE_ACCESS_FAILURES_LOCK:
+        _MAX_SOURCE_ACCESS_FAILURES.pop(int(chat_id), None)
+
+
+def _record_max_source_access_failure(chat, error):
+    """Pause a source after repeated MAX redirects and notify its owner once."""
+    if "WRONG_CHAT_REDIRECT" not in str(error):
+        return False
+    try:
+        chat_id = int(chat["chat_id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    with _MAX_SOURCE_ACCESS_FAILURES_LOCK:
+        failures = _MAX_SOURCE_ACCESS_FAILURES.get(chat_id, 0) + 1
+        _MAX_SOURCE_ACCESS_FAILURES[chat_id] = failures
+    if failures < _MAX_SOURCE_ACCESS_FAILURE_LIMIT:
+        debug_logger.warning(
+            "MAX_SOURCE_ACCESS_FAILURE chat_id=%s consecutive=%s limit=%s",
+            chat_id, failures, _MAX_SOURCE_ACCESS_FAILURE_LIMIT,
+        )
+        return False
+
+    latest = get_chat_by_id(chat_id)
+    if not latest or not latest.get("is_active"):
+        return True
+    toggle_chat(chat_id, False)
+    try:
+        _sync_max_send_button(chat_id)
+    except Exception as sync_error:
+        debug_logger.warning(
+            "MAX_SOURCE_ACCESS_BUTTON_SYNC_FAILED chat_id=%s error_type=%s",
+            chat_id, type(sync_error).__name__,
+        )
+
+    title = escape_html(latest.get("title") or "чат MAX")
+    text = (
+        "⚠️ <b>Пересылка приостановлена</b>\n\n"
+        f"MAX несколько раз не открыл источник «{title}». Проверьте, что аккаунт MAX всё ещё "
+        "состоит в этом чате и ссылка актуальна. Когда доступ восстановлен, нажмите проверку ниже."
+    )
+    keyboard = _self_access_retry_keyboard(chat_id)
+    recipients = []
+    try:
+        owner_id = int(latest.get("owner_id") or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    try:
+        destination_id = int(
+            latest.get("destination_chat_id") or latest.get("chat_id")
+        )
+    except (TypeError, ValueError):
+        destination_id = 0
+    if owner_id > 0:
+        recipients.append(owner_id)
+    if destination_id > 0 and destination_id not in recipients:
+        recipients.append(destination_id)
+    if not recipients:
+        recipients.append(ADMIN_ID)
+    for recipient in recipients:
+        try:
+            bot.send_message(
+                recipient,
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                **NO_PREVIEW,
+            )
+        except Exception as notify_error:
+            debug_logger.warning(
+                "MAX_SOURCE_ACCESS_NOTICE_FAILED chat_id=%s recipient=%s error_type=%s",
+                chat_id, recipient, type(notify_error).__name__,
+            )
+    debug_logger.error(
+        "MAX_SOURCE_ACCESS_PAUSED chat_id=%s account_mode=%s failures=%s",
+        chat_id, latest.get("account_mode"), failures,
+    )
+    return True
+
+
 def _user_needs_subscription(user_id, account_mode=None):
     if not PAYMENT_ACCESS_ENFORCEMENT_ENABLED:
         return False
@@ -2315,14 +2401,21 @@ def run_one_parse_cycle():
                 parse_counts["skipped"] += processed[1]
 
         try:
+            connection_generation = str(
+                chat.get("connection_generation")
+                or get_or_create_chat_connection_generation(chat_id)
+                or ""
+            )
             parse_max_group_media(
                 group_url=max_url,
                 chat_id=chat_id,
                 session_path=_session_path_for_chat(chat),
                 post_callback=consume_post,
                 source_type_callback=lambda detected, cid=chat_id: _update_detected_source_type(cid, detected),
+                connection_generation=connection_generation,
             )
             _clear_session_expiry_notice(chat)
+            _clear_max_source_access_failures(chat_id)
             _verify_manual_source_type(chat_id)
             if not get_chat_by_id(chat_id):
                 continue
@@ -2416,14 +2509,21 @@ def process_single_chat(chat):
         owner_id = int(chat.get("owner_id") or 0)
         if owner_id and _user_needs_subscription(owner_id, chat.get("account_mode", "self")):
             return False
+        connection_generation = str(
+            chat.get("connection_generation")
+            or get_or_create_chat_connection_generation(chat_id)
+            or ""
+        )
         parse_max_group_media(
             group_url=max_url,
             chat_id=chat_id,
             session_path=_session_path_for_chat(chat),
             post_callback=consume_post,
             source_type_callback=lambda detected, cid=chat_id: _update_detected_source_type(cid, detected),
+            connection_generation=connection_generation,
         )
         _clear_session_expiry_notice(chat)
+        _clear_max_source_access_failures(chat_id)
         _verify_manual_source_type(chat_id)
         if get_chat_by_id(chat_id):
             _store_parse_diagnostic(
@@ -2439,6 +2539,7 @@ def process_single_chat(chat):
             parse_diagnostics, error=error,
         )
         print(f"❌ Ошибка парсинга чата {title}: {error}")
+        _record_max_source_access_failure(chat, error)
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             _notify_session_expired(chat, error)
         traceback.print_exc()
@@ -2780,7 +2881,7 @@ def get_cancel_keyboard():
     kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_step"))
     return kb
 
-def track_user(message_or_callback):
+def track_user(message_or_callback, user_already_saved=False):
     try:
         user = message_or_callback.from_user
         if getattr(user, "is_bot", False) or (
@@ -2790,7 +2891,8 @@ def track_user(message_or_callback):
         username = user.username or ''
         first_name = user.first_name or ''
         last_name = user.last_name or ''
-        add_or_update_user(user.id, username, first_name, last_name)
+        if not user_already_saved:
+            add_or_update_user(user.id, username, first_name, last_name)
         if is_admin(user.id):
             update_admin_username(user.id, username)
     except Exception as e:
@@ -2937,8 +3039,53 @@ def _complete_login(target_chat_id, output_chat_id):
     chat = get_chat_by_id(target_chat_id) if target_chat_id != "project_account" else None
     if target_chat_id == "project_account":
         title = "Готового аккаунта"
+        try:
+            refreshed = refresh_project_connection_generations()
+            debug_logger.info("MAX_PROJECT_SESSION_RENEWED chat_count=%s", refreshed)
+        except Exception as error:
+            debug_logger.warning(
+                "MAX_PROJECT_GENERATION_REFRESH_FAILED error_type=%s",
+                type(error).__name__,
+            )
     else:
         title = chat["title"] if chat else "MAX"
+        if chat:
+            try:
+                refresh_chat_connection_generation(int(target_chat_id))
+            except Exception as error:
+                debug_logger.warning(
+                    "MAX_CHAT_GENERATION_REFRESH_FAILED chat_id=%s error_type=%s",
+                    target_chat_id, type(error).__name__,
+                )
+        if (
+            chat
+            and chat.get("max_url")
+            and chat.get("account_mode") == "self"
+        ):
+            # A successful QR/phone login only proves that MAX authenticated
+            # the account. It does not prove that this account can open the
+            # selected source chat. Keep parsing disabled until that exact
+            # source has been opened with the newly saved session.
+            toggle_chat(target_chat_id, False)
+            _sync_max_send_button(int(target_chat_id))
+            progress = bot.send_message(
+                output_chat_id,
+                "⏳ Вход в MAX подтверждён. Проверяю доступ к выбранному чату…",
+                **NO_PREVIEW,
+            )
+            threading.Thread(
+                target=_verify_self_chat_access,
+                args=(
+                    int(target_chat_id),
+                    int(output_chat_id),
+                    int(progress.message_id),
+                    None,
+                    review_event_id or uuid.uuid4().hex,
+                ),
+                daemon=True,
+                name=f"max-self-access-{target_chat_id}",
+            ).start()
+            return True
         if chat and chat.get("max_url"):
             toggle_chat(target_chat_id, True)
             _sync_max_send_button(int(target_chat_id))
@@ -3099,8 +3246,26 @@ def do_qr_login(target_chat_id, admin_chat_id):
     status, data = session.start()
     if status == "already_logged_in":
         if not is_project_account and chat.get("account_mode") == "self" and chat.get("max_url"):
-            toggle_chat(target_chat_id, True)
+            toggle_chat(target_chat_id, False)
             _sync_max_send_button(int(target_chat_id))
+            progress = bot.send_message(
+                admin_chat_id,
+                "⏳ Сессия MAX уже активна. Проверяю доступ к выбранному чату…",
+                **NO_PREVIEW,
+            )
+            threading.Thread(
+                target=_verify_self_chat_access,
+                args=(
+                    int(target_chat_id),
+                    int(admin_chat_id),
+                    int(progress.message_id),
+                    None,
+                    uuid.uuid4().hex,
+                ),
+                daemon=True,
+                name=f"max-self-access-{target_chat_id}",
+            ).start()
+            return
         bot.send_message(
             admin_chat_id,
             f"✅ <b>Уже авторизован!</b>\nСессия для <b>{escape_html(title)}</b> актуальна.",
@@ -5535,7 +5700,35 @@ def start_bot(message):
                     "REFERRAL_REGISTER_FAILED user_id=%s error_type=%s",
                     message.from_user.id, type(error).__name__,
                 )
-    track_user(message)
+    private_start_saved = False
+    welcome_trial_until = None
+    if message.chat.type == "private" and message.from_user is not None:
+        try:
+            welcome_trial_until = register_private_start(
+                message.from_user.id,
+                message.from_user.username or "",
+                message.from_user.first_name or "",
+                message.from_user.last_name or "",
+            )
+            private_start_saved = True
+        except Exception as error:
+            debug_logger.warning(
+                "WELCOME_TRIAL_GRANT_FAILED user_id=%s error_type=%s",
+                message.from_user.id, type(error).__name__,
+            )
+    track_user(message, user_already_saved=private_start_saved)
+    if welcome_trial_until is not None:
+        try:
+            bot.send_message(
+                message.chat.id,
+                "🎁 Вам начислен бесплатный месяц мульти-подписки. Доступны оба способа подключения и до 10 чатов.",
+                **NO_PREVIEW,
+            )
+        except Exception as error:
+            debug_logger.warning(
+                "WELCOME_TRIAL_NOTICE_FAILED user_id=%s error_type=%s",
+                message.from_user.id, type(error).__name__,
+            )
     if message.chat.type == "private":
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) > 1 and parts[1].startswith("maxsend_"):
@@ -6630,6 +6823,11 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
             result_text = _max_send_failure_text(error, "⚠️ MAX не успел подготовить вложение. Попробуйте отправить файл ещё раз.")
         elif "MAX_SEND_NOT_CONFIRMED" in str(error):
             result_text = _max_send_failure_text(error, "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой.")
+        elif "MAX_COMPOSER_NOT_FOUND" in str(error):
+            result_text = _max_send_failure_text(
+                error,
+                "⚠️ MAX открыл чат без поля для отправки. Проверьте, что ссылка ведёт в нужную переписку и аккаунту разрешено писать туда.",
+            )
     finally:
         with admin_max_send_flow_lock:
             current = admin_max_send_flows.get(int(admin_id))
@@ -6921,73 +7119,159 @@ def _sync_send_to_max_command_menu(chat_id, chat=None, force_disabled=False):
     return True
 
 
-def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=None):
-    """Keep one MAX-send link beside the newest parser post for each connection."""
-    chat = get_chat_by_id(int(chat_id))
-    _sync_send_to_max_command_menu(int(chat_id), chat)
-    if not _max_send_button_is_eligible(chat):
-        _remove_max_send_button(chat_id)
-        return False
-    destination_chat_id = int(
-        destination_chat_id or chat.get("destination_chat_id") or chat["chat_id"]
-    )
-    existing_id = chat.get("max_send_button_message_id")
-    keyboard = _public_max_send_button_keyboard(chat_id)
-
-    latest_anchor = _latest_parser_send_anchor(int(chat_id), destination_chat_id)
-    target_id = anchor_message_id or latest_anchor
-    if not target_id and existing_id and _sent_record_is_outgoing_anchor(
-        int(chat_id), destination_chat_id, existing_id
-    ):
-        _remove_max_send_button(chat_id)
-        return False
-    target_id = target_id or existing_id
-    if not target_id:
-        debug_logger.info(
-            "MAX_SEND_BUTTON_NO_ANCHOR chat_id=%s destination_chat_id=%s",
-            chat_id, destination_chat_id,
-        )
-        return False
-    target_id = int(target_id)
-    if existing_id and int(existing_id) != target_id:
-        existing_id = int(existing_id)
+def _latest_parser_anchor_for_destination(destination_chat_id, eligible_chat_ids):
+    eligible_chat_ids = {int(value) for value in eligible_chat_ids}
+    candidates = []
+    for record in _sent_parser_records_snapshot():
+        if str(record.get("origin") or "") == "bot":
+            continue
         try:
-            bot.edit_message_reply_markup(destination_chat_id, existing_id, reply_markup=None)
-        except Exception as error:
-            error_text = str(error).lower()
-            if "message is not modified" not in error_text and not any(marker in error_text for marker in (
-                "message to edit not found", "message_id_invalid", "message can't be edited",
-            )):
-                debug_logger.warning(
-                    "MAX_SEND_BUTTON_MOVE_FAILED chat_id=%s message_id=%s error=%s",
-                    chat_id, existing_id, log_preview(error, 180),
-                )
-            else:
-                set_max_send_button_message_id(int(chat_id), None)
+            source_chat_id = int(record.get("chat_id") or 0)
+            record_destination = int(
+                record.get("destination_chat_id") or record.get("chat_id") or 0
+            )
+            message_ids = [int(value) for value in record.get("message_ids") or []]
+            if source_chat_id not in eligible_chat_ids or record_destination != int(destination_chat_id) or not message_ids:
+                continue
+            # Telegram message IDs increase within a destination chat, so they
+            # give a reliable global order across several MAX sources routed to
+            # the same Telegram destination.
+            candidates.append((max(message_ids), source_chat_id))
+        except (TypeError, ValueError):
+            continue
+    return max(candidates) if candidates else None
 
-    try:
-        bot.edit_message_reply_markup(
-            destination_chat_id, target_id, reply_markup=keyboard
+
+def _sync_max_send_button(chat_id, anchor_message_id=None, destination_chat_id=None):
+    """Keep exactly one MAX-send link on the newest message in a destination."""
+    with _max_send_button_sync_lock:
+        chat_id = int(chat_id)
+        chat = get_chat_by_id(chat_id)
+        if not chat:
+            return False
+        _sync_send_to_max_command_menu(chat_id, chat)
+        destination_chat_id = int(
+            destination_chat_id or chat.get("destination_chat_id") or chat["chat_id"]
         )
-        set_max_send_button_message_id(int(chat_id), target_id)
-        debug_logger.info(
-            "MAX_SEND_BUTTON_ATTACHED chat_id=%s destination_chat_id=%s message_id=%s",
-            chat_id, destination_chat_id, target_id,
-        )
-        return True
-    except Exception as error:
-        if "message is not modified" in str(error).lower():
-            set_max_send_button_message_id(int(chat_id), target_id)
+        destination_type = str(chat.get("destination_type") or "group")
+        try:
+            all_chats = get_all_chats()
+        except Exception as error:
+            debug_logger.warning(
+                "MAX_SEND_BUTTON_SCOPE_LOAD_FAILED chat_id=%s error_type=%s",
+                chat_id, type(error).__name__,
+            )
+            all_chats = [chat]
+
+        scoped_chats = []
+        for candidate in all_chats:
+            try:
+                candidate_destination = int(
+                    candidate.get("destination_chat_id") or candidate["chat_id"]
+                )
+                candidate_type = str(candidate.get("destination_type") or "group")
+                if candidate_destination == destination_chat_id and candidate_type == destination_type:
+                    scoped_chats.append(candidate)
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not any(int(item.get("chat_id") or 0) == chat_id for item in scoped_chats):
+            scoped_chats.append(chat)
+
+        eligible = [item for item in scoped_chats if _max_send_button_is_eligible(item)]
+        eligible_ids = {int(item.get("chat_id") or 0) for item in eligible}
+        latest = _latest_parser_anchor_for_destination(destination_chat_id, eligible_ids)
+        winner_chat_id = int(latest[1]) if latest else None
+        target_id = int(latest[0]) if latest else None
+
+        # The just-sent post is an explicit fresh anchor; prefer it when the
+        # message record has not reached the local sent-record cache yet.
+        if anchor_message_id and chat_id in eligible_ids:
+            explicit_id = int(anchor_message_id)
+            if target_id is None or explicit_id > target_id:
+                winner_chat_id, target_id = chat_id, explicit_id
+
+        if target_id is None:
+            stored = []
+            for candidate in eligible:
+                try:
+                    saved_id = int(candidate.get("max_send_button_message_id") or 0)
+                    if saved_id > 0:
+                        stored.append((saved_id, int(candidate["chat_id"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if stored:
+                target_id, winner_chat_id = max(stored)
+
+        # Remove the stale inline keyboard from every older anchor in this
+        # destination, including anchors belonging to another linked MAX chat.
+        for candidate in scoped_chats:
+            try:
+                candidate_id = int(candidate["chat_id"])
+                existing_id = int(candidate.get("max_send_button_message_id") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not existing_id or (candidate_id == winner_chat_id and existing_id == target_id):
+                continue
+            try:
+                # Moving a button must never delete the Telegram message itself.
+                bot.edit_message_reply_markup(
+                    destination_chat_id, existing_id, reply_markup=None
+                )
+            except Exception as error:
+                if "message is not modified" not in str(error).lower():
+                    debug_logger.info(
+                        "MAX_SEND_BUTTON_MOVE_FAILED chat_id=%s message_id=%s error=%s",
+                        candidate_id, existing_id, log_preview(error, 160),
+                    )
+            set_max_send_button_message_id(candidate_id, None)
+
+        if not eligible or target_id is None or winner_chat_id is None:
             debug_logger.info(
-                "MAX_SEND_BUTTON_ATTACHED chat_id=%s destination_chat_id=%s message_id=%s already_present=true",
-                chat_id, destination_chat_id, target_id,
+                "MAX_SEND_BUTTON_NO_ANCHOR chat_id=%s destination_chat_id=%s eligible=%s",
+                chat_id, destination_chat_id, len(eligible),
+            )
+            return False
+
+        winner_chat = next(
+            (item for item in eligible if int(item.get("chat_id") or 0) == winner_chat_id),
+            None,
+        )
+        if not winner_chat:
+            return False
+        previous_winner_id = int(winner_chat.get("max_send_button_message_id") or 0)
+        if previous_winner_id and previous_winner_id != target_id:
+            try:
+                bot.edit_message_reply_markup(
+                    destination_chat_id, previous_winner_id, reply_markup=None
+                )
+            except Exception as error:
+                if "message is not modified" not in str(error).lower():
+                    debug_logger.info(
+                        "MAX_SEND_BUTTON_MOVE_FAILED chat_id=%s message_id=%s error=%s",
+                        winner_chat_id, previous_winner_id, log_preview(error, 160),
+                    )
+            set_max_send_button_message_id(winner_chat_id, None)
+
+        keyboard = _public_max_send_button_keyboard(winner_chat_id)
+        try:
+            bot.edit_message_reply_markup(
+                destination_chat_id, target_id, reply_markup=keyboard
+            )
+            set_max_send_button_message_id(winner_chat_id, target_id)
+            debug_logger.info(
+                "MAX_SEND_BUTTON_ATTACHED chat_id=%s destination_chat_id=%s message_id=%s",
+                winner_chat_id, destination_chat_id, target_id,
             )
             return True
-        debug_logger.warning(
-            "MAX_SEND_BUTTON_ATTACH_FAILED chat_id=%s message_id=%s error=%s",
-            chat_id, target_id, log_preview(error, 180),
-        )
-        return False
+        except Exception as error:
+            if "message is not modified" in str(error).lower():
+                set_max_send_button_message_id(winner_chat_id, target_id)
+                return True
+            debug_logger.warning(
+                "MAX_SEND_BUTTON_ATTACH_FAILED chat_id=%s message_id=%s error=%s",
+                winner_chat_id, target_id, log_preview(error, 180),
+            )
+            return False
 
 
 def _cleanup_legacy_max_send_buttons():
@@ -7608,6 +7892,11 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
             result_text = _max_send_failure_text(error, "⚠️ MAX не успел подготовить вложение. Проверьте чат MAX и попробуйте отправить файл ещё раз.")
         elif "MAX_SEND_NOT_CONFIRMED" in str(error):
             result_text = _max_send_failure_text(error, "⚠️ MAX не подтвердил отправку. Проверьте чат MAX перед повторной попыткой.")
+        elif "MAX_COMPOSER_NOT_FOUND" in str(error):
+            result_text = _max_send_failure_text(
+                error,
+                "⚠️ MAX открыл чат без поля для отправки. Проверьте, что ссылка ведёт в нужную переписку и аккаунту разрешено писать туда.",
+            )
     finally:
         with public_max_send_flow_lock:
             current = public_max_send_flows.get(flow_key)
@@ -8116,6 +8405,198 @@ def _project_access_retry_keyboard(chat_id, allow_edit=True):
     return keyboard
 
 
+def _self_access_retry_keyboard(chat_id):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "🔁 Проверить доступ ещё раз",
+        callback_data=f"project_retry_{int(chat_id)}",
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "💬 Написать в поддержку",
+        callback_data="support_start",
+    ))
+    return keyboard
+
+
+def _verify_self_chat_access_impl(
+    chat_id, notify_chat_id=None, progress_message_id=None,
+    refresh_list_message_id=None, review_event_id=None,
+):
+    """Enable a self-account connection only after its exact MAX source opens."""
+    chat_id = int(chat_id)
+    chat = get_chat_by_id(chat_id)
+    owner_id = int(chat.get("owner_id") or 0) if chat else 0
+    destination = int(notify_chat_id or owner_id or ADMIN_ID)
+    report_message_id = progress_message_id
+
+    def report(text, reply_markup=None):
+        if report_message_id:
+            try:
+                bot.edit_message_text(
+                    text,
+                    destination,
+                    int(report_message_id),
+                    reply_markup=reply_markup,
+                    **NO_PREVIEW,
+                )
+                return True
+            except Exception as error:
+                debug_logger.info(
+                    "SELF_ACCESS_STATUS_EDIT_FAILED chat_id=%s error_type=%s",
+                    chat_id, type(error).__name__,
+                )
+        try:
+            bot.send_message(
+                destination, text, reply_markup=reply_markup, **NO_PREVIEW
+            )
+            return True
+        except Exception as error:
+            debug_logger.warning(
+                "SELF_ACCESS_STATUS_SEND_FAILED chat_id=%s destination=%s error_type=%s",
+                chat_id, destination, type(error).__name__,
+            )
+            return False
+
+    def notify_owner(text, reply_markup=None):
+        if owner_id <= 0 or owner_id == destination:
+            return
+        try:
+            bot.send_message(owner_id, text, reply_markup=reply_markup, **NO_PREVIEW)
+        except Exception as error:
+            debug_logger.warning(
+                "SELF_ACCESS_OWNER_NOTICE_FAILED chat_id=%s owner_id=%s error_type=%s",
+                chat_id, owner_id, type(error).__name__,
+            )
+
+    def refresh_list():
+        if not refresh_list_message_id or owner_id <= 0:
+            return
+        try:
+            _show_my_chats(owner_id, owner_id, int(refresh_list_message_id))
+        except Exception as error:
+            debug_logger.info(
+                "SELF_ACCESS_LIST_REFRESH_FAILED chat_id=%s error_type=%s",
+                chat_id, type(error).__name__,
+            )
+
+    if not chat or chat.get("account_mode") != "self" or not chat.get("max_url"):
+        report("⚠️ Не удалось проверить подключение: ссылка на чат MAX отсутствует или подключение изменилось.")
+        refresh_list()
+        return False
+
+    session_path = _session_path_for_chat(chat)
+    if not os.path.exists(session_path):
+        toggle_chat(chat_id, False)
+        _sync_max_send_button(chat_id)
+        report(
+            "⚠️ Сессия MAX не найдена. Подключите аккаунт ещё раз, затем проверка чата запустится повторно."
+        )
+        notify_owner(
+            "⚠️ Сессия MAX не найдена. Подключите аккаунт ещё раз, чтобы восстановить пересылку."
+        )
+        refresh_list()
+        return False
+
+    try:
+        verification = parse_max_group_media(
+            group_url=chat["max_url"],
+            chat_id=chat_id,
+            session_path=session_path,
+            verify_only=True,
+            navigation_timeout_ms=15000,
+            navigation_attempts=2,
+        )
+        latest = get_chat_by_id(chat_id)
+        if (
+            not latest
+            or latest.get("account_mode") != "self"
+            or latest.get("max_url") != chat.get("max_url")
+            or int(latest.get("owner_id") or 0) != owner_id
+        ):
+            report("Проверка остановлена: подключение было удалено или изменено.")
+            return False
+
+        detected_source_type = (
+            verification.get("source_type")
+            if isinstance(verification, dict) else None
+        )
+        if detected_source_type in {"group", "channel", "private"}:
+            _update_detected_source_type(chat_id, detected_source_type)
+        toggle_chat(chat_id, True)
+        activated = get_chat_by_id(chat_id)
+        if not activated or not activated.get("is_active"):
+            raise RuntimeError("CHAT_ACTIVATION_NOT_PERSISTED")
+
+        _clear_session_expiry_notice(activated)
+        _clear_max_source_access_failures(chat_id)
+        _sync_max_send_button(chat_id)
+        status = "✅ Доступ к MAX подтверждён. Пересылка включена."
+        report(status)
+        notify_owner(status)
+        refresh_list()
+        if owner_id > 0:
+            try:
+                generation = get_or_create_chat_connection_generation(chat_id)
+                event_id = review_event_id or generation or uuid.uuid4().hex
+                _offer_review_after_connection(
+                    owner_id,
+                    f"{chat_id}:{activated.get('account_mode') or 'self'}:{event_id}",
+                )
+            except Exception as error:
+                debug_logger.warning(
+                    "REVIEW_INVITATION_SEND_FAILED user_id=%s error_type=%s",
+                    owner_id, type(error).__name__,
+                )
+        debug_logger.info(
+            "SELF_CHAT_ACCESS_VERIFIED chat_id=%s source_type=%s",
+            chat_id, detected_source_type or "unknown",
+        )
+        return True
+    except Exception as error:
+        latest = get_chat_by_id(chat_id)
+        if latest and latest.get("account_mode") == "self":
+            toggle_chat(chat_id, False)
+            _sync_max_send_button(chat_id)
+        if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
+            _notify_session_expired(latest or chat, error)
+        debug_logger.warning(
+            "SELF_CHAT_ACCESS_CHECK_FAILED chat_id=%s owner_id=%s error_type=%s error=%s",
+            chat_id, owner_id, type(error).__name__, log_preview(error, 240),
+        )
+        failure = (
+            "⚠️ Вход в MAX выполнен, но выбранный чат не открылся. Проверьте, что аккаунт MAX "
+            "состоит в этой переписке или группе и ссылка ведёт именно на неё. Пересылка пока выключена."
+        )
+        keyboard = _self_access_retry_keyboard(chat_id)
+        report(failure, reply_markup=keyboard)
+        notify_owner(failure, reply_markup=keyboard)
+        refresh_list()
+        return False
+
+
+def _verify_self_chat_access(
+    chat_id, notify_chat_id=None, progress_message_id=None,
+    refresh_list_message_id=None, review_event_id=None,
+):
+    chat_id = int(chat_id)
+    with self_chat_access_verifying_lock:
+        if chat_id in self_chat_access_verifying:
+            debug_logger.info("SELF_ACCESS_DUPLICATE_CHECK_IGNORED chat_id=%s", chat_id)
+            return False
+        self_chat_access_verifying.add(chat_id)
+    try:
+        return _verify_self_chat_access_impl(
+            chat_id,
+            notify_chat_id=notify_chat_id,
+            progress_message_id=progress_message_id,
+            refresh_list_message_id=refresh_list_message_id,
+            review_event_id=review_event_id,
+        )
+    finally:
+        with self_chat_access_verifying_lock:
+            self_chat_access_verifying.discard(chat_id)
+
+
 def _edit_setup_prompt(owner_id, setup_state, text, reply_markup=None, parse_mode=None):
     """Reuse one setup message so old step keyboards cannot remain active."""
     prompt_id = setup_state.get("prompt_message_id")
@@ -8263,6 +8744,7 @@ def _verify_project_chat_access_impl(
             navigation_attempts=2,
         )
         _clear_session_expiry_notice(chat)
+        _clear_max_source_access_failures(chat_id)
         detected_source_type = (verification or {}).get("source_type") if isinstance(verification, dict) else None
         with CHAT_LIFECYCLE_LOCK:
             current = get_chat_by_id(chat_id)
@@ -9896,7 +10378,7 @@ def admin_callbacks(call):
             retry_chat = get_chat_by_id(int(action.rsplit("_", 1)[1]))
             is_allowed_project_retry = bool(
                 retry_chat
-                and retry_chat.get("account_mode") == "project"
+                and retry_chat.get("account_mode") in {"project", "self"}
                 and int(retry_chat.get("owner_id") or 0) == int(call.from_user.id)
             )
         except (ValueError, IndexError, TypeError):
@@ -10367,14 +10849,26 @@ def admin_callbacks(call):
                 **NO_PREVIEW,
             )
             progress_message_id = call.message.message_id
-        threading.Thread(
-            target=_verify_project_chat_access,
-            args=(
+        if retry_chat and retry_chat.get("account_mode") == "self":
+            verify_target = _verify_self_chat_access
+            verify_args = (
                 retry_chat_id,
                 call.from_user.id,
                 progress_message_id,
                 call.message.message_id if is_my_chats_listing else None,
-            ),
+                uuid.uuid4().hex,
+            )
+        else:
+            verify_target = _verify_project_chat_access
+            verify_args = (
+                retry_chat_id,
+                call.from_user.id,
+                progress_message_id,
+                call.message.message_id if is_my_chats_listing else None,
+            )
+        threading.Thread(
+            target=verify_target,
+            args=verify_args,
             daemon=True,
         ).start()
         return

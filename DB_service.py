@@ -335,6 +335,25 @@ def init_db():
                 PRIMARY KEY (user_id, plan_code)
             )
         """)
+        trial_table_exists = conn.execute(
+            "SELECT to_regclass('public.user_trial_grants') AS table_name"
+        ).fetchone()["table_name"] is not None
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_trial_grants (
+                user_id BIGINT PRIMARY KEY,
+                grant_kind TEXT NOT NULL CHECK (grant_kind IN ('welcome', 'legacy')),
+                granted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Existing users should not receive a retroactive welcome month after
+        # this feature is deployed. Legacy markers are seeded only on the
+        # first migration, so later group-only users can qualify on private /start.
+        if not trial_table_exists:
+            conn.execute("""
+                INSERT INTO user_trial_grants (user_id, grant_kind)
+                SELECT user_id, 'legacy' FROM users
+                ON CONFLICT (user_id) DO NOTHING
+            """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_telegram_subscription_entitlements_active_until
             ON telegram_subscription_entitlements (active_until)
@@ -661,6 +680,53 @@ def add_or_update_user(user_id: int, username: str = None, first_name: str = Non
                 last_seen = CURRENT_TIMESTAMP
         """, (user_id, username, first_name, last_name))
 
+
+def register_private_start(user_id: int, username: str = None,
+                           first_name: str = None, last_name: str = None):
+    """Register a private /start and grant one welcome month to a truly new user."""
+    user_id = int(user_id)
+    with get_connection() as conn:
+        with conn.transaction():
+            inserted = conn.execute("""
+                INSERT INTO users (user_id, username, first_name, last_name, last_seen)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO NOTHING
+                RETURNING user_id
+            """, (user_id, username, first_name, last_name)).fetchone()
+            is_new_user = inserted is not None
+            if not is_new_user:
+                conn.execute("""
+                    UPDATE users
+                    SET username = %s, first_name = %s, last_name = %s,
+                        last_seen = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                """, (username, first_name, last_name, user_id))
+
+            # Existing users (including people first seen in a group after this
+            # migration) get a permanent marker but no first-start promotion.
+            grant_kind = 'welcome' if is_new_user else 'legacy'
+            trial_marker = conn.execute("""
+                INSERT INTO user_trial_grants (user_id, grant_kind)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                RETURNING user_id
+            """, (user_id, grant_kind)).fetchone()
+            if not is_new_user or not trial_marker:
+                return None
+
+            entitlement = conn.execute("""
+                INSERT INTO telegram_subscription_entitlements
+                    (user_id, plan_code, active_until)
+                VALUES (%s, 'multi', CURRENT_TIMESTAMP + INTERVAL '1 month')
+                ON CONFLICT (user_id, plan_code) DO UPDATE SET
+                    active_until = GREATEST(
+                        telegram_subscription_entitlements.active_until, CURRENT_TIMESTAMP
+                    ) + INTERVAL '1 month',
+                    updated_at = CURRENT_TIMESTAMP,
+                    reminder_sent_at = NULL
+                RETURNING active_until
+            """, (user_id,)).fetchone()
+            return entitlement["active_until"] if entitlement else None
 
 def delete_user(user_id: int) -> bool:
     with get_connection() as conn:
@@ -1498,6 +1564,31 @@ def get_or_create_chat_connection_generation(chat_id: int) -> str | None:
             RETURNING connection_generation
         """, (uuid.uuid4().hex, int(chat_id))).fetchone()
         return str(row["connection_generation"]) if row else None
+
+
+def refresh_chat_connection_generation(chat_id: int) -> str | None:
+    """Start a new bounded message-catch-up window after reauthentication."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            UPDATE chats
+            SET connection_generation = %s
+            WHERE chat_id = %s
+            RETURNING connection_generation
+        """, (uuid.uuid4().hex, int(chat_id))).fetchone()
+        return str(row["connection_generation"]) if row else None
+
+
+def refresh_project_connection_generations() -> int:
+    """Start new catch-up windows for chats using the shared project account."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM chats WHERE account_mode = 'project'"
+        ).fetchall()
+        for row in rows:
+            conn.execute("""
+                UPDATE chats SET connection_generation = %s WHERE chat_id = %s
+            """, (uuid.uuid4().hex, int(row["chat_id"])))
+        return len(rows)
 
 
 def get_active_chats():
