@@ -9,6 +9,7 @@ import io
 import base64
 import subprocess
 import sys
+from difflib import SequenceMatcher
 from urllib.parse import unquote, urlparse
 import queue
 import threading
@@ -287,6 +288,27 @@ def _is_yesterday_or_today(message: dict, today=None) -> bool:
     return today - timedelta(days=1) <= message_date <= today
 
 
+def _is_older_than_uncached_window(message: dict, now=None) -> bool:
+    """Reject stale catch-up rows after a chat already has an initial baseline."""
+    message_datetime = _message_datetime(message)
+    if message_datetime is None:
+        return False
+    try:
+        timezone = ZoneInfo(MAX_TIMEZONE_ID)
+        current = now or datetime.now(timezone)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone)
+        else:
+            current = current.astimezone(timezone)
+        message_datetime = message_datetime.replace(tzinfo=timezone)
+        return current - message_datetime > MAX_UNCACHED_MESSAGE_AGE
+    except Exception:
+        current = now or datetime.now().astimezone()
+        if current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        return current - message_datetime > MAX_UNCACHED_MESSAGE_AGE
+
+
 def _message_baseline_identity(message: dict) -> str:
     """Identity used only to keep a chat's initial history boundary."""
     source_id = str((message or {}).get("source_id") or "").strip()
@@ -323,45 +345,87 @@ def _message_is_before_initial_boundary(message: dict, baseline: dict) -> bool:
     if identity in initial_keys:
         return False
 
-    source_id = str(message.get("source_id") or "").strip()
-    high_water_id = baseline.get("high_water_id")
-    if source_id and not message.get("source_id_is_index") and high_water_id is not None:
-        try:
-            if int(source_id) <= int(high_water_id):
-                return True
-            return False
-        except (TypeError, ValueError):
-            pass
-
-    if identity in set(baseline.get("older_keys") or []):
-        return True
     boundary_text = str(baseline.get("boundary_datetime") or "").strip()
     if boundary_text:
         try:
             boundary_datetime = datetime.fromisoformat(boundary_text)
             message_datetime = _message_datetime(message)
-            if message_datetime is not None and message_datetime < boundary_datetime:
-                return True
+            if message_datetime is not None:
+                if message_datetime < boundary_datetime:
+                    return True
+                if message_datetime > boundary_datetime:
+                    return False
         except (TypeError, ValueError):
             pass
+
+    source_id = str(message.get("source_id") or "").strip()
+    high_water_id = baseline.get("high_water_id")
+    if source_id and not message.get("source_id_is_index") and high_water_id is not None:
+        try:
+            return int(source_id) <= int(high_water_id)
+        except (TypeError, ValueError):
+            pass
+
+    if identity in set(baseline.get("older_keys") or []):
+        return True
     return False
 
 
+def _collapse_duplicate_index_rows(messages: list[dict]) -> list[dict]:
+    """Collapse near-identical long cards when MAX provides only recycled DOM indexes."""
+    output = []
+
+    def quality(message):
+        text = str(message.get("text") or "")
+        media_count = sum(
+            len(message.get(key) or [])
+            for key in ("images", "documents", "attachments", "emoji_image_urls")
+        )
+        return len(text), media_count
+
+    for message in messages or []:
+        text = normalize_for_hash(message.get("text") or "")
+        has_message_timestamp = bool(
+            str(message.get("date") or "").strip()
+            and str(message.get("time") or "").strip()
+        )
+        if message.get("source_id_is_index") and has_message_timestamp and len(text) >= 120:
+            duplicate_index = None
+            for index in range(max(0, len(output) - 30), len(output)):
+                previous = output[index]
+                if not previous.get("source_id_is_index") or not str(previous.get("time") or "").strip():
+                    continue
+                if (
+                    normalize_for_hash(previous.get("name") or "").casefold()
+                    != normalize_for_hash(message.get("name") or "").casefold()
+                    or str(previous.get("date") or "") != str(message.get("date") or "")
+                    or str(previous.get("time") or "") != str(message.get("time") or "")
+                ):
+                    continue
+                previous_text = normalize_for_hash(previous.get("text") or "")
+                if len(previous_text) < 120:
+                    continue
+                if SequenceMatcher(None, previous_text.casefold(), text.casefold()).ratio() >= 0.92:
+                    duplicate_index = index
+                    break
+            if duplicate_index is not None:
+                previous = output[duplicate_index]
+                if quality(message) > quality(previous):
+                    output[duplicate_index] = message
+                debug_logger.warning(
+                    "MAX_DUPLICATE_INDEX_ROW_COLLAPSED source_id=%s duplicate_source_id=%s similarity=high",
+                    previous.get("source_id") or "?", message.get("source_id") or "?",
+                )
+                continue
+        output.append(message)
+    return output
+
+
 def _order_max_messages(messages: list[dict]) -> list[dict]:
-    """Order the extracted window oldest-to-newest, preferring MAX's stable IDs."""
+    """Order by parsed message timestamp; IDs are a fallback when dates are missing."""
     ordered = list(messages or [])
     if len(ordered) < 2:
         return ordered
-
-    stable_ids = []
-    for message in ordered:
-        source_id = str(message.get("source_id") or "").strip()
-        if message.get("source_id_is_index") or not re.fullmatch(r"-?\d+", source_id):
-            stable_ids = []
-            break
-        stable_ids.append(int(source_id))
-    if len(stable_ids) == len(ordered) and len(set(stable_ids)) == len(stable_ids):
-        return [message for _, message in sorted(zip(stable_ids, ordered), key=lambda pair: pair[0])]
 
     message_datetimes = [_message_datetime(message) for message in ordered]
     if all(value is not None for value in message_datetimes):
@@ -373,6 +437,16 @@ def _order_max_messages(messages: list[dict]) -> list[dict]:
                 -int(message.get("idx") or 0) if dom_order_descending else int(message.get("idx") or 0),
             ),
         )
+
+    stable_ids = []
+    for message in ordered:
+        source_id = str(message.get("source_id") or "").strip()
+        if message.get("source_id_is_index") or not re.fullmatch(r"-?\d+", source_id):
+            stable_ids = []
+            break
+        stable_ids.append(int(source_id))
+    if len(stable_ids) == len(ordered) and len(set(stable_ids)) == len(stable_ids):
+        return [message for _, message in sorted(zip(stable_ids, ordered), key=lambda pair: pair[0])]
 
     if bool(ordered[0].get("dom_order_descending")):
         ordered.reverse()
@@ -522,6 +596,26 @@ def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int 
                 f"Повтор {attempt + 1}/{max_attempts} через {delay_seconds} сек."
             )
             time.sleep(delay_seconds)
+
+
+def _is_max_host(host):
+    host = str(host or "").lower().rstrip(".")
+    return host == "max.ru" or host.endswith(".max.ru")
+
+
+def _max_chat_route_is_open(requested_url, current_url):
+    """Accept MAX's canonical chat routes while rejecting home/login redirects."""
+    requested_url = str(requested_url or "").strip()
+    current_url = str(current_url or "").strip()
+    requested = urlparse(requested_url)
+    current = urlparse(current_url)
+    path = current.path.rstrip("/").lower()
+    blocked_paths = {"", "/", "/auth", "/login", "/signin", "/sign-in"}
+    return bool(
+        _is_max_host(requested.hostname)
+        and _is_max_host(current.hostname)
+        and path not in blocked_paths
+    )
 
 def _get_password_input(page):
     password_selectors = [
@@ -5649,7 +5743,14 @@ def parse_max_group_media(
             timeout=navigation_timeout_ms, max_attempts=navigation_attempts,
         )
         page.wait_for_timeout(1200 if verify_only else 3000)
-        if not _is_logged_in(page):
+        logged_in = False
+        for auth_check in range(3):
+            if _is_logged_in(page):
+                logged_in = True
+                break
+            if auth_check < 2:
+                page.wait_for_timeout(800)
+        if not logged_in:
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
             raise Exception(f"SESSION_EXPIRED|{debug_path}")
@@ -5660,18 +5761,42 @@ def parse_max_group_media(
         page.wait_for_timeout(1200 if verify_only else 4000)
         _accept_max_invite_if_available(page, group_url, chat_id)
         current_url = page.url
-        requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
-        current_parts = urlparse(current_url)
-        current_host = (current_parts.hostname or "").lower().rstrip(".")
-        current_path = current_parts.path.rstrip("/").lower()
-        redirected_to_max_chat = (
-            (requested_host == "max.ru" or requested_host.endswith(".max.ru"))
-            and (current_host == "max.ru" or current_host.endswith(".max.ru"))
-            and current_path not in {"", "/", "/auth", "/login", "/signin", "/sign-in"}
-        )
-        if group_url not in current_url and not redirected_to_max_chat:
+        if not _max_chat_route_is_open(group_url, current_url):
+            first_route = urlparse(current_url)
+            debug_logger.warning(
+                "MAX_CHAT_ROUTE_MISMATCH_RETRY chat_id=%s requested_host=%s requested_path=%s current_host=%s current_path=%s",
+                chat_id,
+                urlparse(group_url).hostname or "",
+                urlparse(group_url).path[:160],
+                first_route.hostname or "",
+                first_route.path[:160],
+            )
+            # MAX Web occasionally lands on its chat list after the first
+            # navigation. Retry the requested URL once before declaring that
+            # the user was redirected away from the selected source.
+            _goto_max_with_retry(
+                page, group_url, chat_id, "повторный переход в чат MAX",
+                timeout=navigation_timeout_ms, max_attempts=2,
+            )
+            page.wait_for_timeout(1200 if verify_only else 2200)
+            _accept_max_invite_if_available(page, group_url, chat_id)
+            current_url = page.url
+        if not _max_chat_route_is_open(group_url, current_url):
+            if not _is_logged_in(page):
+                debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
+                page.screenshot(path=debug_path, full_page=True)
+                raise Exception(f"SESSION_EXPIRED|{debug_path}")
             debug_path = f"{SESSIONS_DIR}/wrong_chat_debug_{chat_id}.png"
             page.screenshot(path=debug_path, full_page=True)
+            current_parts = urlparse(current_url)
+            debug_logger.error(
+                "MAX_CHAT_ROUTE_MISMATCH chat_id=%s requested_host=%s requested_path=%s current_host=%s current_path=%s",
+                chat_id,
+                urlparse(group_url).hostname or "",
+                urlparse(group_url).path[:160],
+                current_parts.hostname or "",
+                current_parts.path[:160],
+            )
             raise Exception(f"WRONG_CHAT_REDIRECT|{debug_path}")
         if len(page.content()) < 1000:
             debug_path = f"{SESSIONS_DIR}/parse_debug_{chat_id}.png"
@@ -7835,7 +7960,11 @@ def parse_max_group_media(
         for msg in raw_messages:
             text = _normalize_message_lines(msg.get("text") or "")
             text = _coalesce_leading_emoji_lines(text, msg.get("emoji_texts") or [])
-            if msg.get("animated_emoji_hint"):
+            # MAX sometimes exposes animated emoji as ordinary text nodes and
+            # misses the animation marker. Their block-level wrappers still
+            # create false blank lines, so normalize whenever the DOM supplied
+            # the emoji glyphs, not only when its animation hint was detected.
+            if msg.get("emoji_texts"):
                 text = _coalesce_embedded_animated_emoji_lines(
                     text, msg.get("emoji_texts") or []
                 )
@@ -7874,7 +8003,7 @@ def parse_max_group_media(
 
         # Отделяем системные карточки и служебные строки перед финальной
         # фильтрацией и отправкой ограниченного окна сообщений.
-        all_messages = cleaned
+        all_messages = _collapse_duplicate_index_rows(cleaned)
 
         # MAX иногда выводит количество голосов отдельной соседней .item, например
         # "Название 1 1 vote". Это не отдельное сообщение — переносим его в poll.
@@ -7997,7 +8126,12 @@ def parse_max_group_media(
             unprocessed = []
             prefiltered = 0
             history_marked = 0
+            outside_catchup_window = 0
             for candidate in all_messages:
+                if _is_older_than_uncached_window(candidate):
+                    mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
+                    outside_catchup_window += 1
+                    continue
                 if _message_is_before_initial_boundary(candidate, baseline_state):
                     mark_message_seen(_message_cache_stub(candidate), chat_id=chat_id)
                     history_marked += 1
@@ -8011,8 +8145,9 @@ def parse_max_group_media(
                 unprocessed.append(candidate)
             all_messages = unprocessed
             debug_logger.info(
-                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s history=%s new=%s",
-                chat_id, len(cleaned), prefiltered, history_marked, len(all_messages),
+                "MAX_ATTACHMENT_PREFILTER chat_id=%s scanned=%s known=%s history=%s stale=%s new=%s",
+                chat_id, len(cleaned), prefiltered, history_marked,
+                outside_catchup_window, len(all_messages),
             )
         print(f"[{chat_id}] После фильтрации: {len(all_messages)} сообщений (от старых к новым)")
 
@@ -9104,23 +9239,31 @@ def send_message_to_max(
         page = context.new_page()
         _goto_max_with_retry(page, "https://web.max.ru", chat_id, "главная страница MAX")
         page.wait_for_timeout(1000)
-        if not _is_logged_in(page):
+        logged_in = False
+        for auth_check in range(3):
+            if _is_logged_in(page):
+                logged_in = True
+                break
+            if auth_check < 2:
+                page.wait_for_timeout(800)
+        if not logged_in:
             raise RuntimeError("SESSION_EXPIRED")
 
         _goto_max_with_retry(page, group_url, chat_id, "переход в чат MAX")
         page.wait_for_timeout(1800)
         _accept_max_invite_if_available(page, group_url, chat_id)
         current_url = page.url
-        requested_host = (urlparse(group_url).hostname or "").lower().rstrip(".")
-        current_parts = urlparse(current_url)
-        current_host = (current_parts.hostname or "").lower().rstrip(".")
-        current_path = current_parts.path.rstrip("/").lower()
-        redirected_to_chat = (
-            (requested_host == "max.ru" or requested_host.endswith(".max.ru"))
-            and (current_host == "max.ru" or current_host.endswith(".max.ru"))
-            and current_path not in {"", "/", "/auth", "/login", "/signin", "/sign-in"}
-        )
-        if group_url not in current_url and not redirected_to_chat:
+        if not _max_chat_route_is_open(group_url, current_url):
+            _goto_max_with_retry(
+                page, group_url, chat_id, "повторный переход в чат MAX",
+                timeout=20000, max_attempts=2,
+            )
+            page.wait_for_timeout(1200)
+            _accept_max_invite_if_available(page, group_url, chat_id)
+            current_url = page.url
+        if not _max_chat_route_is_open(group_url, current_url):
+            if not _is_logged_in(page):
+                raise RuntimeError("SESSION_EXPIRED")
             raise RuntimeError("WRONG_MAX_CHAT")
         if len(page.content()) < 1000:
             raise RuntimeError("MAX_CHAT_NOT_LOADED")

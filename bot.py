@@ -68,6 +68,8 @@ awaiting_phone_from = {}
 awaiting_code_from = {}
 awaiting_admin_group_private_reply = {}
 support_sessions = set(get_open_support_sessions())
+_SESSION_EXPIRY_NOTICE_LOCK = threading.Lock()
+_SESSION_EXPIRY_NOTICE_SIGNATURES = {}
 
 
 def _video_upload_details(media: dict, post: dict) -> dict:
@@ -2029,6 +2031,153 @@ def _session_path_for_chat(chat):
     return os.path.join("sessions", f"{chat['chat_id']}.json")
 
 
+def _session_file_signature(path):
+    try:
+        stat = os.stat(path)
+        return (int(stat.st_ino), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return None
+
+
+def _session_expiry_targets(chat):
+    """Return all active connections that depend on the same MAX session file."""
+    if not chat:
+        return []
+    session_path = _session_path_for_chat(chat)
+    if chat.get("account_mode") != "project":
+        return [chat]
+    try:
+        candidates = get_all_chats()
+    except Exception:
+        candidates = [chat]
+    matching = []
+    for candidate in candidates:
+        try:
+            if (
+                candidate.get("account_mode") == "project"
+                and candidate.get("max_url")
+                and bool(candidate.get("is_active"))
+                and _session_path_for_chat(candidate) == session_path
+            ):
+                matching.append(candidate)
+        except (KeyError, TypeError):
+            continue
+    try:
+        chat_id = int(chat.get("chat_id") or 0)
+        if all(int(target.get("chat_id") or 0) != chat_id for target in matching):
+            matching.append(chat)
+    except (TypeError, ValueError):
+        pass
+    return matching or [chat]
+
+
+def _clear_session_expiry_notice(chat):
+    """Allow a later, genuinely new expiration to notify again after recovery."""
+    for target in _session_expiry_targets(chat):
+        try:
+            key = int(target["chat_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        with _SESSION_EXPIRY_NOTICE_LOCK:
+            _SESSION_EXPIRY_NOTICE_SIGNATURES.pop(key, None)
+
+
+def _notify_session_expired(chat, error=None):
+    """Notify the owner and Telegram destination once for each expired session file."""
+    if not chat:
+        return False
+    targets = _session_expiry_targets(chat)
+    signature = _session_file_signature(_session_path_for_chat(chat))
+    if signature is None:
+        signature = ("missing",)
+    pending = []
+    with _SESSION_EXPIRY_NOTICE_LOCK:
+        for target in targets:
+            try:
+                target_id = int(target["chat_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if _SESSION_EXPIRY_NOTICE_SIGNATURES.get(target_id) == signature:
+                continue
+            _SESSION_EXPIRY_NOTICE_SIGNATURES[target_id] = signature
+            pending.append(target)
+    if not pending:
+        return False
+
+    admin_notices = []
+    owner_notices = {}
+    for target in pending:
+        title_text = str(target.get("title") or "чат MAX")
+        title = escape_html(title_text)
+        try:
+            destination_chat_id = int(
+                target.get("destination_chat_id") or target.get("chat_id")
+            )
+        except (TypeError, ValueError):
+            destination_chat_id = None
+        try:
+            owner_id = int(target.get("owner_id") or 0)
+        except (TypeError, ValueError):
+            owner_id = 0
+        if owner_id > 0:
+            owner_notices.setdefault(owner_id, []).append(title_text)
+        if destination_chat_id and destination_chat_id != owner_id:
+            try:
+                bot.send_message(
+                    destination_chat_id,
+                    "⚠️ <b>Пересылка из MAX приостановлена</b>\n\n"
+                    f"Сессия MAX для источника «{title}» завершилась. "
+                    "Владелец подключения, откройте @max_parserBot и напишите в поддержку через /help, "
+                    "чтобы восстановить вход.",
+                    **NO_PREVIEW,
+                )
+            except Exception as send_error:
+                debug_logger.warning(
+                    "SESSION_EXPIRED_NOTICE_SEND_FAILED chat_id=%s recipient=%s error_type=%s",
+                    target.get("chat_id"), destination_chat_id, type(send_error).__name__,
+                )
+        if target.get("account_mode") == "project":
+            admin_notices.append(title_text)
+
+    for owner_id, titles in owner_notices.items():
+        escaped_titles = ", ".join(escape_html(value) for value in titles[:20])
+        try:
+            bot.send_message(
+                owner_id,
+                "⚠️ <b>Пересылка из MAX приостановлена</b>\n\n"
+                f"Сессия MAX завершилась для источника: {escaped_titles}.\n"
+                "Откройте @max_parserBot и напишите в поддержку через /help, чтобы восстановить вход.",
+                **NO_PREVIEW,
+            )
+        except Exception as send_error:
+            debug_logger.warning(
+                "SESSION_EXPIRED_NOTICE_SEND_FAILED owner_id=%s error_type=%s",
+                owner_id, type(send_error).__name__,
+            )
+
+    if admin_notices and ADMIN_ID not in owner_notices:
+        try:
+            titles = ", ".join(escape_html(value) for value in admin_notices[:20])
+            bot.send_message(
+                ADMIN_ID,
+                "⚠️ <b>Завершилась сессия готового аккаунта MAX</b>\n\n"
+                f"Пересылка приостановлена для: {titles}.\n"
+                "Войдите в готовый аккаунт заново, чтобы восстановить доступ.",
+                **NO_PREVIEW,
+            )
+        except Exception as send_error:
+            debug_logger.warning(
+                "PROJECT_SESSION_EXPIRED_ADMIN_NOTICE_FAILED error_type=%s",
+                type(send_error).__name__,
+            )
+    debug_logger.warning(
+        "MAX_SESSION_EXPIRED_NOTIFIED chat_ids=%s error_type=%s",
+        ",".join(str(target.get("chat_id")) for target in pending),
+        type(error).__name__ if error else "unknown",
+    )
+    return True
+
+
 def _user_needs_subscription(user_id, account_mode=None):
     if not PAYMENT_ACCESS_ENFORCEMENT_ENABLED:
         return False
@@ -2173,6 +2322,7 @@ def run_one_parse_cycle():
                 post_callback=consume_post,
                 source_type_callback=lambda detected, cid=chat_id: _update_detected_source_type(cid, detected),
             )
+            _clear_session_expiry_notice(chat)
             _verify_manual_source_type(chat_id)
             if not get_chat_by_id(chat_id):
                 continue
@@ -2199,6 +2349,7 @@ def run_one_parse_cycle():
             error_str = str(error)
             login_command = "/project_login" if chat.get("account_mode") == "project" else f"/login {chat_id}"
             if "SESSION_EXPIRED" in error_str:
+                _notify_session_expired(chat, error)
                 debug_path = get_parse_debug_screenshot(chat_id)
                 if "|" in error_str:
                     candidate = error_str.split("|", 1)[1]
@@ -2222,6 +2373,7 @@ def run_one_parse_cycle():
                         print(f"⚠️ Не удалось отправить диагностику: {send_error}")
                 results.append(error_msg)
             elif "NO_SESSION" in error_str:
+                _notify_session_expired(chat, error)
                 results.append(
                     f"⚠️ <b>{title}</b>: нет сессии! Используйте `{login_command}`"
                 )
@@ -2271,6 +2423,7 @@ def process_single_chat(chat):
             post_callback=consume_post,
             source_type_callback=lambda detected, cid=chat_id: _update_detected_source_type(cid, detected),
         )
+        _clear_session_expiry_notice(chat)
         _verify_manual_source_type(chat_id)
         if get_chat_by_id(chat_id):
             _store_parse_diagnostic(
@@ -2286,6 +2439,8 @@ def process_single_chat(chat):
             parse_diagnostics, error=error,
         )
         print(f"❌ Ошибка парсинга чата {title}: {error}")
+        if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
+            _notify_session_expired(chat, error)
         traceback.print_exc()
         return False
 
@@ -6151,7 +6306,6 @@ def _start_admin_max_send(call, source_chat_id):
     except Exception:
         pass
     nonce = uuid.uuid4().hex[:8]
-    is_private_source = _max_source_is_private(chat)
     with admin_max_send_flow_lock:
         current = admin_max_send_flows.get(admin_id)
         if current and current.get("stage") == "sending":
@@ -6160,14 +6314,12 @@ def _start_admin_max_send(call, source_chat_id):
         admin_max_send_flows[admin_id] = {
             "source_chat_id": source_chat_id,
             "nonce": nonce,
-            "stage": "body" if is_private_source else "name",
+            "stage": "name",
             "sender_name": "",
             "expires_at": time.time() + 15 * 60,
         }
     bot.answer_callback_query(call.id)
-    _admin_max_send_prompt(
-        admin_id, source_chat_id, nonce, "body" if is_private_source else "name"
-    )
+    _admin_max_send_prompt(admin_id, source_chat_id, nonce, "name")
 
 
 def _admin_may_send_through_chat(chat):
@@ -6459,6 +6611,8 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
     except Exception as error:
         _print_max_send_failure("ADMIN_MAX_MESSAGE_SEND_FAILED", source_chat_id, error)
+        if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
+            _notify_session_expired(get_chat_by_id(int(source_chat_id)), error)
         debug_logger.warning(
             "ADMIN_MAX_MESSAGE_SEND_FAILED source_chat_id=%s error_type=%s error=%s",
             source_chat_id, type(error).__name__, log_preview(error, 900),
@@ -6696,19 +6850,49 @@ def _max_send_button_is_eligible(chat):
 
 
 def _sync_send_to_max_command_menu(chat_id, chat=None, force_disabled=False):
-    """Expose /send_to_max only in connected Telegram groups with sendable MAX sources."""
+    """Expose /send_to_max only in linked Telegram destinations with sendable sources."""
     chat_id = int(chat_id)
     chat = chat or get_chat_by_id(chat_id)
     if not chat:
         return False
     destination_type = str(chat.get("destination_type") or "group")
-    if destination_type not in {"group", "supergroup"}:
+    if destination_type not in {"group", "supergroup", "private"}:
         return False
     try:
         destination_chat_id = int(chat.get("destination_chat_id") or chat["chat_id"])
     except (KeyError, TypeError, ValueError):
         return False
-    should_show = bool(not force_disabled and _max_send_button_is_eligible(chat))
+    if destination_type == "private":
+        owner_id = int(chat.get("owner_id") or 0)
+        if owner_id <= 0 or destination_chat_id != owner_id:
+            return False
+    try:
+        candidates = get_all_chats()
+    except Exception as error:
+        debug_logger.warning(
+            "SEND_TO_MAX_COMMAND_MENU_LIST_FAILED chat_id=%s error_type=%s",
+            chat_id, type(error).__name__,
+        )
+        candidates = [chat]
+    should_show = False
+    for candidate in candidates:
+        try:
+            candidate_destination = int(
+                candidate.get("destination_chat_id") or candidate["chat_id"]
+            )
+            candidate_type = str(candidate.get("destination_type") or "group")
+            same_scope = (
+                candidate_destination == destination_chat_id
+                and candidate_type == destination_type
+            )
+            candidate_id = int(candidate.get("chat_id") or 0)
+            if not same_scope or (force_disabled and candidate_id == chat_id):
+                continue
+            if _max_send_button_is_eligible(candidate):
+                should_show = True
+                break
+        except (KeyError, TypeError, ValueError):
+            continue
     with _send_to_max_command_menu_lock:
         if _send_to_max_command_menu_state.get(destination_chat_id) is should_show:
             return True
@@ -6886,8 +7070,7 @@ def _start_public_max_send(call, source_chat_id, allowed_private_user_id=None):
     input_chat_id = int(user.id)
     flow_key = (input_chat_id, int(user.id))
     nonce = uuid.uuid4().hex[:10]
-    is_private_source = _max_source_is_private(chat)
-    initial_stage = "body" if is_private_source else "name"
+    initial_stage = "name"
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if current and float(current.get("expires_at") or 0) > time.time():
@@ -6910,9 +7093,7 @@ def _start_public_max_send(call, source_chat_id, allowed_private_user_id=None):
         }
     try:
         prompt_text = (
-            "💬 Отправьте текст или вложение для этого личного чата MAX."
-            if is_private_source else
-            f"👤 Кто отправляет сообщение в MAX?\n\n"
+            "👤 Кто отправляет сообщение в MAX?\n\n"
             "Напишите имя в личном чате с ботом или нажмите «Пропустить этот шаг»."
         )
         prompt_options = {
@@ -6986,6 +7167,54 @@ def send_to_max_group_command(message):
     _start_public_max_send(
         SimpleNamespace(id=None, from_user=message.from_user, message=message),
         int(chat["chat_id"]),
+    )
+
+
+@bot.message_handler(commands=["send_to_max"], chat_types=["private"])
+def send_to_max_private_command(message):
+    if not message or not getattr(message, "from_user", None):
+        return
+    user_id = int(message.from_user.id)
+    if getattr(message.from_user, "is_bot", False) or int(message.chat.id) != user_id:
+        return
+    candidates = []
+    for chat in get_active_chats():
+        try:
+            if (
+                int(chat.get("owner_id") or 0) == user_id
+                and int(chat.get("destination_chat_id") or chat.get("chat_id") or 0) == user_id
+                and str(chat.get("destination_type") or "group") == "private"
+                and _max_send_button_is_eligible(chat)
+            ):
+                candidates.append(chat)
+        except (TypeError, ValueError):
+            continue
+    if not candidates:
+        bot.send_message(
+            user_id,
+            "Команда доступна после подключения MAX с получением сообщений в личные сообщения с ботом.",
+            **NO_PREVIEW,
+        )
+        return
+    if len(candidates) == 1:
+        _start_public_max_send(
+            SimpleNamespace(id=None, from_user=message.from_user, message=message),
+            int(candidates[0]["chat_id"]),
+            allowed_private_user_id=user_id,
+        )
+        return
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for chat in candidates:
+        title = str(chat.get("title") or "Чат MAX").strip()[:48]
+        keyboard.add(types.InlineKeyboardButton(
+            f"✍️ {title}",
+            callback_data=f"maxsend_start_{int(chat['chat_id'])}_{user_id}",
+        ))
+    bot.send_message(
+        user_id,
+        "Выберите чат MAX, куда отправить сообщение:",
+        reply_markup=keyboard,
+        **NO_PREVIEW,
     )
 
 
@@ -7356,6 +7585,10 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
         )
     except Exception as error:
         _print_max_send_failure("PUBLIC_MAX_SEND_FAILED", int(flow.get("source_chat_id") or flow_key[0]), error)
+        if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
+            _notify_session_expired(
+                get_chat_by_id(int(flow.get("source_chat_id") or flow_key[0])), error
+            )
         debug_logger.warning(
             "PUBLIC_MAX_SEND_FAILED user_chat=%s error_type=%s error=%s",
             flow_key, type(error).__name__, log_preview(error, 900),
@@ -8029,6 +8262,7 @@ def _verify_project_chat_access_impl(
             navigation_timeout_ms=12000,
             navigation_attempts=2,
         )
+        _clear_session_expiry_notice(chat)
         detected_source_type = (verification or {}).get("source_type") if isinstance(verification, dict) else None
         with CHAT_LIFECYCLE_LOCK:
             current = get_chat_by_id(chat_id)
@@ -8096,6 +8330,8 @@ def _verify_project_chat_access_impl(
                 )
         return True
     except Exception as error:
+        if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
+            _notify_session_expired(chat, error)
         debug_logger.warning(
             "PROJECT_GROUP_ACCESS_CHECK_FAILED chat_id=%s owner_id=%s error_type=%s",
             chat_id, owner_id, type(error).__name__,
