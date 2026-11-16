@@ -4499,10 +4499,47 @@ def admin_send_again_keyboard(target_type, target_id):
     return keyboard
 
 
+def _attach_admin_delivery_reply_button(target_chat_id, sent_message_ids):
+    """Attach the existing private reply flow to the final admin-sent message."""
+    message_ids = []
+    for value in sent_message_ids or []:
+        try:
+            message_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if message_id > 0 and message_id not in message_ids:
+            message_ids.append(message_id)
+    if not message_ids:
+        return False
+
+    target_chat_id = int(target_chat_id)
+    target_message_id = message_ids[-1]
+    token = uuid.uuid4().hex
+    try:
+        save_admin_group_reply_link_token(token, target_chat_id, target_message_id)
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton(
+            "✉️ Ответить",
+            url=f"https://t.me/{BOT_PUBLIC_USERNAME}?start=reply_{token}",
+        ))
+        bot.edit_message_reply_markup(
+            target_chat_id, target_message_id, reply_markup=keyboard
+        )
+        return True
+    except Exception as error:
+        debug_logger.warning(
+            "ADMIN_DELIVERY_REPLY_BUTTON_FAILED chat_id=%s message_id=%s error_type=%s",
+            target_chat_id, target_message_id, type(error).__name__,
+        )
+        return False
+
+
 def process_send_to_one(message, target_user_id):
-    ok, error = send_content_to_user(target_user_id, message)
+    sent_ids = []
+    ok, error = send_content_to_user(target_user_id, message, sent_message_ids=sent_ids)
 
     if ok:
+        _attach_admin_delivery_reply_button(target_user_id, sent_ids)
         bot.send_message(
             message.chat.id,
             f"✅ Сообщение отправлено пользователю {target_user_id}",
@@ -4526,6 +4563,7 @@ def process_send_to_chat(message, target_chat_id):
             getattr(message, "text", None) or getattr(message, "caption", None) or message.content_type,
             has_media=message.content_type != "text",
         )
+        _attach_admin_delivery_reply_button(target_chat_id, sent_ids)
         bot.send_message(
             message.chat.id,
             f"✅ Сообщение отправлено в чат {target_chat_id}",
@@ -4539,9 +4577,11 @@ def process_send_to_chat(message, target_chat_id):
         )
 
 def process_send_to_user_content(message, target_user_id):
-    ok, error = send_content_to_user(target_user_id, message)
+    sent_ids = []
+    ok, error = send_content_to_user(target_user_id, message, sent_message_ids=sent_ids)
 
     if ok:
+        _attach_admin_delivery_reply_button(target_user_id, sent_ids)
         bot.send_message(
             message.chat.id,
             f"✅ Сообщение отправлено пользователю {target_user_id}",
@@ -4629,6 +4669,7 @@ def process_send_to_chat_content(message, target_chat_id):
             getattr(message, "text", None) or getattr(message, "caption", None) or message.content_type,
             has_media=message.content_type != "text",
         )
+        _attach_admin_delivery_reply_button(target_chat_id, sent_ids)
         bot.send_message(
             message.chat.id,
             f"✅ Сообщение отправлено в чат {target_chat_id}",
@@ -5768,15 +5809,26 @@ def start_bot(message):
             }
             try:
                 telegram_chat = bot.get_chat(int(route["group_chat_id"]))
-                group_name = escape_html(telegram_chat.title or str(route["group_chat_id"]))
+                group_name = escape_html(
+                    telegram_chat.title
+                    or getattr(telegram_chat, "first_name", None)
+                    or str(route["group_chat_id"])
+                )
+                is_private_target = getattr(telegram_chat, "type", None) == "private"
             except Exception:
                 group_name = escape_html(str(route["group_chat_id"]))
+                is_private_target = False
             keyboard = types.InlineKeyboardMarkup(row_width=1)
             keyboard.add(types.InlineKeyboardButton("❌ Не отвечать", callback_data="group_private_reply_cancel"))
+            reply_prompt = (
+                f"✉️ Напишите ответ администраторам по личному сообщению от MAX_Parser ({group_name}).\n\n"
+                if is_private_target
+                else f"✉️ Напишите ответ администраторам по группе «{group_name}».\n\n"
+            )
             bot.send_message(
                 message.chat.id,
-                f"✉️ Напишите ответ администраторам по группе «{group_name}».\n\n"
-                "Сообщение увидят администраторы <b>MAX_Parser</b>. Ответ можно отправить текстом или вложением.",
+                reply_prompt
+                + "Сообщение увидят администраторы <b>MAX_Parser</b>. Ответ можно отправить текстом или вложением.",
                 reply_markup=keyboard,
                 **NO_PREVIEW,
             )
@@ -5835,13 +5887,19 @@ def handle_admin_group_private_reply(message):
     body = body[:2400] + ("…" if len(body) > 2400 else "")
     try:
         group_chat = bot.get_chat(group_id)
-        group_title = escape_html(group_chat.title or str(group_id))
+        is_private_target = getattr(group_chat, "type", None) == "private"
+        group_title = escape_html(
+            group_chat.title
+            or getattr(group_chat, "first_name", None)
+            or str(group_id)
+        )
     except Exception:
         group_title = escape_html(str(group_id))
+        is_private_target = False
     card = (
-        "💬 <b>Ответ на сообщение в группе</b>\n"
+        f"💬 <b>{'Ответ на личное сообщение MAX_Parser' if is_private_target else 'Ответ на сообщение в группе'}</b>\n"
         f"📍 {group_title}\n"
-        f"🆔 ID группы: <code>{group_id}</code>\n"
+        f"🆔 {'ID чата' if is_private_target else 'ID группы'}: <code>{group_id}</code>\n"
         f"👤 {escape_html(sender_name)}\n"
         f"🔎 Никнейм: {username}\n"
         f"🆔 ID: <code>{user_id}</code>\n"
@@ -6383,10 +6441,6 @@ def _project_source_type_keyboard(chat_id):
     keyboard.add(types.InlineKeyboardButton(
         "👥 Группа или чат",
         callback_data=f"project_source_group_{chat_id}",
-    ))
-    keyboard.add(types.InlineKeyboardButton(
-        "👤 ЛС - личный чат",
-        callback_data=f"project_source_private_{chat_id}",
     ))
     keyboard.add(_setup_cancel_button(chat_id))
     return keyboard
@@ -9400,6 +9454,10 @@ def admin_group_thread_reply(message):
         return
     group_id = int(route["group_chat_id"])
     reply_to_id = int(route["group_message_id"])
+    try:
+        is_private_target = getattr(bot.get_chat(group_id), "type", None) == "private"
+    except Exception:
+        is_private_target = False
     header_html = "📩 <b>Ответ от команды MAX_Parser</b>\n\n"
     header_plain = "📩 Ответ от команды MAX_Parser\n\n"
     sent_message_ids = []
@@ -9456,7 +9514,8 @@ def admin_group_thread_reply(message):
             save_admin_group_thread_message(group_id, sent_id, int(message.from_user.id))
         bot.send_message(
             message.chat.id,
-            "✅ Ответ отправлен в группу.",
+            "✅ Ответ отправлен в личный чат."
+            if is_private_target else "✅ Ответ отправлен в группу.",
             reply_markup=admin_send_again_keyboard("group", group_id),
             **NO_PREVIEW,
         )
@@ -10601,11 +10660,22 @@ def admin_callbacks(call):
         ):
             bot.answer_callback_query(call.id, "Этот шаг настройки уже завершён", show_alert=True)
             return
-        if action.startswith(("project_source_channel_", "project_source_group_", "project_source_private_")):
+        if action.startswith("project_source_private_"):
+            bot.answer_callback_query(
+                call.id,
+                "Готовый аккаунт подключается к каналам и группам. Для личного чата выберите свой MAX-аккаунт.",
+                show_alert=True,
+            )
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id, call.message.message_id, reply_markup=None
+                )
+            except Exception:
+                pass
+            return
+        if action.startswith(("project_source_channel_", "project_source_group_")):
             if action.startswith("project_source_channel_"):
                 source_type = "channel"
-            elif action.startswith("project_source_private_"):
-                source_type = "private"
             else:
                 source_type = "group"
             update_chat_source_type(setup_chat_id, source_type, manual=True)
@@ -12329,7 +12399,7 @@ def callback_handler(call):
                     "в Telegram-группу, куда должны приходить сообщения. После появления бота отправьте в группе /bind. "
                     "Если бот уже добавлен, то просто напишите /bind. Боту нужно разрешить отправлять сообщения.\n\n"
                     "<b>Шаг 2 · Выберите чат MAX</b>\n"
-                    "Во втором способе нажмите «Канал», «ЛС - личный чат» или «Группа или чат». Затем откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
+                    "Во втором способе нажмите «Канал» или «Группа или чат». Затем откройте <a href=\"https://web.max.ru\">web.max.ru</a>, "
                     "перейдите к чату и скопируйте ссылку из меню.\n\n"
                     "<b>Вариант 1 · Ваш аккаунт MAX</b>\n"
                     "<blockquote><b>Через QR-код:</b>\n\nПосле отправки ссылки бот пришлёт QR-код. Отсканируйте его в приложении MAX и нажмите "

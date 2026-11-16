@@ -15,6 +15,7 @@ import queue
 import threading
 import traceback
 import tempfile
+import zipfile
 from datetime import datetime, timedelta
 from typing import List, Dict, Union
 from zoneinfo import ZoneInfo
@@ -3213,6 +3214,86 @@ def _is_html_page_payload(content_type: str, data: bytes) -> bool:
     return bool(re.match(rb"(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)", sample))
 
 
+def _invalid_document_payload_reason(content_type: str, filename: str, data: bytes) -> str:
+    """Reject login/error responses masquerading as downloadable MAX files."""
+    mime_type = (content_type or "").split(";", 1)[0].strip().lower()
+    suffix = os.path.splitext(str(filename or ""))[1].lower()
+    sample = bytes(data[:8192]).lstrip(b"\xef\xbb\xbf \t\r\n")
+
+    if _is_html_page_payload(mime_type, data):
+        return "html-response"
+
+    signature_by_suffix = {
+        ".pdf": (b"%PDF-",),
+        ".docx": (b"PK\x03\x04", b"PK\x05\x06"),
+        ".xlsx": (b"PK\x03\x04", b"PK\x05\x06"),
+        ".pptx": (b"PK\x03\x04", b"PK\x05\x06"),
+        ".odt": (b"PK\x03\x04", b"PK\x05\x06"),
+        ".ods": (b"PK\x03\x04", b"PK\x05\x06"),
+        ".odp": (b"PK\x03\x04", b"PK\x05\x06"),
+        ".zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+        ".rar": (b"Rar!\x1a\x07",),
+        ".doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+        ".xls": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+        ".ppt": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+    }
+    expected = signature_by_suffix.get(suffix)
+    if expected and not any(bytes(data).startswith(signature) for signature in expected):
+        return f"signature-mismatch:{suffix}"
+    if suffix == ".pdf" and b"%%EOF" not in bytes(data[-2048:]):
+        return "truncated-pdf"
+    if suffix in {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                archive.infolist()
+        except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+            return f"invalid-zip-container:{suffix}"
+
+    mime_signatures = (
+        ("application/pdf", (b"%PDF-",)),
+        ("application/x-pdf", (b"%PDF-",)),
+        ("application/zip", (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")),
+        ("application/vnd.openxmlformats-officedocument.", (b"PK\x03\x04", b"PK\x05\x06")),
+    )
+    for mime_prefix, signatures in mime_signatures:
+        if mime_type.startswith(mime_prefix) and not any(
+            bytes(data).startswith(signature) for signature in signatures
+        ):
+            return f"mime-signature-mismatch:{mime_prefix.rstrip('.')}"
+
+    if mime_type in {"application/json", "text/json"} or sample.startswith((b"{", b"[")):
+        try:
+            payload = json.loads(sample.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            error_keys = {"error", "errors", "exception", "detail"}
+            has_error_key = bool(error_keys.intersection(str(key).lower() for key in payload))
+            status = str(payload.get("status", "")).lower()
+            success = payload.get("success")
+            if has_error_key or status in {"error", "failed", "failure"} or success is False:
+                return "json-error-response"
+            if mime_type in {"application/json", "text/json"} and suffix != ".json":
+                return "unexpected-json-response"
+        elif mime_type in {"application/json", "text/json"} and suffix != ".json":
+            return "unexpected-json-response"
+
+    text_suffixes = {".txt", ".rtf", ".csv", ".json", ".xml"}
+    text = sample.decode("utf-8", errors="ignore").strip().lower()
+    error_text = re.search(
+        r"\b(?:unauthorized|forbidden|access denied|not found|file not found|download failed|invalid token|ошибка|не найдено|доступ запрещ[её]н)\b",
+        text,
+    )
+    if error_text and suffix not in text_suffixes:
+        if mime_type.startswith("text/"):
+            return "text-error-response"
+        printable = sum(char.isprintable() or char.isspace() for char in text)
+        if text and printable / len(text) > 0.9:
+            return "text-error-response"
+
+    return ""
+
+
 def _media_filename(filename: str, url: str, content_type: str, data: bytes, media_type: str) -> str:
     """Keep downloaded voice/video files recognizable to Telegram's media endpoints."""
     name = _normalize_document_filename(filename, url, content_type)
@@ -4320,6 +4401,17 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
             host = urlparse(url).hostname or "веб-страница"
             print(f"[{chat_id}] ℹ️ Пропускаю ссылку на веб-страницу вместо файла: {host}")
             return None
+        if media_type == "document":
+            invalid_reason = _invalid_document_payload_reason(
+                content_type, final_name, file_bytes
+            )
+            if invalid_reason:
+                debug_logger.warning(
+                    "MAX_DOCUMENT_PAYLOAD_REJECTED chat_id=%s filename=%s bytes=%s mime=%s reason=%s",
+                    chat_id, os.path.basename(final_name)[:120], len(file_bytes),
+                    (content_type or "<none>")[:100], invalid_reason,
+                )
+                return None
         if (
             media_type == "image" and _looks_like_image(file_bytes, content_type)
             and len(file_bytes) > MAX_TELEGRAM_PHOTO_BYTES
@@ -4360,6 +4452,22 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
             filename_hint,
             flags=re.I,
         ).strip()
+    attempted_download_urls = set()
+
+    def download_url_once(url, suggested_filename=""):
+        url = str(url or "").strip()
+        if not url or url in attempted_download_urls:
+            return None
+        attempted_download_urls.add(url)
+        return _download_document_to_memory(
+            page=page,
+            context=context,
+            url=url,
+            filename=filename_hint or suggested_filename or msg.get("download_click_filename", ""),
+            chat_id=chat_id,
+            media_type=media_type,
+        )
+
     try:
         click_id = (msg.get("download_click_id") or "").strip()
         specific_control_attempted = False
@@ -4389,14 +4497,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                         download_url = download.url
                         suggested = download.suggested_filename or filename_hint or "document.pdf"
                         if download_url:
-                            media = _download_document_to_memory(
-                                page=page,
-                                context=context,
-                                url=download_url,
-                                filename=filename_hint or suggested,
-                                chat_id=chat_id,
-                                media_type=media_type,
-                            )
+                            media = download_url_once(download_url, suggested)
                             if media and media.get("oversized"):
                                 return media
                             if media and media.get("bytes"):
@@ -4414,14 +4515,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                     )
                     for url in [attrs.get('href', ''), attrs.get('url', '')]:
                         if url:
-                            media = _download_document_to_memory(
-                                page=page,
-                                context=context,
-                                url=url,
-                                filename=filename_hint or msg.get('download_click_filename', ''),
-                                chat_id=chat_id,
-                                media_type=media_type,
-                            )
+                            media = download_url_once(url)
                             if media and media.get("oversized"):
                                 return media
                             if media and media.get("bytes"):
@@ -4468,14 +4562,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                     download_url = download.url
                     suggested = download.suggested_filename or filename_hint or "document.pdf"
                     if download_url:
-                        media = _download_document_to_memory(
-                            page=page,
-                            context=context,
-                            url=download_url,
-                            filename=filename_hint or suggested,
-                            chat_id=chat_id,
-                            media_type=media_type,
-                        )
+                        media = download_url_once(download_url, suggested)
                         if media and media.get("oversized"):
                             return media
                         if media and media.get("bytes"):
@@ -4505,13 +4592,8 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                 r"скачать|download|pdf|document|file|attachment", hint, re.I
             ):
                 continue
-            media = _download_document_to_memory(
-                page=page,
-                context=context,
-                url=url,
-                filename=filename_hint or item.get("download", "") or item.get("text", ""),
-                chat_id=chat_id,
-                media_type=media_type,
+            media = download_url_once(
+                url, item.get("download", "") or item.get("text", "")
             )
             if media and media.get("oversized"):
                 return media
@@ -4525,14 +4607,7 @@ def _download_document_from_message_card(page, context, msg: dict, chat_id: int 
                 download_url = download.url
                 suggested = download.suggested_filename or filename_hint or "document.pdf"
                 if download_url:
-                    return _download_document_to_memory(
-                        page=page,
-                        context=context,
-                        url=download_url,
-                        filename=filename_hint or suggested,
-                        chat_id=chat_id,
-                        media_type=media_type,
-                    )
+                    return download_url_once(download_url, suggested)
             except Exception as e:
                 print(f"[{chat_id}] ℹ️ Карточка файла не дала download event: {e}")
     except Exception as e:
