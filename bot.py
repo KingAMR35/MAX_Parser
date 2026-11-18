@@ -75,6 +75,8 @@ awaiting_admin_group_private_reply = {}
 support_sessions = set(get_open_support_sessions())
 _SESSION_EXPIRY_NOTICE_LOCK = threading.Lock()
 _SESSION_EXPIRY_NOTICE_SIGNATURES = {}
+_ADMIN_CHAT_ERROR_NOTICE_LOCK = threading.Lock()
+_ADMIN_CHAT_ERROR_NOTICE_KEYS = set()
 
 
 def _video_upload_details(media: dict, post: dict) -> dict:
@@ -1954,6 +1956,14 @@ def _process_posts(
         except Exception as error:
             failed_count += 1
             diagnostic_posts.append(_diagnostic_post(post, "failed", str(error)))
+            _notify_admin_chat_error(
+                get_chat_by_id(int(chat_id)) or {
+                    "chat_id": int(chat_id), "title": title,
+                    "destination_chat_id": destination_chat_id,
+                },
+                error,
+                stage="пересылка сообщения",
+            )
             debug_logger.exception(
                 "MESSAGE_PROCESS_FAILED chat_id=%s source_id=%s title=%s error=%s",
                 chat_id, source_id or "?", log_preview(title, 100), log_preview(error, 300)
@@ -2086,6 +2096,57 @@ def _clear_session_expiry_notice(chat):
             continue
         with _SESSION_EXPIRY_NOTICE_LOCK:
             _SESSION_EXPIRY_NOTICE_SIGNATURES.pop(key, None)
+
+
+def _clear_admin_chat_error_notice(chat_id):
+    try:
+        key = int(chat_id)
+    except (TypeError, ValueError):
+        key = 0
+    with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
+        _ADMIN_CHAT_ERROR_NOTICE_KEYS.discard(key)
+
+
+def _notify_admin_chat_error(chat, error, stage="обработка"):
+    """Send the primary admin one alert per chat until a clean parse succeeds."""
+    try:
+        chat_id = int((chat or {}).get("chat_id") or 0)
+    except (TypeError, ValueError, AttributeError):
+        chat_id = 0
+    with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
+        if chat_id in _ADMIN_CHAT_ERROR_NOTICE_KEYS:
+            return False
+        _ADMIN_CHAT_ERROR_NOTICE_KEYS.add(chat_id)
+
+    chat = chat if isinstance(chat, dict) else {}
+    title = escape_html(str(chat.get("title") or ("фоновый парсер" if not chat_id else "чат MAX")))
+    owner_id = chat.get("owner_id")
+    error_text = " ".join(str(error or "Неизвестная ошибка").split())
+    error_text = escape_html(error_text[:1200])
+    message = (
+        "⚠️ <b>Ошибка в MAX_Parser</b>\n\n"
+        f"<b>Чат:</b> {title}\n"
+        f"<b>ID чата:</b> <code>{chat_id or '—'}</code>\n"
+        f"<b>Этап:</b> {escape_html(str(stage))}\n"
+    )
+    if owner_id:
+        message += f"<b>Владелец:</b> <code>{escape_html(str(owner_id))}</code>\n"
+    message += f"<b>Ошибка:</b> <code>{error_text}</code>"
+    try:
+        bot.send_message(ADMIN_ID, message, parse_mode="HTML", **NO_PREVIEW)
+        debug_logger.error(
+            "ADMIN_CHAT_ERROR_NOTIFIED chat_id=%s stage=%s error_type=%s",
+            chat_id, log_preview(stage, 80), type(error).__name__,
+        )
+        return True
+    except Exception as send_error:
+        with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
+            _ADMIN_CHAT_ERROR_NOTICE_KEYS.discard(chat_id)
+        debug_logger.error(
+            "ADMIN_CHAT_ERROR_NOTICE_FAILED chat_id=%s error_type=%s",
+            chat_id, type(send_error).__name__,
+        )
+        return False
 
 
 def _notify_session_expired(chat, error=None):
@@ -2434,6 +2495,7 @@ def run_one_parse_cycle():
                     f"ℹ️ <b>{title}</b>: новых сообщений нет (⏭ {skipped_count} пропущено)"
                 )
         except Exception as error:
+            _notify_admin_chat_error(chat, error, stage="проверка парсинга")
             _store_parse_diagnostic(
                 chat_id, title, parse_counts["new"], parse_counts["skipped"],
                 sum(item.get("status") == "failed" for item in parse_diagnostics),
@@ -2531,6 +2593,8 @@ def process_single_chat(chat):
                 sum(item.get("status") == "failed" for item in parse_diagnostics),
                 parse_diagnostics,
             )
+        if not any(item.get("status") == "failed" for item in parse_diagnostics):
+            _clear_admin_chat_error_notice(chat_id)
         return True
     except Exception as error:
         _store_parse_diagnostic(
@@ -2539,6 +2603,7 @@ def process_single_chat(chat):
             parse_diagnostics, error=error,
         )
         print(f"❌ Ошибка парсинга чата {title}: {error}")
+        _notify_admin_chat_error(chat, error, stage="парсинг")
         _record_max_source_access_failure(chat, error)
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             _notify_session_expired(chat, error)
@@ -2558,11 +2623,17 @@ def background_parser():
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(len(active_chats), MAX_CONCURRENT_CHAT_PARSERS)
             ) as executor:
-                futures = [
-                    executor.submit(process_single_chat, chat)
+                future_chats = {
+                    executor.submit(process_single_chat, chat): chat
                     for chat in active_chats
-                ]
-                concurrent.futures.wait(futures)
+                }
+                concurrent.futures.wait(future_chats)
+                for future, chat in future_chats.items():
+                    try:
+                        future.result()
+                    except Exception as error:
+                        _notify_admin_chat_error(chat, error, stage="фоновый разбор")
+            _clear_admin_chat_error_notice(0)
             elapsed = time.monotonic() - cycle_started
             wait_seconds = max(0, PARSER_CYCLE_INTERVAL_SECONDS - elapsed)
             print(
@@ -2573,6 +2644,7 @@ def background_parser():
                 time.sleep(wait_seconds)
         except Exception as error:
             print(f"❌ Критическая ошибка парсера: {error}")
+            _notify_admin_chat_error(None, error, stage="фоновый парсер")
             time.sleep(max(1, PARSER_CYCLE_INTERVAL_SECONDS - (time.monotonic() - cycle_started)))
 
 
@@ -4698,6 +4770,7 @@ def start_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(types.InlineKeyboardButton("✔ Подключить MAX_Parser", callback_data="parse_setup"))
     keyboard.add(types.InlineKeyboardButton("🔎 О парсинге", callback_data="about_bot"))
+    keyboard.add(types.InlineKeyboardButton("🔐 Доверять MAX_Parser?", callback_data="trust_info"))
     keyboard.add(types.InlineKeyboardButton("💬 Тех поддержка", callback_data="support_start"))
     keyboard.add(types.InlineKeyboardButton("🎁 Пригласить друга", callback_data="referral_program"))
     keyboard.add(types.InlineKeyboardButton("👑 Благодарности", callback_data="thanks_project"))
@@ -4783,16 +4856,16 @@ def return_start():
     keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="start_comeback"))
     return keyboard
 
-def parser_keyboard():
+def parser_keyboard(user_id=None):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
-        _subscription_product_button_label("self"), callback_data="connect_self"
+        _subscription_product_button_label("self", user_id=user_id), callback_data="connect_self"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        _subscription_product_button_label("project"), callback_data="connect_project"
+        _subscription_product_button_label("project", user_id=user_id), callback_data="connect_project"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        _subscription_product_button_label("multi"), callback_data="connect_multi"
+        _subscription_product_button_label("multi", user_id=user_id), callback_data="connect_multi"
     ))
     keyboard.add(types.InlineKeyboardButton("ℹ️ Разница способов", callback_data="compare_modes"))
     keyboard.add(types.InlineKeyboardButton("❔ Не знаю, что выбрать", callback_data="method_choice_help"))
@@ -4842,7 +4915,34 @@ def _strikethrough_button_text(text):
     )
 
 
-def _subscription_product_button_label(plan_code):
+def _subscription_product_price_hidden(user_id, plan_code, always_show_price=False):
+    if user_id is None or always_show_price:
+        return False
+    try:
+        user_id = int(user_id)
+        if user_id == int(ADMIN_ID):
+            return False
+        if has_active_multi_subscription(user_id):
+            return True
+        return (
+            plan_code in {"self", "project"}
+            and is_subscription_active(user_id, plan_code)
+        )
+    except Exception as error:
+        debug_logger.warning(
+            "SUBSCRIPTION_BUTTON_ACCESS_LOOKUP_FAILED user_id=%s plan=%s error_type=%s",
+            user_id, plan_code, type(error).__name__,
+        )
+        return False
+
+
+def _subscription_product_button_label(plan_code, user_id=None, always_show_price=False):
+    if _subscription_product_price_hidden(user_id, plan_code, always_show_price):
+        return {
+            "self": "1️⃣ Свой аккаунт",
+            "project": "2️⃣ Готовый аккаунт",
+            "multi": "✨ Мульти-подписка",
+        }[plan_code]
     regular_price = SUBSCRIPTION_PRICES[plan_code][1] * 100
     discounted_price = _discounted_price_kopecks(plan_code, 1)
     return (
@@ -4864,16 +4964,24 @@ def _subscription_discount_text_html(plan_code):
     return " · ".join(prices)
 
 
-def subscription_products_keyboard(prefix="subscription_product"):
+def subscription_products_keyboard(
+    prefix="subscription_product", user_id=None, always_show_prices=False
+):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(
-        _subscription_product_button_label("self"), callback_data=f"{prefix}_self"
+        _subscription_product_button_label(
+            "self", user_id=user_id, always_show_price=always_show_prices
+        ), callback_data=f"{prefix}_self"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        _subscription_product_button_label("project"), callback_data=f"{prefix}_project"
+        _subscription_product_button_label(
+            "project", user_id=user_id, always_show_price=always_show_prices
+        ), callback_data=f"{prefix}_project"
     ))
     keyboard.add(types.InlineKeyboardButton(
-        _subscription_product_button_label("multi"), callback_data=f"{prefix}_multi"
+        _subscription_product_button_label(
+            "multi", user_id=user_id, always_show_price=always_show_prices
+        ), callback_data=f"{prefix}_multi"
     ))
     return keyboard
 
@@ -4893,8 +5001,12 @@ def subscription_period_keyboard(plan_code, back_callback="subscription_products
     return keyboard
 
 
-def subscription_renewal_keyboard():
-    return subscription_products_keyboard("subscription_product")
+def subscription_renewal_keyboard(
+    user_id=None, always_show_prices=False, prefix="subscription_product"
+):
+    return subscription_products_keyboard(
+        prefix, user_id=user_id, always_show_prices=always_show_prices
+    )
 
 
 def _product_marketing_text(plan_code):
@@ -5024,7 +5136,9 @@ def _start_customer_setup_prompt(user_id, account_mode, chat_id, message_id=None
         bot.send_message(
             chat_id,
             "Для этого способа подключения нужна активная подписка. Выберите тариф:",
-            reply_markup=subscription_products_keyboard("subscription_product"),
+            reply_markup=subscription_products_keyboard(
+                "subscription_product", user_id=user_id
+            ),
             **NO_PREVIEW,
         )
         return
@@ -5974,7 +6088,7 @@ def subscription_status_command(message):
             "💳 <b>Ваша подписка MAX_Parser активна</b>\n\n"
             f"Доступны: <b>{escape_html(methods_label)}</b>\n"
             f"Действует до: <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
-            "Продлите её заранее: новый срок добавится к действующему."
+            "После окончания срока вы сможете оплатить новый период командой /subscription."
         )
     else:
         text = (
@@ -5985,7 +6099,11 @@ def subscription_status_command(message):
         message.chat.id,
         text,
         parse_mode="HTML",
-        reply_markup=subscription_renewal_keyboard(),
+        reply_markup=subscription_renewal_keyboard(
+            user_id=message.from_user.id,
+            always_show_prices=True,
+            prefix="subscription_product_full",
+        ),
         **NO_PREVIEW,
     )
 
@@ -6135,9 +6253,8 @@ def subscription_reminder_loop():
                         user_id,
                         "⏰ <b>Скоро закончится подписка MAX_Parser</b>\n\n"
                         f"Доступ действует до <b>{active_until:%d.%m.%Y %H:%M} UTC</b>.\n"
-                        "Автоматического списания нет. Если хотите продолжить пользоваться парсером, продлите подписку заранее.",
+                        "После окончания срока вы сможете оформить новый период командой /subscription.",
                         parse_mode="HTML",
-                        reply_markup=subscription_renewal_keyboard(),
                         **NO_PREVIEW,
                     )
                     mark_subscription_reminder_sent(user_id, subscription["plan_code"])
@@ -6160,7 +6277,7 @@ def connect_command(message):
     bot.send_message(
         message.chat.id,
         "Выберите способ подключения.",
-        reply_markup=parser_keyboard(),
+        reply_markup=parser_keyboard(user_id=message.from_user.id),
         **NO_PREVIEW,
     )
 
@@ -6851,6 +6968,7 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
                 ),
             )
         result_text = "✅ Сообщение отправлено в MAX."
+        _clear_admin_chat_error_notice(int(source_chat_id))
         result_keyboard = types.InlineKeyboardMarkup(row_width=1)
         result_keyboard.add(types.InlineKeyboardButton(
             "✍️ Написать в MAX", callback_data=f"admin_max_source_{int(source_chat_id)}"
@@ -6858,6 +6976,11 @@ def _send_admin_max_message(admin_id, source_chat_id, nonce, preview_message_id)
         debug_logger.info("ADMIN_MAX_MESSAGE_SENT admin_id=%s source_chat_id=%s", admin_id, source_chat_id)
     except Exception as error:
         _print_max_send_failure("ADMIN_MAX_MESSAGE_SEND_FAILED", source_chat_id, error)
+        _notify_admin_chat_error(
+            get_chat_by_id(int(source_chat_id)) or {"chat_id": int(source_chat_id)},
+            error,
+            stage="отправка сообщения из админ-панели в MAX",
+        )
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             _notify_session_expired(get_chat_by_id(int(source_chat_id)), error)
         debug_logger.warning(
@@ -7918,11 +8041,18 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
             )
         result_text = "✅ Сообщение отправлено в MAX."
+        _clear_admin_chat_error_notice(source_chat_id)
         result_keyboard = _public_max_send_button_keyboard(
             source_chat_id, private_user_id=int(flow.get("user_id") or flow_key[1])
         )
     except Exception as error:
-        _print_max_send_failure("PUBLIC_MAX_SEND_FAILED", int(flow.get("source_chat_id") or flow_key[0]), error)
+        failed_source_chat_id = int(flow.get("source_chat_id") or flow_key[0])
+        _print_max_send_failure("PUBLIC_MAX_SEND_FAILED", failed_source_chat_id, error)
+        _notify_admin_chat_error(
+            get_chat_by_id(failed_source_chat_id) or {"chat_id": failed_source_chat_id},
+            error,
+            stage="отправка сообщения пользователя в MAX",
+        )
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             _notify_session_expired(
                 get_chat_by_id(int(flow.get("source_chat_id") or flow_key[0])), error
@@ -8583,6 +8713,7 @@ def _verify_self_chat_access_impl(
 
         _clear_session_expiry_notice(activated)
         _clear_max_source_access_failures(chat_id)
+        _clear_admin_chat_error_notice(chat_id)
         _sync_max_send_button(chat_id)
         status = "✅ Доступ к MAX подтверждён. Пересылка включена."
         report(status)
@@ -8613,6 +8744,7 @@ def _verify_self_chat_access_impl(
             _sync_max_send_button(chat_id)
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             _notify_session_expired(latest or chat, error)
+        _notify_admin_chat_error(latest or chat, error, stage="проверка доступа к чату")
         debug_logger.warning(
             "SELF_CHAT_ACCESS_CHECK_FAILED chat_id=%s owner_id=%s error_type=%s error=%s",
             chat_id, owner_id, type(error).__name__, log_preview(error, 240),
@@ -8837,6 +8969,7 @@ def _verify_project_chat_access_impl(
         status_reported = report("✅ Доступ к MAX подтверждён. Пересылка включена.")
         clear_project_access_buttons()
         refresh_chat_list()
+        _clear_admin_chat_error_notice(chat_id)
         review_offered = False
         if owner_id > 0:
             try:
@@ -8866,6 +8999,7 @@ def _verify_project_chat_access_impl(
                 )
         return True
     except Exception as error:
+        _notify_admin_chat_error(chat or {"chat_id": chat_id}, error, stage="проверка доступа к чату")
         if "SESSION_EXPIRED" in str(error) or "NO_SESSION" in str(error):
             _notify_session_expired(chat, error)
         debug_logger.warning(
@@ -8966,7 +9100,7 @@ def _begin_customer_group_setup(chat_id, owner_id, account_mode):
         bot.send_message(
             owner_id,
             "Для подключения группы сначала оформите подписку командой /subscription.",
-            reply_markup=subscription_renewal_keyboard(),
+            reply_markup=subscription_renewal_keyboard(user_id=owner_id),
             **NO_PREVIEW,
         )
         return False
@@ -9029,7 +9163,7 @@ def _begin_customer_private_setup(owner_id, account_mode, callback_message=None)
         bot.send_message(
             owner_id,
             "Для подключения сначала оформите подписку командой /subscription.",
-            reply_markup=subscription_renewal_keyboard(),
+            reply_markup=subscription_renewal_keyboard(user_id=owner_id),
             **NO_PREVIEW,
         )
         return False
@@ -9175,7 +9309,7 @@ def project_admin_source_url(message):
         bot.send_message(
             owner_id,
             "Срок подписки истёк до завершения настройки. Продлите её командой /subscription, затем повторите подключение.",
-            reply_markup=subscription_renewal_keyboard(),
+            reply_markup=subscription_renewal_keyboard(user_id=owner_id),
             **NO_PREVIEW,
         )
         return
@@ -9254,7 +9388,7 @@ def customer_source_url(message):
         bot.send_message(
             message.chat.id,
             "Срок подписки истёк до завершения настройки. Продлите её командой /subscription, затем повторите подключение.",
-            reply_markup=subscription_renewal_keyboard(),
+            reply_markup=subscription_renewal_keyboard(user_id=message.from_user.id),
             **NO_PREVIEW,
         )
         return
@@ -12089,6 +12223,27 @@ def callback_handler(call):
 В обоих случаях бот пересылает сообщения только из чатов, к которым у выбранного аккаунта есть доступ.</blockquote>
 
 ''', reply_markup=return_start(), parse_mode='HTML', **NO_PREVIEW)
+        elif call.data == "trust_info":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    "🔐 <b>Почему можно доверять MAX_Parser</b>\n\n"
+                    "MAX_Parser нужен, чтобы пересылать сообщения из выбранных вами чатов MAX в Telegram. "
+                    "Он не меняет пароль и настройки вашего аккаунта.\n\n"
+                    "<blockquote><b>Если подключаете свой аккаунт</b>\n"
+                    "Вы сами проходите вход в MAX в отдельном окне браузера. Не отправляйте пароль или код в переписку с ботом. "
+                    "Для работы парсера сервер сохраняет сессию входа и использует её для выбранных вами источников.</blockquote>\n\n"
+                    "<blockquote><b>Если выбираете готовый аккаунт</b>\n"
+                    "Ваши данные для входа не нужны. Пересылка возможна только из чатов, которые доступны этому аккаунту.</blockquote>\n\n"
+                    "Бот не начинает переписку от вашего имени сам. Отправить сообщение в MAX можно только по вашему действию. "
+                    "Если сомневаетесь, используйте готовый аккаунт и не подключайте личные переписки."
+                ),
+                reply_markup=return_start(),
+                parse_mode="HTML",
+                **NO_PREVIEW,
+            )
         elif call.data == "start_comeback":
             text = (
                 "👋 <b>Привет!</b>\n\n"
@@ -12122,31 +12277,43 @@ def callback_handler(call):
                     "<blockquote><b>✨ Мульти-подписка\n</b>Мульти-подписка открывает оба способа: свой MAX-аккаунт и готовый аккаунт MAX.</blockquote>\n\n"
                     "<i>Пошаговый порядок подключения — в инструкции ниже.</i>"
                 ),
-                reply_markup=parser_keyboard(),
+                reply_markup=parser_keyboard(user_id=call.from_user.id),
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
         elif call.data == "compare_modes":
             _record_referral_engagement(call.from_user.id, "comparison")
             bot.answer_callback_query(call.id)
+            self_price = (
+                "" if _subscription_product_price_hidden(call.from_user.id, "self")
+                else f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('self')}.\n"
+            )
+            project_price = (
+                "" if _subscription_product_price_hidden(call.from_user.id, "project")
+                else f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('project')}.\n"
+            )
+            multi_price = (
+                "" if _subscription_product_price_hidden(call.from_user.id, "multi")
+                else f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('multi')}. "
+            )
             bot.edit_message_text(
                 "<b>Чем отличаются способы подключения</b>\n\n"
                 "<blockquote><b>1️⃣ Свой MAX-аккаунт</b>\n"
-                f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('self')}.\n"
+                f"{self_price}"
                 "Вы входите в свой MAX. Парсер читает выбранные вами чаты, которые доступны вашему аккаунту.\n"
                 "Подходит, если не хотите добавлять готовый аккаунт в чат.</blockquote>\n\n"
                 "<blockquote><b>2️⃣ Через готовый аккаунт</b>\n"
-                f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('project')}.\n"
+                f"{project_price}"
                 f"Используется готовый аккаунт <code>{escape_html(MAX_PROJECT_ACCOUNT_PHONE)}</code>. "
                 "Для группы его нужно добавить или пригласить, для канала — просто скинуть ссылку.\n"
                 "Вы не вводите данные своего MAX.</blockquote>\n\n"
                 "<blockquote><b>✨ Мульти-подписка</b>\n"
-                f"Скидка {SUBSCRIPTION_DISCOUNT_PERCENT}%: {_subscription_discount_text_html('multi')}. "
+                f"{multi_price}"
                 "Включает оба способа, "
                 "чтобы выбирать удобный вариант для каждого чата.</blockquote>",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                reply_markup=parser_keyboard(),
+                reply_markup=parser_keyboard(user_id=call.from_user.id),
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
@@ -12175,7 +12342,8 @@ def callback_handler(call):
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
-        elif call.data == "subscription_products":
+        elif call.data in {"subscription_products", "subscription_products_full"}:
+            show_all_prices = call.data == "subscription_products_full"
             bot.answer_callback_query(call.id)
             bot.edit_message_text(
                 "💳 <b>Выберите тариф</b>\n\n"
@@ -12183,7 +12351,11 @@ def callback_handler(call):
                 "Мульти-подписка открывает оба способа подключения.",
                 call.message.chat.id,
                 call.message.message_id,
-                reply_markup=subscription_products_keyboard(),
+                reply_markup=subscription_products_keyboard(
+                    user_id=call.from_user.id,
+                    always_show_prices=show_all_prices,
+                    prefix=("subscription_product_full" if show_all_prices else "subscription_product"),
+                ),
                 parse_mode="HTML",
                 **NO_PREVIEW,
             )
@@ -12197,7 +12369,11 @@ def callback_handler(call):
                 call.message.chat.id,
                 call.message.message_id,
                 plan_code,
-                back_callback="subscription_products",
+                back_callback=(
+                    "subscription_products_full"
+                    if call.data.startswith("subscription_product_full_")
+                    else "subscription_products"
+                ),
             )
         elif call.data.startswith("subscription_buy_"):
             parts = call.data.split("_")

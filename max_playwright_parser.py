@@ -2455,6 +2455,19 @@ def _get_post_content_signature(post: dict) -> str:
     )
     return _get_post_text_signature(post) + "|" + "|".join(media_keys)
 
+
+def _get_authorless_post_signature(post: dict) -> str:
+    """Content identity used when MAX intermittently omits a message author."""
+    anonymous_post = dict(post or {})
+    anonymous_post["name"] = ""
+    return "authorless:" + _get_post_content_signature(anonymous_post)
+
+
+def _get_authorless_text_signature(post: dict) -> str:
+    anonymous_post = dict(post or {})
+    anonymous_post["name"] = ""
+    return "authorless-text:" + _get_post_text_signature(anonymous_post)
+
 def get_message_hash(post: dict) -> str:
     """Primary duplicate key: message content, never data-index/date-of-today."""
     name = normalize_for_hash(post.get("name", ""))
@@ -2687,6 +2700,17 @@ def is_new_message(post: dict, chat_id: int = 0) -> bool:
     known_signatures = message_signatures_by_chat.get(chat_id, set())
     if signature and signature in known_signatures:
         return False
+    if not normalize_for_hash(post.get("name", "")):
+        authorless_signature = _get_authorless_post_signature(post)
+        authorless_text_signature = _get_authorless_text_signature(post)
+        if (
+            authorless_signature in known_signatures
+            or (
+                _has_media_independent_content(post)
+                and authorless_text_signature in known_signatures
+            )
+        ):
+            return False
     text_signature = _get_post_text_signature(post)
     if _has_media_independent_content(post) and text_signature and text_signature in known_signatures:
         mark_message_seen(post, chat_id=chat_id)
@@ -2799,6 +2823,9 @@ def mark_message_seen(post: dict, chat_id: int = 0) -> None:
         signature = _get_post_content_signature(post)
         if signature:
             message_signatures_by_chat[chat_id].add(signature)
+        message_signatures_by_chat[chat_id].add(_get_authorless_post_signature(post))
+        if _has_media_independent_content(post):
+            message_signatures_by_chat[chat_id].add(_get_authorless_text_signature(post))
         text_signature = _get_post_text_signature(post)
         if _has_media_independent_content(post) and text_signature:
             message_signatures_by_chat[chat_id].add(text_signature)
@@ -6588,6 +6615,57 @@ def parse_max_group_media(
                                     ? `Карта: ${href}` : href;
                                 el.replaceWith(keptLink);
                             });
+                        } catch(e) {}
+                        // Some MAX builds render a webpage card without preview
+                        // classes or test ids. Detect that card from its domain,
+                        // rich title/description text and thumbnail while keeping
+                        // the URL that the author actually posted.
+                        try {
+                            for (const anchor of [...clone.querySelectorAll('a[href]')]) {
+                                if (!clone.contains(anchor)) continue;
+                                const href = safeAttr(anchor, 'href');
+                                if (!/^https?:/i.test(href)) continue;
+                                let host = '';
+                                try { host = new URL(href, location.href).hostname.replace(/^www\./i, '').toLowerCase(); }
+                                catch(e) { continue; }
+                                if (!host) continue;
+                                let card = null;
+                                let cardTextLength = Infinity;
+                                // Scan sibling subtrees too: MAX often puts the
+                                // author's plain URL and its preview in separate
+                                // nodes under the same message bubble.
+                                for (const node of [...clone.querySelectorAll('*')]) {
+                                    const text = String(node.innerText || node.textContent || '')
+                                        .replace(/\s+/g, ' ').trim();
+                                    const lowered = text.toLowerCase();
+                                    const hasDomain = lowered.includes(host);
+                                    const includesTypedUrl = lowered.includes(href.toLowerCase());
+                                    const hasThumbnail = !!node.querySelector(
+                                        'img,picture,video,canvas,[style*="background-image" i]'
+                                    );
+                                    const hasRichCardText = text.length >= 80;
+                                    if (
+                                        hasDomain && !includesTypedUrl &&
+                                        (hasThumbnail || hasRichCardText) &&
+                                        text.length < cardTextLength
+                                    ) {
+                                        card = node;
+                                        cardTextLength = text.length;
+                                    }
+                                }
+                                if (!card) continue;
+                                const sameUrlOutsideCard = [...clone.querySelectorAll('a[href]')].some(existing =>
+                                    !card.contains(existing) && safeAttr(existing, 'href') === href
+                                );
+                                if (sameUrlOutsideCard) {
+                                    card.remove();
+                                } else {
+                                    const keptLink = document.createElement('a');
+                                    keptLink.setAttribute('href', href);
+                                    keptLink.textContent = href;
+                                    card.replaceWith(keptLink);
+                                }
+                            }
                         } catch(e) {}
                         // MAX's map card may not have a semantic preview class;
                         // retain its direct URL while dropping the card's title,

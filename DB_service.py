@@ -1905,6 +1905,19 @@ def is_subscription_active(user_id: int, account_mode: str = None) -> bool:
         return row is not None
 
 
+def has_active_multi_subscription(user_id: int) -> bool:
+    """Return whether the user currently owns an active multi subscription."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT 1 AS active
+            FROM telegram_subscription_entitlements
+            WHERE user_id = %s AND plan_code = 'multi'
+              AND active_until > CURRENT_TIMESTAMP
+            LIMIT 1
+        """, (int(user_id),)).fetchone()
+        return row is not None
+
+
 def get_customer_chat_limit(user_id: int) -> int:
     with get_connection() as conn:
         row = conn.execute("""
