@@ -263,14 +263,65 @@ _BASE_BOT_COMMANDS = [
 ]
 _SEND_TO_MAX_BOT_COMMAND = types.BotCommand("send_to_max", "Отправить сообщение в MAX")
 BOT_SHORT_DESCRIPTION = (
-    "Пересылает сообщения из MAX в Telegram. Отправляйте текст и вложения обратно командой /send_to_max."
+    "Сообщения и вложения из MAX — в Telegram. Отправляйте сообщения обратно командой /send_to_max."
 )
 BOT_PROFILE_DESCRIPTION = (
-    "MAX_Parser пересылает новые сообщения из MAX в Telegram: текст, фото, видео, документы и другие вложения. "
-    "Подключайте доступные группы, каналы и личные чаты, выбирайте получение в Telegram-группу или личные сообщения. "
-    "Из подключённой Telegram-группы можно отправлять текст и вложения обратно в MAX командой /send_to_max, "
-    "если источник не является каналом. Пошаговая инструкция и поддержка — в боте."
+    "Не теряйте важные сообщения в потоке MAX. Подключите доступную группу, канал или личный чат и получайте новые сообщения и вложения в Telegram — в выбранной группе или личных сообщениях.\n\n"
+    "Из подключённой Telegram-группы можно отправлять сообщения обратно в MAX командой /send_to_max, если источник поддерживает отправку. Пошаговая настройка и поддержка — в боте."
 )
+START_WELCOME_IMAGE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "media", "start_welcome.jpg"
+)
+WELCOME_TEXT = (
+    "👋 <b>Привет!</b>\n\n"
+    "Меня зовут <b>MAX_Parser</b>.\n\n"
+    "Я помогаю автоматически пересылать сообщения из выбранной группы "
+    "<b>мессенджера MAX в Telegram</b> , а также <b>из Telegram в MAX</b>.\n\n"
+    "📌 <b>Для чего я нужен</b>\n"
+    "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
+    "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
+    "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
+    "⚡ <b>Почему это удобно</b>\n"
+    "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
+    "• Не нужно постоянно включать и выключать VPN.\n"
+    "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
+)
+START_HOME_TEXT = (
+    "👋 <b>Привет!</b>\n\n"
+    "Меня зовут <b>MAX_Parser</b>.\n\n"
+    "Я помогаю автоматически пересылать сообщения из выбранной группы "
+    "мессенджера MAX в Telegram.\n\n"
+    "📌 <b>Для чего я нужен</b>\n"
+    "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
+    "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
+    "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
+    "⚡ <b>Почему это удобно</b>\n"
+    "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
+    "• Не нужно постоянно включать и выключать VPN.\n"
+    "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
+    "🔒 <b>Важно</b>\n"
+    "Бот работает только с теми группами, доступ к которым тебе разрешён."
+)
+
+
+def _send_start_welcome(message, reply_markup=None):
+    """Send a separate welcome photo, then the unchanged /start text and keyboard."""
+    if message.chat.type == "private" and os.path.isfile(START_WELCOME_IMAGE_PATH):
+        try:
+            with open(START_WELCOME_IMAGE_PATH, "rb") as welcome_image:
+                bot.send_photo(message.chat.id, welcome_image)
+        except Exception as error:
+            debug_logger.warning(
+                "WELCOME_PHOTO_SEND_FAILED chat_id=%s error_type=%s",
+                message.chat.id, type(error).__name__,
+            )
+    return bot.send_message(
+        message.chat.id,
+        WELCOME_TEXT,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+        **NO_PREVIEW,
+    )
 
 
 def _sync_bot_profile_descriptions():
@@ -2104,25 +2155,48 @@ def _clear_admin_chat_error_notice(chat_id):
     except (TypeError, ValueError):
         key = 0
     with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
-        _ADMIN_CHAT_ERROR_NOTICE_KEYS.discard(key)
+        _ADMIN_CHAT_ERROR_NOTICE_KEYS.difference_update(
+            [
+                notice_key
+                for notice_key in _ADMIN_CHAT_ERROR_NOTICE_KEYS
+                if notice_key[0] == key
+            ]
+        )
 
 
 def _notify_admin_chat_error(chat, error, stage="обработка"):
-    """Send the primary admin one alert per chat until a clean parse succeeds."""
+    """Notify the primary admin once per distinct error until it is cleared or acknowledged."""
     try:
         chat_id = int((chat or {}).get("chat_id") or 0)
     except (TypeError, ValueError, AttributeError):
         chat_id = 0
-    with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
-        if chat_id in _ADMIN_CHAT_ERROR_NOTICE_KEYS:
-            return False
-        _ADMIN_CHAT_ERROR_NOTICE_KEYS.add(chat_id)
-
     chat = chat if isinstance(chat, dict) else {}
+    raw_error_text = " ".join(str(error or "Неизвестная ошибка").split())
+    normalized_error = re.sub(
+        r"\btimeout\s+\d+\s*ms\b", "timeout <ms>", raw_error_text, flags=re.I
+    )
+    error_token = hashlib.sha256(
+        f"{type(error).__name__}|{normalized_error}".encode("utf-8", "replace")
+    ).hexdigest()[:24]
+    try:
+        # Acknowledgement mutes the same diagnostic across chats, so a shared
+        # MAX Web outage does not keep generating one alert per connected chat.
+        if is_admin_error_acknowledged(0, error_token):
+            return False
+    except Exception as lookup_error:
+        debug_logger.warning(
+            "ADMIN_CHAT_ERROR_ACK_LOOKUP_FAILED chat_id=%s error_type=%s",
+            chat_id, type(lookup_error).__name__,
+        )
+    notice_key = (chat_id, error_token)
+    with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
+        if notice_key in _ADMIN_CHAT_ERROR_NOTICE_KEYS:
+            return False
+        _ADMIN_CHAT_ERROR_NOTICE_KEYS.add(notice_key)
+
     title = escape_html(str(chat.get("title") or ("фоновый парсер" if not chat_id else "чат MAX")))
     owner_id = chat.get("owner_id")
-    error_text = " ".join(str(error or "Неизвестная ошибка").split())
-    error_text = escape_html(error_text[:1200])
+    error_text = escape_html(raw_error_text[:1200])
     message = (
         "⚠️ <b>Ошибка в MAX_Parser</b>\n\n"
         f"<b>Чат:</b> {title}\n"
@@ -2132,8 +2206,14 @@ def _notify_admin_chat_error(chat, error, stage="обработка"):
     if owner_id:
         message += f"<b>Владелец:</b> <code>{escape_html(str(owner_id))}</code>\n"
     message += f"<b>Ошибка:</b> <code>{error_text}</code>"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "👀 Просмотрел", callback_data=f"error_ack:{chat_id}:{error_token}"
+    ))
     try:
-        bot.send_message(ADMIN_ID, message, parse_mode="HTML", **NO_PREVIEW)
+        bot.send_message(
+            ADMIN_ID, message, parse_mode="HTML", reply_markup=keyboard, **NO_PREVIEW
+        )
         debug_logger.error(
             "ADMIN_CHAT_ERROR_NOTIFIED chat_id=%s stage=%s error_type=%s",
             chat_id, log_preview(stage, 80), type(error).__name__,
@@ -2141,7 +2221,7 @@ def _notify_admin_chat_error(chat, error, stage="обработка"):
         return True
     except Exception as send_error:
         with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
-            _ADMIN_CHAT_ERROR_NOTICE_KEYS.discard(chat_id)
+            _ADMIN_CHAT_ERROR_NOTICE_KEYS.discard(notice_key)
         debug_logger.error(
             "ADMIN_CHAT_ERROR_NOTICE_FAILED chat_id=%s error_type=%s",
             chat_id, type(send_error).__name__,
@@ -5947,23 +6027,7 @@ def start_bot(message):
                 **NO_PREVIEW,
             )
             return
-    text = (
-        "👋 <b>Привет!</b>\n\n"
-        "Меня зовут <b>MAX_Parser</b>.\n\n"
-        "Я помогаю автоматически пересылать сообщения из выбранной группы "
-        "<b>мессенджера MAX в Telegram</b> , а также <b>из Telegram в MAX</b>.\n\n"
-        "📌 <b>Для чего я нужен</b>\n"
-        "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
-        "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
-        "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
-        "⚡ <b>Почему это удобно</b>\n"
-        "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
-        "• Не нужно постоянно включать и выключать VPN.\n"
-        "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
-
-    )
-
-    bot.send_message(message.chat.id, text, **NO_PREVIEW, reply_markup=start_keyboard())
+    _send_start_welcome(message, reply_markup=start_keyboard())
 
 
 @bot.message_handler(
@@ -12133,7 +12197,38 @@ def my_chat_delete_callbacks(call):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     if call.message:
-        if call.data == "group_private_reply_cancel":
+        if call.data.startswith("error_ack:"):
+            if int(call.from_user.id) != ADMIN_ID and not is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "Эта кнопка доступна администратору.", show_alert=True)
+                return
+            try:
+                _, chat_id_text, error_token = call.data.split(":", 2)
+                chat_id = int(chat_id_text)
+                if not re.fullmatch(r"[0-9a-f]{24}", error_token):
+                    raise ValueError("invalid error token")
+                acknowledge_admin_error(0, error_token, call.from_user.id)
+            except Exception as error:
+                debug_logger.warning(
+                    "ADMIN_CHAT_ERROR_ACK_FAILED admin_id=%s error_type=%s",
+                    call.from_user.id, type(error).__name__,
+                )
+                bot.answer_callback_query(
+                    call.id, "Не удалось отметить ошибку. Попробуйте ещё раз.", show_alert=True
+                )
+                return
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id, call.message.message_id, reply_markup=None
+                )
+            except Exception as error:
+                debug_logger.warning(
+                    "ADMIN_CHAT_ERROR_ACK_MARKUP_REMOVE_FAILED error_type=%s",
+                    type(error).__name__,
+                )
+            bot.answer_callback_query(
+                call.id, "Просмотрено. Эта ошибка больше не будет повторно присылаться."
+            )
+        elif call.data == "group_private_reply_cancel":
             awaiting_admin_group_private_reply.pop(int(call.from_user.id), None)
             bot.answer_callback_query(call.id, "Ответ отменён")
             try:
@@ -12245,26 +12340,10 @@ def callback_handler(call):
                 **NO_PREVIEW,
             )
         elif call.data == "start_comeback":
-            text = (
-                "👋 <b>Привет!</b>\n\n"
-                "Меня зовут <b>MAX_Parser</b>.\n\n"
-                "Я помогаю автоматически пересылать сообщения из выбранной группы "
-                "мессенджера MAX в Telegram.\n\n"
-                "📌 <b>Для чего я нужен</b>\n"
-                "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
-                "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
-                "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
-                "⚡ <b>Почему это удобно</b>\n"
-                "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
-                "• Не нужно постоянно включать и выключать VPN.\n"
-                "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
-                "🔒 <b>Важно</b>\n"
-                "Бот работает только с теми группами, доступ к которым тебе разрешён."
-            )
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=text, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
+                text=START_HOME_TEXT, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
         elif call.data == "parse_setup":
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
@@ -12442,26 +12521,10 @@ def callback_handler(call):
             bot.answer_callback_query(call.id)
             start_support(call.message.chat.id, call.from_user)
         elif call.data == "start_home":
-            text = (
-                "👋 <b>Привет!</b>\n\n"
-                "Меня зовут <b>MAX_Parser</b>.\n\n"
-                "Я помогаю автоматически пересылать сообщения из выбранной группы "
-                "мессенджера MAX в Telegram.\n\n"
-                "📌 <b>Для чего я нужен</b>\n"
-                "• Получать важные объявления из школьных, рабочих или дружеских чатов MAX.\n"
-                "• Не пропустить сообщения, если ты больше предпочитаешь Telegram.\n"
-                "• Собирать сообщения из одной группы в удобном для тебя Telegram-чате.\n\n"
-                "⚡ <b>Почему это удобно</b>\n"
-                "• Не нужно каждый раз открывать MAX и искать нужную группу.\n"
-                "• Не нужно постоянно включать и выключать VPN.\n"
-                "• Сообщения приходят автоматически, а ты просто читаешь их в Telegram.\n\n"
-                "🔒 <b>Важно</b>\n"
-                "Бот работает только с теми группами, доступ к которым тебе разрешён."
-            )
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=text, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
+                text=START_HOME_TEXT, reply_markup=start_keyboard(), parse_mode='HTML', **NO_PREVIEW)
         elif call.data == "video_instruction":
             bot.answer_callback_query(call.id)
             video_keyboard = types.InlineKeyboardMarkup(row_width=1)

@@ -581,7 +581,7 @@ def _is_logged_in(page) -> bool:
         return False
 
 def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int = 60000, max_attempts: int = 4):
-    """Retry transient MAX network failures with a short exponential backoff."""
+    """Navigate on the initial response, then retry transient MAX network/timeouts."""
     retryable_errors = (
         "err_connection_closed",
         "err_connection_reset",
@@ -594,17 +594,25 @@ def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int 
         "err_internet_disconnected",
         "err_ssl_protocol_error",
     )
-    max_attempts = max(1, int(max_attempts))
-    for attempt in range(1, max_attempts + 1):
+    # MAX Web can keep loading background resources and never dispatch
+    # DOMContentLoaded. Waiting for the first response lets its SPA continue
+    # loading while the parser performs its own readiness checks afterwards.
+    effective_timeout = min(max(1000, int(timeout)), 20000)
+    attempt_limit = min(max(1, int(max_attempts)), 3)
+    for attempt in range(1, attempt_limit + 1):
         try:
-            return page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            return page.goto(url, timeout=effective_timeout, wait_until="commit")
         except Exception as exc:
             error_text = str(exc).lower()
             network_error = next(
                 (marker.upper() for marker in retryable_errors if marker in error_text),
                 type(exc).__name__,
             )
-            if attempt >= max_attempts or not any(marker in error_text for marker in retryable_errors):
+            is_timeout = "timeout" in error_text or "timed out" in error_text
+            is_retryable = is_timeout or any(
+                marker in error_text for marker in retryable_errors
+            )
+            if attempt >= attempt_limit or not is_retryable:
                 debug_logger.error(
                     "MAX_NAVIGATION_FAILED chat_id=%s stage=%s attempts=%s error=%s",
                     chat_id, stage, attempt, network_error,
@@ -613,11 +621,11 @@ def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int 
             delay_seconds = min(2 ** attempt, 8)
             debug_logger.warning(
                 "MAX_NAVIGATION_RETRY chat_id=%s stage=%s attempt=%s/%s delay_seconds=%s error=%s",
-                chat_id, stage, attempt + 1, max_attempts, delay_seconds, network_error,
+                chat_id, stage, attempt + 1, attempt_limit, delay_seconds, network_error,
             )
             print(
                 f"[{chat_id}] ⚠️ Сетевой сбой при этапе «{stage}». "
-                f"Повтор {attempt + 1}/{max_attempts} через {delay_seconds} сек."
+                f"Повтор {attempt + 1}/{attempt_limit} через {delay_seconds} сек."
             )
             time.sleep(delay_seconds)
 

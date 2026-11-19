@@ -49,6 +49,16 @@ def init_db():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_error_acknowledgements (
+                chat_id BIGINT NOT NULL,
+                error_token TEXT NOT NULL,
+                acknowledged_by BIGINT NOT NULL,
+                acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, error_token)
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
@@ -480,6 +490,25 @@ def get_all_admins():
 def delete_admin(user_id: int):
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+        return cursor.rowcount == 1
+
+
+def is_admin_error_acknowledged(chat_id: int, error_token: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 AS found FROM admin_error_acknowledgements WHERE chat_id = %s AND error_token = %s",
+            (int(chat_id), str(error_token)),
+        ).fetchone()
+        return row is not None
+
+
+def acknowledge_admin_error(chat_id: int, error_token: str, admin_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            INSERT INTO admin_error_acknowledgements (chat_id, error_token, acknowledged_by)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (chat_id, error_token) DO NOTHING
+        """, (int(chat_id), str(error_token), int(admin_id)))
         return cursor.rowcount == 1
 
 
