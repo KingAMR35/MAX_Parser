@@ -447,10 +447,14 @@ _telegram_send_lock = threading.Lock()
 _send_context = threading.local()
 _POLL_MESSAGE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_poll_messages.json")
 _SENT_PARSER_MESSAGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_parser_messages.json")
+_SENT_PARSER_VIEW_HIDDEN_CHATS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sent_parser_view_hidden_chats.json"
+)
 _poll_message_cache = {}
 _poll_message_cache_lock = threading.Lock()
 _sent_parser_messages = []
 _sent_parser_messages_lock = threading.RLock()
+_sent_parser_view_hidden_chats = set()
 _SENT_MESSAGE_DELETE_WINDOW = timedelta(hours=47)
 MAX_PUBLIC_SEND_BATCH_ITEMS = 3
 MAX_PUBLIC_SEND_BATCH_BYTES = 20 * 1024 * 1024
@@ -475,6 +479,57 @@ def _save_sent_parser_messages_locked():
             "SENT_PARSER_MESSAGES_SAVE_FAILED path=%s error=%s",
             _SENT_PARSER_MESSAGES_FILE, log_preview(exc),
         )
+
+def _load_sent_parser_view_hidden_chats():
+    global _sent_parser_view_hidden_chats
+    try:
+        with open(_SENT_PARSER_VIEW_HIDDEN_CHATS_FILE, "r", encoding="utf-8") as hidden_file:
+            values = json.load(hidden_file)
+        hidden = set()
+        for value in values if isinstance(values, list) else []:
+            try:
+                hidden.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        _sent_parser_view_hidden_chats = hidden
+    except (OSError, ValueError, TypeError):
+        _sent_parser_view_hidden_chats = set()
+
+def _save_sent_parser_view_hidden_chats_locked():
+    temporary_path = _SENT_PARSER_VIEW_HIDDEN_CHATS_FILE + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as hidden_file:
+            json.dump(sorted(_sent_parser_view_hidden_chats), hidden_file)
+        os.replace(temporary_path, _SENT_PARSER_VIEW_HIDDEN_CHATS_FILE)
+        return True
+    except OSError as exc:
+        debug_logger.warning(
+            "SENT_PARSER_VIEW_HIDDEN_CHATS_SAVE_FAILED path=%s error=%s",
+            _SENT_PARSER_VIEW_HIDDEN_CHATS_FILE, log_preview(exc),
+        )
+        return False
+
+def _sent_parser_chat_is_hidden(chat_id):
+    try:
+        target_chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    with _sent_parser_messages_lock:
+        return target_chat_id in _sent_parser_view_hidden_chats
+
+def _hide_sent_parser_chat_from_view(chat_id):
+    try:
+        target_chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    with _sent_parser_messages_lock:
+        was_hidden = target_chat_id in _sent_parser_view_hidden_chats
+        _sent_parser_view_hidden_chats.add(target_chat_id)
+        if _save_sent_parser_view_hidden_chats_locked():
+            return True
+        if not was_hidden:
+            _sent_parser_view_hidden_chats.discard(target_chat_id)
+        return False
 
 def _post_media_hashes(post: dict) -> list[str]:
     hashes = []
@@ -790,6 +845,7 @@ def _finish_sent_parser_record(record_id, remaining_ids):
             return
 
 _load_sent_parser_messages()
+_load_sent_parser_view_hidden_chats()
 
 def _load_poll_message_cache():
     global _poll_message_cache
@@ -3665,7 +3721,7 @@ def _show_admin_view_chats(chat_id, message_id, page=0):
             source_chat_id = int(record.get("chat_id") or 0)
         except (TypeError, ValueError):
             continue
-        if source_chat_id:
+        if source_chat_id and not _sent_parser_chat_is_hidden(source_chat_id):
             grouped[source_chat_id] = grouped.get(source_chat_id, 0) + 1
     ordered = sorted(grouped, key=_sent_record_latest_time, reverse=True)
     page_size = 10
@@ -3698,6 +3754,16 @@ def _show_admin_view_chats(chat_id, message_id, page=0):
 
 
 def _show_admin_view_posts(chat_id, message_id, target_chat_id, page=0):
+    if _sent_parser_chat_is_hidden(target_chat_id):
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton(
+            "🔙 К списку чатов", callback_data="admin_view_messages"
+        ))
+        safe_edit_message(
+            "👁 <b>Просмотр сообщений</b>\n\nЭта группа удалена из просмотра сообщений.",
+            chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW,
+        )
+        return
     records = [
         record for record in _sent_parser_records_snapshot()
         if str(record.get("chat_id")) == str(target_chat_id)
@@ -3725,6 +3791,11 @@ def _show_admin_view_posts(chat_id, message_id, target_chat_id, page=0):
             ))
         if row:
             keyboard.row(*row)
+    keyboard.add(types.InlineKeyboardButton(
+        "🗑 Удалить группу из просмотра",
+        callback_data=f"admin_view_hide_chat_{int(target_chat_id)}_{page}",
+        style="danger",
+    ))
     keyboard.add(types.InlineKeyboardButton("🔙 К списку чатов", callback_data="admin_view_messages"))
     title = _sent_parser_chat_title(target_chat_id)
     text = f"📨 <b>{escape_html(title)}</b>\n\nВыберите сообщение для просмотра."
@@ -3732,6 +3803,38 @@ def _show_admin_view_posts(chat_id, message_id, target_chat_id, page=0):
         text = f"📨 <b>{escape_html(title)}</b>\n\nДля этого чата пока нет сохранённых пересылок."
     elif page_count > 1:
         text += f"\n\nСтраница {page + 1} из {page_count}."
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def _show_admin_view_hide_confirmation(chat_id, message_id, target_chat_id, page=0):
+    try:
+        target_chat_id = int(target_chat_id)
+    except (TypeError, ValueError):
+        return
+    if _sent_parser_chat_is_hidden(target_chat_id):
+        _show_admin_view_chats(chat_id, message_id)
+        return
+    title = _sent_parser_chat_title(target_chat_id)
+    record_count = sum(
+        1 for record in _sent_parser_records_snapshot()
+        if str(record.get("chat_id")) == str(target_chat_id)
+    )
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "🗑 Да, удалить из просмотра",
+        callback_data=f"admin_view_hide_yes_{target_chat_id}_{int(page)}",
+        style="danger",
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "↩️ Отмена", callback_data=f"admin_view_chat_{target_chat_id}_{int(page)}"
+    ))
+    text = (
+        "⚠️ <b>Удалить группу из просмотра сообщений?</b>\n\n"
+        f"Группа: <b>{escape_html(title)}</b>\n"
+        f"Записей в разделе: <b>{record_count}</b>\n\n"
+        "Группа исчезнет из списка просмотра. Подключение и уже отправленные сообщения в Telegram "
+        "останутся без изменений. История сохранится для раздела удаления сообщений бота."
+    )
     safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
 
 
@@ -12375,6 +12478,40 @@ def admin_callbacks(call):
         except (TypeError, ValueError):
             page = 0
         _show_admin_view_chats(call.message.chat.id, call.message.message_id, page=page)
+    elif action.startswith("admin_view_hide_yes_"):
+        try:
+            chat_id_raw, page_raw = action[len("admin_view_hide_yes_"):].rsplit("_", 1)
+            target_chat_id = int(chat_id_raw)
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            bot.answer_callback_query(call.id, "Не удалось определить группу", show_alert=True)
+            return
+        if not _hide_sent_parser_chat_from_view(target_chat_id):
+            bot.answer_callback_query(
+                call.id, "Не удалось сохранить изменение. Попробуйте ещё раз.", show_alert=True
+            )
+            _show_admin_view_posts(
+                call.message.chat.id, call.message.message_id, target_chat_id, page=page
+            )
+            return
+        bot.answer_callback_query(call.id, "Группа удалена из просмотра сообщений")
+        _show_admin_view_chats(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_view_hide_chat_"):
+        try:
+            chat_id_raw, page_raw = action[len("admin_view_hide_chat_"):].rsplit("_", 1)
+            target_chat_id = int(chat_id_raw)
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            bot.answer_callback_query(call.id, "Не удалось определить группу", show_alert=True)
+            return
+        if _sent_parser_chat_is_hidden(target_chat_id):
+            bot.answer_callback_query(call.id, "Эта группа уже удалена из просмотра")
+            _show_admin_view_chats(call.message.chat.id, call.message.message_id)
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_view_hide_confirmation(
+            call.message.chat.id, call.message.message_id, target_chat_id, page=page
+        )
     elif action.startswith("admin_view_chat_"):
         try:
             source_chat_raw, page_raw = action[len("admin_view_chat_"):].rsplit("_", 1)
@@ -12386,6 +12523,24 @@ def admin_callbacks(call):
         _show_admin_view_posts(
             call.message.chat.id, call.message.message_id, source_chat_id, page=page
         )
+    elif action == "admin_view_copy_delete":
+        if (
+            not call.message
+            or call.message.chat.type != "private"
+            or int(call.message.chat.id) != int(call.from_user.id)
+            or not is_admin(call.from_user.id)
+        ):
+            bot.answer_callback_query(call.id, "Удалить копию может только администратор в личном чате.", show_alert=True)
+            return
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            bot.answer_callback_query(call.id, "Копия удалена из этого чата")
+        except Exception as error:
+            debug_logger.warning(
+                "ADMIN_VIEW_COPIED_MESSAGE_DELETE_FAILED admin_id=%s message_id=%s error_type=%s",
+                call.from_user.id, call.message.message_id, type(error).__name__,
+            )
+            bot.answer_callback_query(call.id, "Не удалось удалить копию. Попробуйте ещё раз.", show_alert=True)
     elif action.startswith("admin_view_copy_"):
         record = _find_sent_parser_record(action[len("admin_view_copy_"):])
         if not record:
@@ -12394,10 +12549,15 @@ def admin_callbacks(call):
         copied = 0
         failures = []
         target_id = int(record.get("destination_chat_id") or record.get("chat_id") or 0)
+        copy_keyboard = types.InlineKeyboardMarkup(row_width=1)
+        copy_keyboard.add(types.InlineKeyboardButton(
+            "🗑 Удалить", callback_data="admin_view_copy_delete", style="danger"
+        ))
         for source_message_id in (record.get("message_ids") or [])[:20]:
             try:
                 bot.copy_message(
-                    call.message.chat.id, target_id, int(source_message_id)
+                    call.message.chat.id, target_id, int(source_message_id),
+                    reply_markup=copy_keyboard,
                 )
                 copied += 1
             except Exception as error:
