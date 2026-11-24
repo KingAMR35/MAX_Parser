@@ -19,6 +19,7 @@ import zipfile
 from datetime import datetime, timedelta
 from typing import List, Dict, Union
 from zoneinfo import ZoneInfo
+from contextlib import nullcontext
 from playwright.sync_api import sync_playwright
 from debug_log import logger as debug_logger, preview as log_preview
 
@@ -44,6 +45,8 @@ recent_post_hashes_by_chat = {}
 message_signatures_by_chat = {}
 message_baseline_by_chat = {}
 MESSAGE_CACHE_LOCK = threading.RLock()
+_MAX_HOME_NAVIGATION_LOCK = threading.Lock()
+_MAX_HOME_FAILURE_UNTIL = 0.0
 
 
 def _strip_browser_video_fallback(text: str) -> str:
@@ -57,8 +60,10 @@ def _strip_browser_video_fallback(text: str) -> str:
     return _normalize_message_lines(text)
 
 
-def _strip_document_tile_metadata(text: str, media_files: list[dict]) -> str:
-    """Remove MAX's file-card labels while preserving the actual message caption."""
+def _strip_document_tile_metadata(
+    text: str, media_files: list[dict], filename_hints=None,
+) -> str:
+    """Remove MAX file-card labels even when downloading the attachment failed."""
     documents = []
     for media in media_files or []:
         if not isinstance(media, dict):
@@ -67,7 +72,14 @@ def _strip_document_tile_metadata(text: str, media_files: list[dict]) -> str:
         mime_type = str(media.get("content_type") or media.get("mime_type") or "").casefold()
         if media_type in {"document", "file", "unknown"} or mime_type.startswith("application/"):
             documents.append(media)
-    if not documents:
+    filename_hints = list(filename_hints or [])
+    has_file_card_hint = bool(filename_hints)
+    hinted_filenames = set()
+    for value in filename_hints:
+        name = os.path.basename(str(value or "").strip()).casefold()
+        if name and name not in {"document.file", "file", "document"}:
+            hinted_filenames.add(name)
+    if not documents and not hinted_filenames and not has_file_card_hint:
         return str(text or "")
 
     filenames = {
@@ -75,6 +87,7 @@ def _strip_document_tile_metadata(text: str, media_files: list[dict]) -> str:
         for item in documents
         if str(item.get("filename") or "").strip()
     }
+    filenames.update(hinted_filenames)
     cleaned_lines = []
     for raw_line in str(text or "").replace("\r", "").split("\n"):
         line = " ".join(raw_line.split())
@@ -84,6 +97,12 @@ def _strip_document_tile_metadata(text: str, media_files: list[dict]) -> str:
             continue
         if normalized in filenames:
             continue
+        if has_file_card_hint and re.fullmatch(
+            r".+\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)",
+            normalized,
+            re.I,
+        ):
+            continue
         if re.fullmatch(r"(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp|файл|документ)", normalized):
             continue
         if re.fullmatch(r"(?:document|file)(?:\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp|bin))?", normalized):
@@ -91,6 +110,18 @@ def _strip_document_tile_metadata(text: str, media_files: list[dict]) -> str:
         if re.fullmatch(r"(?:скачать|download)(?:\s*[·•|]\s*.*)?", normalized):
             continue
         if re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:bytes?|b|kb|mb|gb|кб|мб|гб)", normalized):
+            continue
+        # The MAX card sometimes renders the file type, name and download size
+        # in a single line. Drop that line only when the card had a filename hint.
+        if filenames and any(name in normalized for name in filenames) and re.search(
+            r"(?:скачать|download|\bpdf\b|\bfile\b|\bdocument\b|\d+(?:[.,]\d+)?\s*(?:kb|mb|кб|мб))",
+            normalized,
+            re.I,
+        ):
+            continue
+        if has_file_card_hint and re.search(
+            r"\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|rtf|odt|ods|odp)(?:\s|$)", normalized, re.I
+        ) and re.search(r"(?:скачать|download|\d+(?:[.,]\d+)?\s*(?:kb|mb|кб|мб))", normalized, re.I):
             continue
         cleaned_lines.append(line)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
@@ -582,6 +613,7 @@ def _is_logged_in(page) -> bool:
 
 def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int = 60000, max_attempts: int = 4):
     """Navigate on the initial response, then retry transient MAX network/timeouts."""
+    global _MAX_HOME_FAILURE_UNTIL
     retryable_errors = (
         "err_connection_closed",
         "err_connection_reset",
@@ -594,40 +626,56 @@ def _goto_max_with_retry(page, url: str, chat_id: int, stage: str, timeout: int 
         "err_internet_disconnected",
         "err_ssl_protocol_error",
     )
-    # MAX Web can keep loading background resources and never dispatch
-    # DOMContentLoaded. Waiting for the first response lets its SPA continue
-    # loading while the parser performs its own readiness checks afterwards.
-    effective_timeout = min(max(1000, int(timeout)), 20000)
-    attempt_limit = min(max(1, int(max_attempts)), 3)
-    for attempt in range(1, attempt_limit + 1):
-        try:
-            return page.goto(url, timeout=effective_timeout, wait_until="commit")
-        except Exception as exc:
-            error_text = str(exc).lower()
-            network_error = next(
-                (marker.upper() for marker in retryable_errors if marker in error_text),
-                type(exc).__name__,
-            )
-            is_timeout = "timeout" in error_text or "timed out" in error_text
-            is_retryable = is_timeout or any(
-                marker in error_text for marker in retryable_errors
-            )
-            if attempt >= attempt_limit or not is_retryable:
-                debug_logger.error(
-                    "MAX_NAVIGATION_FAILED chat_id=%s stage=%s attempts=%s error=%s",
-                    chat_id, stage, attempt, network_error,
+    parsed_url = urlparse(str(url or ""))
+    is_home = (parsed_url.hostname or "").casefold() == "web.max.ru" and parsed_url.path in {"", "/"}
+    lock_context = _MAX_HOME_NAVIGATION_LOCK if is_home else nullcontext()
+    # Parallel chats used to hit the same MAX homepage at once. Serialize only
+    # this shared navigation and pause sibling parsers briefly after an outage.
+    with lock_context:
+        if is_home and time.monotonic() < _MAX_HOME_FAILURE_UNTIL:
+            raise RuntimeError("MAX_WEB_UNAVAILABLE: MAX Web временно не отвечает; повтор будет в следующем цикле")
+
+        # Waiting for the first response lets the SPA load its UI afterwards.
+        # A commit timeout is a network/host failure, so retry it only once.
+        effective_timeout = min(max(1000, int(timeout)), 15000)
+        attempt_limit = min(max(1, int(max_attempts)), 2)
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                response = page.goto(url, timeout=effective_timeout, wait_until="commit")
+                if is_home:
+                    _MAX_HOME_FAILURE_UNTIL = 0.0
+                return response
+            except Exception as exc:
+                error_text = str(exc).lower()
+                network_error = next(
+                    (marker.upper() for marker in retryable_errors if marker in error_text),
+                    type(exc).__name__,
                 )
-                raise
-            delay_seconds = min(2 ** attempt, 8)
-            debug_logger.warning(
-                "MAX_NAVIGATION_RETRY chat_id=%s stage=%s attempt=%s/%s delay_seconds=%s error=%s",
-                chat_id, stage, attempt + 1, attempt_limit, delay_seconds, network_error,
-            )
-            print(
-                f"[{chat_id}] ⚠️ Сетевой сбой при этапе «{stage}». "
-                f"Повтор {attempt + 1}/{attempt_limit} через {delay_seconds} сек."
-            )
-            time.sleep(delay_seconds)
+                is_timeout = "timeout" in error_text or "timed out" in error_text
+                is_retryable = is_timeout or any(
+                    marker in error_text for marker in retryable_errors
+                )
+                if attempt >= attempt_limit or not is_retryable:
+                    debug_logger.error(
+                        "MAX_NAVIGATION_FAILED chat_id=%s stage=%s attempts=%s error=%s",
+                        chat_id, stage, attempt, network_error,
+                    )
+                    if is_home and is_retryable:
+                        _MAX_HOME_FAILURE_UNTIL = time.monotonic() + 25.0
+                        raise RuntimeError(
+                            f"MAX_WEB_UNAVAILABLE: {type(exc).__name__}: {log_preview(exc, 240)}"
+                        ) from exc
+                    raise
+                delay_seconds = 2
+                debug_logger.warning(
+                    "MAX_NAVIGATION_RETRY chat_id=%s stage=%s attempt=%s/%s delay_seconds=%s error=%s",
+                    chat_id, stage, attempt + 1, attempt_limit, delay_seconds, network_error,
+                )
+                print(
+                    f"[{chat_id}] ⚠️ Сетевой сбой при этапе «{stage}». "
+                    f"Повтор {attempt + 1}/{attempt_limit} через {delay_seconds} сек."
+                )
+                time.sleep(delay_seconds)
 
 
 def _is_max_host(host):
@@ -4416,11 +4464,71 @@ def _download_document_to_memory(page, context, url: str, filename: str = "", ch
                     pass
                 return _media_size_limit_marker(chat_id, url, media_type, declared_size)
             content_type = headers.get("content-type", "")
+            status = int(response.status)
             file_bytes = response.body()
+            content_range = str(headers.get("content-range") or "")
             try:
                 response.dispose()
             except Exception:
                 pass
+            if status == 206:
+                range_match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range.strip(), re.I)
+                if not range_match:
+                    raise RuntimeError("MAX вернул частичный файл без корректного Content-Range")
+                start, end, total = (int(value) for value in range_match.groups())
+                if start != 0 or end < start or total <= end:
+                    raise RuntimeError("MAX вернул неполный фрагмент документа")
+                if total > MAX_MEDIA_DOWNLOAD_BYTES:
+                    return _media_size_limit_marker(chat_id, url, media_type, total)
+                if len(file_bytes) != end - start + 1:
+                    raise RuntimeError("Размер фрагмента документа не совпал с Content-Range")
+                assembled = bytearray(file_bytes)
+                next_start = end + 1
+                chunk_size = 4 * 1024 * 1024
+                while next_start < total:
+                    next_end = min(total - 1, next_start + chunk_size - 1)
+                    ranged = context.request.get(
+                        url,
+                        headers={"Range": f"bytes={next_start}-{next_end}"},
+                        timeout=60_000,
+                        fail_on_status_code=False,
+                    )
+                    try:
+                        ranged_bytes = ranged.body() if ranged.ok else b""
+                        ranged_status = int(ranged.status)
+                        ranged_headers = ranged.headers
+                    finally:
+                        try:
+                            ranged.dispose()
+                        except Exception:
+                            pass
+                    if ranged_status == 200 and len(ranged_bytes) == total:
+                        assembled = bytearray(ranged_bytes)
+                        next_start = total
+                        break
+                    ranged_match = re.fullmatch(
+                        r"bytes\s+(\d+)-(\d+)/(\d+)",
+                        str(ranged_headers.get("content-range") or "").strip(), re.I,
+                    )
+                    if ranged_status != 206 or not ranged_match:
+                        raise RuntimeError("MAX не отдал оставшуюся часть документа")
+                    ranged_start, ranged_end, ranged_total = (int(value) for value in ranged_match.groups())
+                    if (
+                        ranged_start != next_start or ranged_total != total
+                        or ranged_end < ranged_start
+                        or ranged_end > next_end
+                        or len(ranged_bytes) != ranged_end - ranged_start + 1
+                    ):
+                        raise RuntimeError("Части документа пришли с пропуском или неверным размером")
+                    assembled.extend(ranged_bytes)
+                    next_start = ranged_end + 1
+                if len(assembled) != total:
+                    raise RuntimeError("Документ загружен не полностью")
+                file_bytes = bytes(assembled)
+            else:
+                content_length = int(headers.get("content-length") or 0)
+                if content_length and len(file_bytes) < content_length:
+                    raise RuntimeError("Документ загружен не полностью: Content-Length не совпал")
             if len(file_bytes) > MAX_MEDIA_DOWNLOAD_BYTES:
                 return _media_size_limit_marker(chat_id, url, media_type, len(file_bytes))
             header_name = _filename_from_headers(headers, filename)
@@ -8951,7 +9059,24 @@ def parse_max_group_media(
                 if media.get("type") == "image" and visual_hash:
                     seen_direct_visual_hashes.append(visual_hash)
             message_text = "" if msg.get("_captured_animated_emoji") else msg.get("text", "")
-            message_text = _strip_document_tile_metadata(message_text, unique_media)
+            document_filename_hints = [msg.get("download_click_filename", "")]
+            if msg.get("download_click_id"):
+                document_filename_hints.append("__MAX_FILE_CARD__")
+            document_filename_hints.extend(
+                str(document.get("filename") or "")
+                for document in (msg.get("documents") or [])
+                if isinstance(document, dict)
+            )
+            document_filename_hints.extend(
+                str(attachment.get("filename") or "")
+                for attachment in (msg.get("attachments") or [])
+                if isinstance(attachment, dict)
+                and str(attachment.get("type") or "").casefold()
+                in {"document", "file", "unknown"}
+            )
+            message_text = _strip_document_tile_metadata(
+                message_text, unique_media, filename_hints=document_filename_hints
+            )
             human_posts.append({
                 "source_id": msg.get("source_id", ""),
                 "source_id_is_index": bool(msg.get("source_id_is_index")),
@@ -9612,7 +9737,8 @@ def send_message_to_max(
         if detected_source_type == "channel":
             raise RuntimeError("MAX_SOURCE_IS_CHANNEL")
 
-        composer_found = page.evaluate("""() => {
+        def detect_composer():
+            return page.evaluate("""() => {
             const visible = el => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
@@ -9639,6 +9765,13 @@ def send_message_to_max(
             best.setAttribute('data-max-parser-send-composer', 'true');
             return true;
         }""")
+        composer_found = False
+        for composer_attempt in range(10):
+            composer_found = detect_composer()
+            if composer_found:
+                break
+            if composer_attempt < 9:
+                page.wait_for_timeout(400)
         if not composer_found:
             raise RuntimeError("MAX_COMPOSER_NOT_FOUND")
 

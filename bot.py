@@ -452,6 +452,8 @@ _poll_message_cache_lock = threading.Lock()
 _sent_parser_messages = []
 _sent_parser_messages_lock = threading.RLock()
 _SENT_MESSAGE_DELETE_WINDOW = timedelta(hours=47)
+MAX_PUBLIC_SEND_BATCH_ITEMS = 3
+MAX_PUBLIC_SEND_BATCH_BYTES = 20 * 1024 * 1024
 
 def _load_sent_parser_messages():
     global _sent_parser_messages
@@ -613,6 +615,25 @@ def _record_parser_sent_post(
             preview = "Геопозиция"
         else:
             preview = "Медиа или вложение"
+    media_details = []
+    for media in post.get("media_files") or []:
+        if not isinstance(media, dict):
+            continue
+        data = media.get("bytes")
+        try:
+            media_size = (
+                len(data) if isinstance(data, (bytes, bytearray))
+                else max(0, int(media.get("size_bytes") or media.get("size") or 0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            media_size = 0
+        media_details.append({
+            "type": str(media.get("type") or "вложение")[:32],
+            "filename": os.path.basename(str(media.get("filename") or ""))[:180],
+            "content_type": str(media.get("content_type") or media.get("mime_type") or "")[:100],
+            "size": media_size,
+            "duration": media.get("duration"),
+        })
     record = {
         "record_id": uuid.uuid4().hex[:12],
         "chat_id": int(chat_id),
@@ -621,6 +642,11 @@ def _record_parser_sent_post(
         "source_id": str(post.get("source_id") or post.get("idx") or "")[:80],
         "sent_at": datetime.now(timezone.utc).isoformat(),
         "preview": preview,
+        "full_text": str(post.get("text") or "")[:4000],
+        "emoji_text": "".join(str(value) for value in (post.get("emoji_texts") or []))[:2000],
+        "media_details": media_details[:20],
+        "poll": dict(post.get("poll") or {}) if isinstance(post.get("poll"), dict) else None,
+        "location": dict(post.get("location") or {}) if isinstance(post.get("location"), dict) else None,
         "partial": bool(partial),
         "captioned": bool(captioned),
         "text_sent": bool(text_sent),
@@ -692,6 +718,8 @@ def _mark_parser_record_captioned(record_id: str, post: dict):
             updated["captioned"] = True
             updated["text_sent"] = False
             updated["preview"] = preview or updated.get("preview") or "Медиа или вложение"
+            updated["full_text"] = str(post.get("text") or "")[:4000]
+            updated["emoji_text"] = "".join(str(value) for value in (post.get("emoji_texts") or []))[:2000]
             updated["name"] = str(post.get("name") or updated.get("name") or "")[:100]
             updated["date"] = str(post.get("date") or updated.get("date") or "")[:32]
             updated["time"] = str(post.get("time") or updated.get("time") or "")[:24]
@@ -723,6 +751,8 @@ def _mark_parser_record_text_sent(record_id: str, post: dict, message_ids):
             updated["message_ids"] = ids
             updated["text_sent"] = True
             updated["preview"] = preview or updated.get("preview") or "Медиа или вложение"
+            updated["full_text"] = str(post.get("text") or "")[:4000]
+            updated["emoji_text"] = "".join(str(value) for value in (post.get("emoji_texts") or []))[:2000]
             _sent_parser_messages[index] = updated
             _save_sent_parser_messages_locked()
             return True
@@ -2178,6 +2208,9 @@ def _notify_admin_chat_error(chat, error, stage="обработка"):
     error_token = hashlib.sha256(
         f"{type(error).__name__}|{normalized_error}".encode("utf-8", "replace")
     ).hexdigest()[:24]
+    shared_max_outage = "MAX_WEB_UNAVAILABLE" in raw_error_text
+    if shared_max_outage:
+        error_token = "MAX_WEB_UNAVAILABLE"
     try:
         # Acknowledgement mutes the same diagnostic across chats, so a shared
         # MAX Web outage does not keep generating one alert per connected chat.
@@ -2188,7 +2221,7 @@ def _notify_admin_chat_error(chat, error, stage="обработка"):
             "ADMIN_CHAT_ERROR_ACK_LOOKUP_FAILED chat_id=%s error_type=%s",
             chat_id, type(lookup_error).__name__,
         )
-    notice_key = (chat_id, error_token)
+    notice_key = (0 if shared_max_outage else chat_id, error_token)
     with _ADMIN_CHAT_ERROR_NOTICE_LOCK:
         if notice_key in _ADMIN_CHAT_ERROR_NOTICE_KEYS:
             return False
@@ -2708,12 +2741,14 @@ def background_parser():
                     for chat in active_chats
                 }
                 concurrent.futures.wait(future_chats)
+                any_chat_succeeded = False
                 for future, chat in future_chats.items():
                     try:
-                        future.result()
+                        any_chat_succeeded = bool(future.result()) or any_chat_succeeded
                     except Exception as error:
                         _notify_admin_chat_error(chat, error, stage="фоновый разбор")
-            _clear_admin_chat_error_notice(0)
+                if any_chat_succeeded:
+                    _clear_admin_chat_error_notice(0)
             elapsed = time.monotonic() - cycle_started
             wait_seconds = max(0, PARSER_CYCLE_INTERVAL_SECONDS - elapsed)
             print(
@@ -3486,6 +3521,7 @@ def show_admin_menu(chat_id):
     kb.add(types.InlineKeyboardButton("📋 Список чатов", callback_data="admin_chats"))
     kb.add(types.InlineKeyboardButton("📊 Статус парсинга", callback_data="admin_parse_status"))
     kb.add(types.InlineKeyboardButton("🧪 Последний разбор сообщений", callback_data="admin_parse_diagnostics"))
+    kb.add(types.InlineKeyboardButton("👁 Просмотр сообщений", callback_data="admin_view_messages"))
     kb.add(types.InlineKeyboardButton("🗑 Удалить сообщения бота", callback_data="admin_sent_messages"))
     kb.row(
         types.InlineKeyboardButton("👑 Админы", callback_data="admin_admins"),
@@ -3618,6 +3654,242 @@ def _show_sent_parser_posts(chat_id, message_id, target_chat_id, page=0):
         + (f"\n\nСтраница {page + 1} из {page_count}." if page_count > 1 else "")
         if records else
         f"🗑 <b>{escape_html(title)}</b>\n\nНет сохранённых отправок для удаления."
+    )
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def _show_admin_view_chats(chat_id, message_id, page=0):
+    grouped = {}
+    for record in _sent_parser_records_snapshot():
+        try:
+            source_chat_id = int(record.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if source_chat_id:
+            grouped[source_chat_id] = grouped.get(source_chat_id, 0) + 1
+    ordered = sorted(grouped, key=_sent_record_latest_time, reverse=True)
+    page_size = 10
+    page_count = max(1, (len(ordered) + page_size - 1) // page_size)
+    page = max(0, min(int(page or 0), page_count - 1))
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for source_chat_id in ordered[page * page_size:(page + 1) * page_size]:
+        title = _sent_parser_chat_title(source_chat_id)
+        keyboard.add(types.InlineKeyboardButton(
+            f"📨 {title[:34]} · {grouped[source_chat_id]}",
+            callback_data=f"admin_view_chat_{source_chat_id}_0",
+        ))
+    if page_count > 1:
+        row = []
+        if page > 0:
+            row.append(types.InlineKeyboardButton("◀️ Назад", callback_data=f"admin_view_chats_{page - 1}"))
+        if page + 1 < page_count:
+            row.append(types.InlineKeyboardButton("Вперёд ▶️", callback_data=f"admin_view_chats_{page + 1}"))
+        if row:
+            keyboard.row(*row)
+    keyboard.add(types.InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_back"))
+    text = (
+        "👁 <b>Просмотр сообщений</b>\n\nВыберите чат, чтобы открыть список пересланных сообщений, посмотреть их содержимое и при необходимости удалить."
+        if ordered else
+        "👁 <b>Просмотр сообщений</b>\n\nПересланные сообщения появятся здесь после работы парсера."
+    )
+    if page_count > 1:
+        text += f"\n\nСтраница {page + 1} из {page_count}."
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def _show_admin_view_posts(chat_id, message_id, target_chat_id, page=0):
+    records = [
+        record for record in _sent_parser_records_snapshot()
+        if str(record.get("chat_id")) == str(target_chat_id)
+    ]
+    records.sort(key=lambda record: str(record.get("sent_at") or ""), reverse=True)
+    page_size = 10
+    page_count = max(1, (len(records) + page_size - 1) // page_size)
+    page = max(0, min(int(page or 0), page_count - 1))
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for record in records[page * page_size:(page + 1) * page_size]:
+        preview = " ".join(str(record.get("preview") or "Сообщение").split())[:36]
+        keyboard.add(types.InlineKeyboardButton(
+            f"👁 {_sent_record_time_label(record)} · {preview}",
+            callback_data=f"admin_view_msg_{record.get('record_id')}_{page}",
+        ))
+    if page_count > 1:
+        row = []
+        if page > 0:
+            row.append(types.InlineKeyboardButton(
+                "◀️ Предыдущие", callback_data=f"admin_view_chat_{int(target_chat_id)}_{page - 1}"
+            ))
+        if page + 1 < page_count:
+            row.append(types.InlineKeyboardButton(
+                "Следующие ▶️", callback_data=f"admin_view_chat_{int(target_chat_id)}_{page + 1}"
+            ))
+        if row:
+            keyboard.row(*row)
+    keyboard.add(types.InlineKeyboardButton("🔙 К списку чатов", callback_data="admin_view_messages"))
+    title = _sent_parser_chat_title(target_chat_id)
+    text = f"📨 <b>{escape_html(title)}</b>\n\nВыберите сообщение для просмотра."
+    if not records:
+        text = f"📨 <b>{escape_html(title)}</b>\n\nДля этого чата пока нет сохранённых пересылок."
+    elif page_count > 1:
+        text += f"\n\nСтраница {page + 1} из {page_count}."
+    safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
+
+
+def _admin_view_record_text(record):
+    title = _sent_parser_chat_title(record.get("chat_id"))
+    content = str(record.get("full_text") or "").strip()
+    details = record.get("media_details") or []
+    if not isinstance(details, list):
+        details = []
+    emoji_text = str(record.get("emoji_text") or "").strip()
+    poll = record.get("poll") or {}
+    poll_options = [
+        str(option.get("text") if isinstance(option, dict) else option).strip()
+        for option in (poll.get("options") or [])
+        if (option.get("text") if isinstance(option, dict) else option)
+    ] if isinstance(poll, dict) else []
+    max_date = " ".join(
+        value for value in (str(record.get("date") or "").strip(), str(record.get("time") or "").strip())
+        if value
+    )
+    content_limit = min(len(content), 1800)
+    media_limit = min(len(details), 10)
+    poll_limit = min(len(poll_options), 10)
+    emoji_limit = min(len(emoji_text), 100)
+
+    # Keep the HTML document below Telegram's message limit without cutting an
+    # entity or tag in half. Long originals remain available through the copy button.
+    while True:
+        lines = [
+            f"👁 <b>{escape_html(title[:100])}</b>",
+            f"🕒 В Telegram: {escape_html(_sent_record_time_label(record))}",
+        ]
+        if max_date:
+            lines.append(f"🗓 В MAX: {escape_html(max_date[:80])}")
+        if record.get("name"):
+            lines.append(f"👤 {escape_html(str(record.get('name'))[:100])}")
+        lines.append(f"🆔 ID сообщения MAX: <code>{escape_html(str(record.get('source_id') or '—')[:100])}</code>")
+        if record.get("is_outgoing"):
+            lines.append("↗️ Отправлено из Telegram в MAX")
+        if content and content_limit:
+            visible_content = content[:content_limit]
+            lines.extend(["", "<b>Текст:</b>", f"<blockquote>{escape_html(visible_content)}</blockquote>"])
+            if len(content) > content_limit:
+                lines.append("<i>Часть текста скрыта в карточке. Полный оригинал доступен по кнопке ниже.</i>")
+        elif content:
+            lines.extend(["", "<i>Полный текст доступен в оригинале по кнопке ниже.</i>"])
+        elif record.get("preview"):
+            lines.extend(["", f"<b>Текст:</b> {escape_html(str(record.get('preview'))[:200])}"])
+            lines.append("<i>Для старой записи полный текст не сохранён; попробуйте открыть оригинал ниже.</i>")
+        if media_limit:
+            lines.append("\n<b>Вложения:</b>")
+            for media in details[:media_limit]:
+                if not isinstance(media, dict):
+                    continue
+                label = str(media.get("type") or "вложение")[:32]
+                filename = str(media.get("filename") or "").strip()[:80]
+                try:
+                    size = max(0, int(media.get("size") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    size = 0
+                item = f"• {escape_html(label)}"
+                if filename:
+                    item += f" · {escape_html(filename)}"
+                if size:
+                    item += f" · {size / 1024:.1f} КБ"
+                duration = media.get("duration")
+                try:
+                    duration = max(0, int(float(duration))) if duration is not None else 0
+                except (TypeError, ValueError, OverflowError):
+                    duration = 0
+                if duration:
+                    item += f" · {duration // 60}:{duration % 60:02d}"
+                lines.append(item)
+            if len(details) > media_limit:
+                lines.append(f"Ещё вложений: {len(details) - media_limit}. Оригинал доступен ниже.")
+        elif record.get("has_media"):
+            lines.append("\n📎 В сообщении есть медиа или файл; точные сведения для старых записей не сохранены.")
+        if emoji_text and emoji_text not in content and emoji_limit:
+            lines.extend(["", f"✨ Эмодзи: {escape_html(emoji_text[:emoji_limit])}"])
+        if isinstance(poll, dict) and poll and (poll.get("question") or poll_limit):
+            question = str(poll.get("question") or "").strip()
+            if question:
+                lines.extend(["", f"📊 <b>Опрос:</b> {escape_html(question[:160])}"])
+            for option in poll_options[:poll_limit]:
+                lines.append(f"• {escape_html(option[:100])}")
+            if len(poll_options) > poll_limit:
+                lines.append("Остальные варианты доступны в оригинале ниже.")
+        location = record.get("location")
+        if isinstance(location, dict) and location:
+            latitude = location.get("latitude", location.get("lat"))
+            longitude = location.get("longitude", location.get("lon", location.get("lng")))
+            if latitude is not None and longitude is not None:
+                lines.extend(["", f"📍 Геопозиция: {escape_html(str(latitude)[:32])}, {escape_html(str(longitude)[:32])}"])
+            address = str(location.get("title") or location.get("address") or "").strip()
+            if address:
+                lines.append(f"{escape_html(address[:120])}")
+        if record.get("partial"):
+            lines.append("\n⚠️ Пересылка этого сообщения завершилась частично.")
+        rendered = "\n".join(lines)
+        if len(rendered) <= 3900:
+            return rendered
+        if content_limit:
+            content_limit = max(0, content_limit - 200)
+        elif media_limit:
+            media_limit -= 1
+        elif poll_limit:
+            poll_limit -= 1
+        elif emoji_limit:
+            emoji_limit = 0
+        else:
+            return "👁 <b>Сообщение</b>\n\nКарточка содержит слишком много данных. Откройте оригинал по кнопке ниже."
+
+
+def _show_admin_view_record(chat_id, message_id, record, page=0):
+    if not record:
+        _show_admin_view_chats(chat_id, message_id)
+        return
+    source_chat_id = int(record.get("chat_id") or 0)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if record.get("message_ids"):
+        keyboard.add(types.InlineKeyboardButton(
+            "📎 Показать оригинал с медиа", callback_data=f"admin_view_copy_{record.get('record_id')}"
+        ))
+    if _sent_record_is_deletable(record):
+        keyboard.add(types.InlineKeyboardButton(
+            "🗑 Удалить сообщение", callback_data=f"admin_view_delete_{record.get('record_id')}_{int(page)}"
+        ))
+    else:
+        keyboard.add(types.InlineKeyboardButton("🗑 Удаление уже недоступно", callback_data="admin_view_noop"))
+    keyboard.add(types.InlineKeyboardButton(
+        "🔙 К сообщениям", callback_data=f"admin_view_chat_{source_chat_id}_{int(page)}"
+    ))
+    safe_edit_message(
+        _admin_view_record_text(record), chat_id, message_id,
+        reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW,
+    )
+
+
+def _show_admin_view_delete_confirmation(chat_id, message_id, record, page=0):
+    if not record or not _sent_record_is_deletable(record):
+        return
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "✅ Удалить", callback_data=f"admin_view_delete_yes_{record.get('record_id')}_{int(page)}"
+        ),
+        types.InlineKeyboardButton(
+            "↩️ Назад", callback_data=f"admin_view_msg_{record.get('record_id')}_{int(page)}"
+        ),
+    )
+    title = _sent_parser_chat_title(record.get("chat_id"))
+    preview = escape_html(str(record.get("preview") or "Сообщение")[:180])
+    text = (
+        "⚠️ <b>Удалить пересланное сообщение?</b>\n\n"
+        f"Чат: <b>{escape_html(title)}</b>\n"
+        f"Время: <b>{escape_html(_sent_record_time_label(record))}</b>\n"
+        f"Текст: <blockquote>{preview}</blockquote>\n"
+        "Если MAX_Parser отправил несколько частей, удалятся все части этой пересылки."
     )
     safe_edit_message(text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML", **NO_PREVIEW)
 
@@ -7526,11 +7798,15 @@ def _cleanup_legacy_max_send_buttons():
             )
 
 
-def _public_max_send_keyboard(nonce, include_skip=False):
+def _public_max_send_keyboard(nonce, include_skip=False, include_batch=False):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     if include_skip:
         keyboard.add(types.InlineKeyboardButton(
             "⏭️ Пропустить этот шаг", callback_data=f"maxsend_skipname_{nonce}"
+        ))
+    if include_batch:
+        keyboard.add(types.InlineKeyboardButton(
+            "📨 Отправить несколько", callback_data=f"maxsend_batch_start_{nonce}"
         ))
     keyboard.add(types.InlineKeyboardButton(
         "❌ Отмена", callback_data=f"maxsend_cancel_{nonce}"
@@ -7752,7 +8028,7 @@ def _ask_public_max_body(flow_key, nonce):
     prompt = bot.send_message(
         int(flow_key[0]),
         text,
-        reply_markup=_public_max_send_keyboard(nonce),
+        reply_markup=_public_max_send_keyboard(nonce, include_batch=True),
         **NO_PREVIEW,
     )
     with public_max_send_flow_lock:
@@ -7772,7 +8048,7 @@ def _is_public_max_send_reply(message):
         flow = public_max_send_flows.get(key)
         if (
             not flow
-            or flow.get("stage") not in {"name", "body"}
+            or flow.get("stage") not in {"name", "body", "batch_body"}
             or float(flow.get("expires_at") or 0) <= time.time()
         ):
             return False
@@ -7957,15 +8233,108 @@ def _public_max_preview_text(flow):
     return f"Проверьте сообщение для MAX:\n\n{sender_line}{description}"
 
 
-def _public_max_send_confirm_keyboard(source_chat_id, nonce):
+def _public_max_send_confirm_keyboard(source_chat_id, nonce, message_count=1):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.row(
         types.InlineKeyboardButton(
-            "✅ Отправить", callback_data=f"maxsend_confirm_{int(source_chat_id)}_{nonce}"
+            (f"✅ Отправить {int(message_count)}" if int(message_count or 1) > 1 else "✅ Отправить"),
+            callback_data=f"maxsend_confirm_{int(source_chat_id)}_{nonce}"
         ),
         types.InlineKeyboardButton("❌ Отмена", callback_data=f"maxsend_cancel_{nonce}"),
     )
     return keyboard
+
+
+def _public_max_batch_wait_keyboard(nonce):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "❌ Отмена", callback_data=f"maxsend_cancel_{nonce}"
+    ))
+    return keyboard
+
+
+def _public_max_batch_review_keyboard(nonce, count):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if int(count) < MAX_PUBLIC_SEND_BATCH_ITEMS:
+        keyboard.add(types.InlineKeyboardButton(
+            "➕ Добавить ещё", callback_data=f"maxsend_batch_add_{nonce}"
+        ))
+    keyboard.add(types.InlineKeyboardButton(
+        f"📤 Отправить {int(count)}", callback_data=f"maxsend_batch_submit_{nonce}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "❌ Отмена", callback_data=f"maxsend_cancel_{nonce}"
+    ))
+    return keyboard
+
+
+def _public_max_batch_preview_text(flow):
+    count = len(flow.get("batch_items") or [])
+    title = escape_html(str((get_chat_by_id(int(flow.get("source_chat_id") or 0)) or {}).get("title") or "Чат MAX"))
+    lines = [f"Проверьте отправку {count} сообщений в MAX «{title}»:\n"]
+    sender_name = str(flow.get("sender_name") or "").strip()
+    for index, item in enumerate(flow.get("batch_items") or [], 1):
+        body = str(item.get("body") or "").strip()
+        label = str(item.get("label") or "Вложение")
+        content = escape_html(body[:220]) if body else f"<i>{escape_html(label)}</i>"
+        if len(body) > 220:
+            content += "…"
+        sender = f"<b>{escape_html(sender_name)}</b> пишет:\n" if sender_name else ""
+        lines.append(f"\n<b>{index}.</b> {sender}{content}")
+    lines.append("\n\nПосле подтверждения сообщения отправятся по порядку. Максимум — 3 сообщения за один раз.")
+    return "".join(lines)[:3900]
+
+
+def _public_max_batch_prompt(flow_key, nonce, text, count=None):
+    with public_max_send_flow_lock:
+        flow = public_max_send_flows.get(flow_key)
+        if not flow or flow.get("nonce") != nonce:
+            return False
+        prompt_message_id = int(flow.get("prompt_message_id") or 0)
+    if not prompt_message_id:
+        return False
+    keyboard = (
+        _public_max_batch_review_keyboard(nonce, count)
+        if count is not None else _public_max_batch_wait_keyboard(nonce)
+    )
+    try:
+        bot.edit_message_text(
+            text, int(flow_key[0]), prompt_message_id,
+            parse_mode="HTML", reply_markup=keyboard, **NO_PREVIEW,
+        )
+    except Exception as error:
+        if "message is not modified" not in str(error).lower():
+            debug_logger.info(
+                "PUBLIC_MAX_BATCH_PROMPT_EDIT_FAILED user=%s error_type=%s",
+                flow_key[1], type(error).__name__,
+            )
+    return True
+
+
+def _queue_public_max_batch_item(flow_key, nonce, payload):
+    with public_max_send_flow_lock:
+        flow = public_max_send_flows.get(flow_key)
+        if not flow or flow.get("nonce") != nonce or flow.get("stage") != "batch_body":
+            return False
+        items = list(flow.get("batch_items") or [])
+        if len(items) >= MAX_PUBLIC_SEND_BATCH_ITEMS:
+            return False
+        items.append({
+            "body": str(payload.get("body") or "").strip(),
+            "media": payload.get("media"),
+            "label": str(payload.get("label") or "Вложение")[:80],
+        })
+        flow["batch_items"] = items
+        flow["stage"] = "batch_review"
+        flow["expires_at"] = time.time() + 10 * 60
+        count = len(items)
+    _public_max_batch_prompt(
+        flow_key, nonce,
+        f"✅ В очереди <b>{count}</b> из <b>{MAX_PUBLIC_SEND_BATCH_ITEMS}</b> сообщений.\n\n"
+        "MAX пока ничего не отправлял. Добавьте ещё сообщение или нажмите «Отправить», чтобы перейти к подтверждению.",
+        count=count,
+    )
+    return True
 
 
 def _is_public_max_file_oversize(file_size):
@@ -8060,6 +8429,9 @@ def _prepare_public_max_media(item):
 def _send_public_max_message(flow_key, nonce, preview_message_id):
     result_text = None
     result_keyboard = None
+    batch_sent_count = 0
+    batch_total_count = 0
+    batch_mode = False
     try:
         with public_max_send_flow_lock:
             flow = public_max_send_flows.get(flow_key)
@@ -8070,41 +8442,78 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
         chat = get_chat_by_id(source_chat_id)
         if not _max_send_button_is_eligible(chat):
             raise RuntimeError("CONNECTION_NO_LONGER_ACTIVE")
-        body = str(flow.get("body") or "").strip()
         name = str(flow.get("sender_name") or "").strip()
-        media = flow.get("media") or None
-        if media:
-            media_items = media if isinstance(media, list) else [media]
-            downloaded_items = []
-            total_size = 0
-            for item in media_items[:10]:
-                item = dict(item)
-                telegram_file = bot.get_file(item["file_id"])
-                if _is_public_max_file_oversize(getattr(telegram_file, "file_size", None)):
-                    raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
-                file_bytes = bot.download_file(telegram_file.file_path)
-                total_size += len(file_bytes)
-                if total_size > 20 * 1024 * 1024:
-                    raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
-                item["bytes"] = file_bytes
-                item = _prepare_public_max_media(item)
-                downloaded_items.append(item)
-            media = downloaded_items
-            if len(media) == 1:
-                media = media[0]
-
+        batch_mode = bool(flow.get("batch_mode"))
+        send_items = list(flow.get("batch_items") or []) if batch_mode else [{
+            "body": flow.get("body"),
+            "media": flow.get("media"),
+            "label": flow.get("payload_label") or "Сообщение",
+        }]
+        if not send_items:
+            raise RuntimeError("MAX_SEND_BATCH_EMPTY")
+        batch_total_count = len(send_items)
+        downloaded_payloads = []
+        batch_bytes = 0
+        for payload_index, payload in enumerate(send_items, 1):
+            body = str(payload.get("body") or "").strip()
+            media = payload.get("media") or None
+            if media:
+                media_items = media if isinstance(media, list) else [media]
+                downloaded_items = []
+                item_size = 0
+                for item in media_items[:10]:
+                    item = dict(item)
+                    telegram_file = bot.get_file(item["file_id"])
+                    if _is_public_max_file_oversize(getattr(telegram_file, "file_size", None)):
+                        raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
+                    file_bytes = bot.download_file(telegram_file.file_path)
+                    item_size += len(file_bytes)
+                    batch_bytes += len(file_bytes)
+                    if item_size > MAX_PUBLIC_SEND_BATCH_BYTES or (
+                        batch_mode and batch_bytes > MAX_PUBLIC_SEND_BATCH_BYTES
+                    ):
+                        raise RuntimeError("TELEGRAM_FILE_TOO_LARGE")
+                    item["bytes"] = file_bytes
+                    item = _prepare_public_max_media(item)
+                    downloaded_items.append(item)
+                media = downloaded_items
+                if len(media) == 1:
+                    media = media[0]
+            downloaded_payloads.append((body, media, payload_index))
         source_lock = max_send_source_locks.setdefault(source_chat_id, threading.Lock())
         with source_lock:
-            _send_max_payload_with_sender(
-                group_url=chat["max_url"],
-                body=body,
-                sender_name=name,
-                media=media,
-                chat_id=source_chat_id,
-                session_path=_session_path_for_chat(chat),
-                source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
-            )
-        result_text = "✅ Сообщение отправлено в MAX."
+            for body, media, payload_index in downloaded_payloads:
+                try:
+                    _send_max_payload_with_sender(
+                        group_url=chat["max_url"],
+                        body=body,
+                        sender_name=name,
+                        media=media,
+                        chat_id=source_chat_id,
+                        session_path=_session_path_for_chat(chat),
+                        source_type_callback=lambda detected: _update_detected_source_type(source_chat_id, detected),
+                    )
+                    batch_sent_count += 1
+                    if batch_mode and batch_sent_count < batch_total_count:
+                        try:
+                            bot.edit_message_text(
+                                f"⏳ Отправлено {batch_sent_count} из {batch_total_count}. Продолжаю отправку…",
+                                int(flow_key[0]), int(preview_message_id),
+                                reply_markup=None, **NO_PREVIEW,
+                            )
+                        except Exception:
+                            pass
+                except Exception as item_error:
+                    debug_logger.warning(
+                        "PUBLIC_MAX_BATCH_ITEM_FAILED source_chat_id=%s item=%s/%s sent_before_failure=%s error_type=%s",
+                        source_chat_id, payload_index, batch_total_count, batch_sent_count,
+                        type(item_error).__name__,
+                    )
+                    raise
+        result_text = (
+            f"✅ В MAX отправлено {batch_sent_count} сообщений."
+            if batch_mode else "✅ Сообщение отправлено в MAX."
+        )
         _clear_admin_chat_error_notice(source_chat_id)
         result_keyboard = _public_max_send_button_keyboard(
             source_chat_id, private_user_id=int(flow.get("user_id") or flow_key[1])
@@ -8145,6 +8554,19 @@ def _send_public_max_message(flow_key, nonce, preview_message_id):
                 error,
                 "⚠️ MAX открыл чат без поля для отправки. Проверьте, что ссылка ведёт в нужную переписку и аккаунту разрешено писать туда.",
             )
+        if batch_mode:
+            if "MAX_SEND_NOT_CONFIRMED" in str(error):
+                batch_status = (
+                    f"⚠️ MAX подтвердил {batch_sent_count} из {batch_total_count} сообщений. "
+                    "Последнее сообщение могло дойти, но подтверждение не получено. "
+                    "Перед повтором проверьте чат MAX."
+                )
+            else:
+                batch_status = (
+                    f"⚠️ В MAX отправлено {batch_sent_count} из {batch_total_count} сообщений. "
+                    "Неотправленные сообщения бот не повторял, чтобы не дублировать уже доставленные."
+                )
+            result_text = batch_status + "\n\n" + result_text
     finally:
         with public_max_send_flow_lock:
             current = public_max_send_flows.get(flow_key)
@@ -8179,7 +8601,7 @@ def _finalize_public_max_album(flow_key, nonce, media_group_id):
             not album
             or not flow
             or flow.get("nonce") != nonce
-            or flow.get("stage") != "body"
+            or flow.get("stage") not in {"body", "batch_body"}
         ):
             return
         messages = list(album.get("messages") or [])[:10]
@@ -8208,6 +8630,13 @@ def _finalize_public_max_album(flow_key, nonce, media_group_id):
             current = public_max_send_flows.get(flow_key)
             if current and current.get("nonce") == nonce:
                 current["prompt_message_id"] = int(prompt.message_id)
+        return
+    if flow.get("stage") == "batch_body":
+        if not _queue_public_max_batch_item(
+            flow_key, nonce,
+            {"body": body, "media": items, "label": f"Альбом · {len(items)} вложений"},
+        ):
+            debug_logger.info("PUBLIC_MAX_BATCH_ALBUM_NOT_QUEUED user=%s", flow_key[1])
         return
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
@@ -8244,7 +8673,7 @@ def handle_public_max_send_reply(message):
     flow_key = (int(message.chat.id), int(message.from_user.id))
     with public_max_send_flow_lock:
         flow = public_max_send_flows.get(flow_key)
-        if not flow or flow.get("stage") not in {"name", "body"}:
+        if not flow or flow.get("stage") not in {"name", "body", "batch_body"}:
             return
         flow = dict(flow)
 
@@ -8346,6 +8775,16 @@ def handle_public_max_send_reply(message):
             if current and current.get("nonce") == flow.get("nonce"):
                 current["prompt_message_id"] = int(sent.message_id)
         return
+    if flow.get("stage") == "batch_body":
+        if not _queue_public_max_batch_item(flow_key, flow["nonce"], payload):
+            bot.send_message(
+                message.chat.id,
+                "Не удалось добавить сообщение в очередь. Нажмите «Добавить ещё» и попробуйте снова.",
+                reply_markup=_public_max_send_keyboard(flow["nonce"]),
+                **NO_PREVIEW,
+            )
+        return
+
     with public_max_send_flow_lock:
         current = public_max_send_flows.get(flow_key)
         if not current or current.get("nonce") != flow.get("nonce"):
@@ -10210,6 +10649,94 @@ def admin_callbacks(call):
                 call.from_user.id, type(error).__name__,
             )
         return
+    if action.startswith("maxsend_batch_start_"):
+        nonce = action[len("maxsend_batch_start_"):]
+        flow_key = (int(call.message.chat.id), int(call.from_user.id))
+        with public_max_send_flow_lock:
+            flow = public_max_send_flows.get(flow_key)
+            if (
+                not flow or flow.get("nonce") != nonce or flow.get("stage") != "body"
+                or int(flow.get("prompt_message_id") or 0) != int(call.message.message_id)
+            ):
+                flow = None
+            else:
+                flow["batch_mode"] = True
+                flow["batch_items"] = []
+                flow["stage"] = "batch_body"
+                flow["expires_at"] = time.time() + 10 * 60
+        if not flow:
+            bot.answer_callback_query(call.id, "Эта кнопка уже не действует.")
+            return
+        bot.answer_callback_query(call.id, "Режим нескольких сообщений включён")
+        _public_max_batch_prompt(
+            flow_key, nonce,
+            "📨 <b>Режим нескольких сообщений</b>\n\n"
+            f"Отправляйте сообщения по одному. Можно добавить до {MAX_PUBLIC_SEND_BATCH_ITEMS} сообщений; "
+            "после этого проверьте список и отдельно подтвердите отправку.",
+        )
+        return
+    if action.startswith("maxsend_batch_add_"):
+        nonce = action[len("maxsend_batch_add_"):]
+        flow_key = (int(call.message.chat.id), int(call.from_user.id))
+        with public_max_send_flow_lock:
+            flow = public_max_send_flows.get(flow_key)
+            if (
+                not flow or flow.get("nonce") != nonce or flow.get("stage") != "batch_review"
+                or int(flow.get("prompt_message_id") or 0) != int(call.message.message_id)
+                or len(flow.get("batch_items") or []) >= MAX_PUBLIC_SEND_BATCH_ITEMS
+            ):
+                flow = None
+            else:
+                flow["stage"] = "batch_body"
+                flow["expires_at"] = time.time() + 10 * 60
+                next_number = len(flow.get("batch_items") or []) + 1
+        if not flow:
+            bot.answer_callback_query(call.id, "Эта кнопка уже не действует.")
+            return
+        bot.answer_callback_query(call.id, f"Отправьте сообщение {next_number}")
+        _public_max_batch_prompt(
+            flow_key, nonce,
+            f"💬 Отправьте сообщение <b>{next_number}</b> из <b>{MAX_PUBLIC_SEND_BATCH_ITEMS}</b> "
+            "или нажмите «Отмена».",
+        )
+        return
+    if action.startswith("maxsend_batch_submit_"):
+        nonce = action[len("maxsend_batch_submit_"):]
+        flow_key = (int(call.message.chat.id), int(call.from_user.id))
+        with public_max_send_flow_lock:
+            flow = public_max_send_flows.get(flow_key)
+            if (
+                not flow or flow.get("nonce") != nonce or flow.get("stage") != "batch_review"
+                or int(flow.get("prompt_message_id") or 0) != int(call.message.message_id)
+                or not flow.get("batch_items")
+            ):
+                flow = None
+            else:
+                flow["stage"] = "confirm"
+                flow["expires_at"] = time.time() + 10 * 60
+                flow["preview_message_id"] = int(call.message.message_id)
+                source_chat_id = int(flow.get("source_chat_id") or 0)
+                batch_count = len(flow.get("batch_items") or [])
+                preview_text = _public_max_batch_preview_text(flow)
+        if not flow:
+            bot.answer_callback_query(call.id, "Эта кнопка уже не действует.")
+            return
+        bot.answer_callback_query(call.id, "Проверьте список и подтвердите отправку")
+        try:
+            bot.edit_message_text(
+                preview_text,
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=_public_max_send_confirm_keyboard(source_chat_id, nonce, batch_count),
+                **NO_PREVIEW,
+            )
+        except Exception as error:
+            debug_logger.warning(
+                "PUBLIC_MAX_BATCH_CONFIRM_PREVIEW_FAILED user=%s error_type=%s",
+                call.from_user.id, type(error).__name__,
+            )
+        return
     if action.startswith("maxsend_cancel_"):
         nonce = action[len("maxsend_cancel_"):]
         flow_key = (int(call.message.chat.id), int(call.from_user.id))
@@ -10263,7 +10790,10 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "Отправляю сообщение в MAX")
         try:
             bot.edit_message_text(
-                "⏳ Отправляю сообщение в MAX…",
+                (
+                    f"⏳ Отправляю {len(flow.get('batch_items') or [])} сообщений в MAX по порядку…"
+                    if flow.get("batch_mode") else "⏳ Отправляю сообщение в MAX…"
+                ),
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=None,
@@ -11837,6 +12367,111 @@ def admin_callbacks(call):
             call.message.chat.id, call.message.message_id,
             int(action.rsplit("_", 1)[1]),
         )
+    elif action == "admin_view_messages":
+        _show_admin_view_chats(call.message.chat.id, call.message.message_id)
+    elif action.startswith("admin_view_chats_"):
+        try:
+            page = int(action.rsplit("_", 1)[1])
+        except (TypeError, ValueError):
+            page = 0
+        _show_admin_view_chats(call.message.chat.id, call.message.message_id, page=page)
+    elif action.startswith("admin_view_chat_"):
+        try:
+            source_chat_raw, page_raw = action[len("admin_view_chat_"):].rsplit("_", 1)
+            source_chat_id = int(source_chat_raw)
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            bot.answer_callback_query(call.id, "Не удалось открыть этот чат", show_alert=True)
+            return
+        _show_admin_view_posts(
+            call.message.chat.id, call.message.message_id, source_chat_id, page=page
+        )
+    elif action.startswith("admin_view_copy_"):
+        record = _find_sent_parser_record(action[len("admin_view_copy_"):])
+        if not record:
+            bot.answer_callback_query(call.id, "Сообщение больше не найдено", show_alert=True)
+            return
+        copied = 0
+        failures = []
+        target_id = int(record.get("destination_chat_id") or record.get("chat_id") or 0)
+        for source_message_id in (record.get("message_ids") or [])[:20]:
+            try:
+                bot.copy_message(
+                    call.message.chat.id, target_id, int(source_message_id)
+                )
+                copied += 1
+            except Exception as error:
+                failures.append(error)
+        if copied:
+            bot.answer_callback_query(
+                call.id,
+                f"Показано частей: {copied}" + ("; часть не удалось скопировать" if failures else ""),
+                show_alert=bool(failures),
+            )
+        else:
+            bot.answer_callback_query(
+                call.id,
+                "Оригинал Telegram недоступен для копирования. Сведения о нём — в карточке.",
+                show_alert=True,
+            )
+    elif action.startswith("admin_view_delete_yes_"):
+        try:
+            record_id, page_raw = action[len("admin_view_delete_yes_"):].rsplit("_", 1)
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            bot.answer_callback_query(call.id, "Не удалось определить сообщение", show_alert=True)
+            return
+        record = _find_sent_parser_record(record_id)
+        if not record:
+            bot.answer_callback_query(call.id, "Сообщение уже удалено или не найдено", show_alert=True)
+            _show_admin_view_chats(call.message.chat.id, call.message.message_id)
+            return
+        source_chat_id = int(record.get("chat_id") or 0)
+        deleted, remaining, error_text = _delete_sent_parser_record(record_id)
+        if remaining:
+            detail = re.sub(r"\s+", " ", error_text or "")[:70]
+            bot.answer_callback_query(
+                call.id, f"Удалено: {deleted}; осталось: {len(remaining)}. {detail}", show_alert=True
+            )
+        elif deleted:
+            bot.answer_callback_query(call.id, f"Удалено частей: {deleted}")
+        else:
+            bot.answer_callback_query(call.id, error_text or "Не удалось удалить сообщение", show_alert=True)
+        _show_admin_view_posts(
+            call.message.chat.id, call.message.message_id, source_chat_id, page=page
+        )
+    elif action.startswith("admin_view_delete_"):
+        try:
+            record_id, page_raw = action[len("admin_view_delete_"):].rsplit("_", 1)
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            bot.answer_callback_query(call.id, "Не удалось определить сообщение", show_alert=True)
+            return
+        record = _find_sent_parser_record(record_id)
+        if not record or not _sent_record_is_deletable(record):
+            bot.answer_callback_query(call.id, "Удаление этого сообщения уже недоступно", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_view_delete_confirmation(
+            call.message.chat.id, call.message.message_id, record, page=page
+        )
+    elif action.startswith("admin_view_msg_"):
+        try:
+            record_id, page_raw = action[len("admin_view_msg_"):].rsplit("_", 1)
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            bot.answer_callback_query(call.id, "Не удалось открыть сообщение", show_alert=True)
+            return
+        record = _find_sent_parser_record(record_id)
+        if not record:
+            bot.answer_callback_query(call.id, "Сообщение больше не найдено", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_view_record(
+            call.message.chat.id, call.message.message_id, record, page=page
+        )
+    elif action == "admin_view_noop":
+        bot.answer_callback_query(call.id, "Удалять можно в течение 48 часов после отправки")
     elif action == "admin_clear_cache":
         from max_playwright_parser import message_cache_by_chat
         stats = get_global_stats()
