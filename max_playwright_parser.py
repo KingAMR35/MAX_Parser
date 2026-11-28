@@ -4769,12 +4769,40 @@ def _refresh_card_image_urls(page, msg: dict, chat_id: int = 0) -> list[str]:
             imgs=card.locator("img")
             for i in range(min(imgs.count(), 12)):
                 try:
-                    imgs.nth(i).scroll_into_view_if_needed(timeout=700)
+                    img = imgs.nth(i)
+                    excluded = img.evaluate("""img=>{
+                        const item=img.closest('[data-max-parser-message-id]')||img.closest('.item')||img.parentElement;
+                        if(!item)return false;
+                        const blocks=[];
+                        const marker=item.querySelector('.link button.mark');
+                        if(marker)blocks.push(marker.closest('.link')||marker.parentElement||marker);
+                        for(const selector of ['[class*="reply" i]','[class*="quoted" i]','[class*="quote" i]','[data-testid*="reply" i]','[data-testid*="quote" i]']){
+                            try{item.querySelectorAll(selector).forEach(node=>{if(!blocks.some(block=>block===node||block.contains(node)))blocks.push(node);});}catch(e){}
+                        }
+                        return blocks.some(block=>block===img||block.contains(img));
+                    }""")
+                    if excluded:
+                        continue
+                    img.scroll_into_view_if_needed(timeout=700)
                     page.wait_for_timeout(90)
                 except Exception:
                     continue
             card.evaluate("""card=>{
+                const excluded=[];
+                const addExcluded=node=>{
+                    if(!node)return;
+                    if(excluded.some(existing=>existing===node||existing.contains(node)))return;
+                    for(let i=excluded.length-1;i>=0;i--){if(node.contains(excluded[i]))excluded.splice(i,1);}
+                    excluded.push(node);
+                };
+                const marker=card.querySelector('.link button.mark');
+                if(marker)addExcluded(marker.closest('.link')||marker.parentElement||marker);
+                for(const selector of ['[class*="reply" i]','[class*="quoted" i]','[class*="quote" i]','[data-testid*="reply" i]','[data-testid*="quote" i]']){
+                    try{card.querySelectorAll(selector).forEach(addExcluded);}catch(e){}
+                }
+                const inReply=node=>excluded.some(block=>block===node||block.contains(node));
                 for(const img of card.querySelectorAll('img')){
+                    if(inReply(img))continue;
                     try{
                         img.loading='eager';
                         const attrs=['data-src','data-original','data-lazy-src','data-image','data-photo','data-image-url','data-photo-url','data-media-url','data-original-src','data-attachment-url','data-content-url'];
@@ -4789,6 +4817,20 @@ def _refresh_card_image_urls(page, msg: dict, chat_id: int = 0) -> list[str]:
         except Exception: pass
         values=card.locator("img, picture source, a[href]").evaluate_all(r"""els=>els.map(el=>{
             const tag=(el.tagName||'').toLowerCase();
+            const excluded=[];
+            const addExcluded=node=>{
+                if(!node)return;
+                if(excluded.some(existing=>existing===node||existing.contains(node)))return;
+                for(let i=excluded.length-1;i>=0;i--){if(node.contains(excluded[i]))excluded.splice(i,1);}
+                excluded.push(node);
+            };
+            const item=el.closest('[data-max-parser-message-id]')||el.closest('.item');
+            const marker=item?.querySelector('.link button.mark');
+            if(marker)addExcluded(marker.closest('.link')||marker.parentElement||marker);
+            for(const selector of ['[class*="reply" i]','[class*="quoted" i]','[class*="quote" i]','[data-testid*="reply" i]','[data-testid*="quote" i]']){
+                try{item?.querySelectorAll(selector).forEach(addExcluded);}catch(e){}
+            }
+            if(excluded.some(block=>block===el||block.contains(el)))return {tag,meta:'',emoji:false,smallInlineImage:false,urls:[]};
             const meta=[el.className||'',el.getAttribute?.('data-testid')||'',el.getAttribute?.('aria-label')||'',el.getAttribute?.('alt')||'',el.getAttribute?.('title')||'',el.getAttribute?.('data-type')||'',el.parentElement?.className||''].join(' ').toLowerCase();
             const onlyEmojiLabel=value=>{
                 const text=String(value||'').trim();
@@ -4811,12 +4853,55 @@ def _refresh_card_image_urls(page, msg: dict, chat_id: int = 0) -> list[str]:
                 const cp=[node.getAttribute?.('data-codepoint')||'',node.getAttribute?.('data-codepoints')||'',node.getAttribute?.('data-unicode')||''].join(' ');
                 if(/(?:^|\s)(?:U\+|0x)?[0-9a-f]{4,6}(?:[-,\s]+(?:U\+|0x)?[0-9a-f]{4,6})*(?:$|\s)/i.test(cp)) emoji=true;
             }
-            const attrs=['src','current-src','data-src','data-original','data-lazy-src','data-image','data-photo','data-image-url','data-photo-url','data-media-url','data-original-src','data-attachment-url','data-content-url','href'];
-            const urls=[];
-            for(const a of attrs){ let v=(a==='src'&&el.currentSrc)?el.currentSrc:(el.getAttribute?.(a)||''); if(v&&/^(https?:|blob:)/i.test(v)) urls.push(v); }
-            try{ const bg=getComputedStyle(el).backgroundImage||''; const m=bg.match(/url\([\"']?(.*?)[\"']?\)/i); if(m&&/^(https?:|blob:)/i.test(m[1])) urls.push(m[1]); }catch(e){}
+            const normalize=value=>{
+                let url=String(value||'').trim();
+                if(!/^(?:https?:|blob:|\/\/|\/)/i.test(url))return '';
+                try{if(url.startsWith('//'))url=location.protocol+url;else if(url.startsWith('/'))url=new URL(url,location.href).href;}catch(e){}
+                return url;
+            };
+            const ranked=[];
+            const rank=(value,score)=>{const url=normalize(value);if(url)ranked.push({url,score});};
+            const srcsetChoice=value=>{
+                let best=null;
+                for(const entry of String(value||'').split(',')){
+                    const parts=entry.trim().split(/\s+/),url=normalize(parts[0]);
+                    if(!url)continue;
+                    const width=String(parts[1]||'').match(/^(\d+(?:\.\d+)?)w$/i);
+                    const density=String(parts[1]||'').match(/^(\d+(?:\.\d+)?)x$/i);
+                    const score=width?Number(width[1]):density?Number(density[1])*1000:1;
+                    if(!best||score>best.score)best={url,score};
+                }
+                return best;
+            };
             const href=(el.getAttribute?.('href')||'');
-            const anchorLooksLikeImage=tag!=='a' || /(?:\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|$))|^blob:|photo|image|media|attachment|picture/i.test(href+' '+meta);
+            if(tag==='img'){
+                for(const attr of ['data-original','data-original-src','data-full-size','data-full-src','data-download-url','data-file-url','data-attachment-url','data-content-url'])rank(el.getAttribute?.(attr),100000);
+                const anchor=el.closest('a[href]'),anchorHref=anchor?.getAttribute('href')||'';
+                if(anchor&&/(?:\.(?:jpe?g|png|gif|webp|bmp|avif)(?:[?#]|$))|^blob:|photo|image|media|attachment|picture/i.test(anchorHref+' '+(anchor.className||'')))rank(anchorHref,95000);
+                const responsive=[];
+                const own=srcsetChoice(el.getAttribute?.('srcset')||el.getAttribute?.('data-srcset'));if(own)responsive.push(own);
+                const picture=el.closest('picture');
+                if(picture)for(const source of picture.querySelectorAll('source')){const choice=srcsetChoice(source.getAttribute('srcset')||source.getAttribute('data-srcset'));if(choice)responsive.push(choice);}
+                if(responsive.length){responsive.sort((a,b)=>b.score-a.score);rank(responsive[0].url,50000+Math.max(0,responsive[0].score)*10);}
+                for(const attr of ['data-photo-url','data-image-url','data-media-url'])rank(el.getAttribute?.(attr),40000);
+                rank(el.currentSrc,30000);rank(el.getAttribute?.('src')||el.src,20000);
+                for(const attr of ['data-src','data-lazy-src','data-photo','data-image'])rank(el.getAttribute?.(attr),10000);
+            }else if(tag==='source'){
+                if(!el.parentElement?.querySelector('img')){
+                    const choice=srcsetChoice(el.getAttribute?.('srcset')||el.getAttribute?.('data-srcset'));
+                    if(choice)rank(choice.url,50000+Math.max(0,choice.score)*10);
+                    else rank(el.getAttribute?.('data-original')||el.getAttribute?.('data-src')||el.getAttribute?.('src'),30000);
+                }
+            }else if(tag==='a'){
+                if(!el.querySelector('img')&&/(?:\.(?:jpe?g|png|gif|webp|bmp|avif)(?:[?#]|$))|^blob:|photo|image|media|attachment|picture/i.test(href+' '+meta))rank(href,95000);
+            }else{
+                if(el.querySelector?.('img'))return {tag,meta,emoji:emoji&&!sticker,smallInlineImage:false,urls:[]};
+                for(const attr of ['data-original','data-original-src','data-full-size','data-full-src','data-download-url','data-file-url','data-attachment-url','data-content-url','data-photo-url','data-image-url','data-media-url','data-image','data-photo','data-src','data-lazy-src'])rank(el.getAttribute?.(attr),40000);
+                try{const bg=getComputedStyle(el).backgroundImage||'';const m=bg.match(/url\([\"']?(.*?)[\"']?\)/i);if(m)rank(m[1],30000);}catch(e){}
+            }
+            ranked.sort((a,b)=>b.score-a.score);
+            const urls=ranked.length?[ranked[0].url]:[];
+            const anchorLooksLikeImage=tag!=='a' || /(?:\.(?:jpe?g|png|gif|webp|bmp|avif)(?:[?#]|$))|^blob:|photo|image|media|attachment|picture/i.test(href+' '+meta);
             let smallInlineImage=false;
             if(tag==='img'&&!sticker){
                 const rect=el.getBoundingClientRect();
@@ -4851,7 +4936,21 @@ def _warmup_captioned_photo_card(page, msg: dict, chat_id: int = 0) -> None:
             const attrs = ['data-src','data-original','data-lazy-src','data-image','data-photo',
                 'data-image-url','data-photo-url','data-media-url','data-original-src',
                 'data-attachment-url','data-content-url'];
+            const excluded=[];
+            const addExcluded=node=>{
+                if(!node)return;
+                if(excluded.some(existing=>existing===node||existing.contains(node)))return;
+                for(let i=excluded.length-1;i>=0;i--){if(node.contains(excluded[i]))excluded.splice(i,1);}
+                excluded.push(node);
+            };
+            const marker=card.querySelector('.link button.mark');
+            if(marker)addExcluded(marker.closest('.link')||marker.parentElement||marker);
+            for(const selector of ['[class*="reply" i]','[class*="quoted" i]','[class*="quote" i]','[data-testid*="reply" i]','[data-testid*="quote" i]']){
+                try{card.querySelectorAll(selector).forEach(addExcluded);}catch(e){}
+            }
+            const inReply=node=>excluded.some(block=>block===node||block.contains(node));
             for (const img of card.querySelectorAll('img')) {
+                if(inReply(img))continue;
                 try {
                     img.loading = 'eager';
                     img.decoding = 'sync';
@@ -4867,6 +4966,7 @@ def _warmup_captioned_photo_card(page, msg: dict, chat_id: int = 0) -> None:
                 } catch(e) {}
             }
             for (const el of card.querySelectorAll('img, [style*="background-image" i], [data-image-url], [data-photo-url], [data-media-url]')) {
+                if(inReply(el))continue;
                 try { el.scrollIntoView({block:'center', inline:'nearest'}); } catch(e) {}
             }
         }""")
@@ -6240,6 +6340,22 @@ def parse_max_group_media(
                     return null;
                 }
 
+                function getReplyMediaBlock(row) {
+                    // The reply marker is sometimes only a small button inside a
+                    // larger preview card. Exclude the whole card from media
+                    // discovery so its old thumbnail cannot be sent as new media.
+                    try {
+                        const marker = row.querySelector(".link button.mark");
+                        if (marker) return marker.closest(".link") || marker.parentElement || marker;
+                    } catch (e) {}
+                    return getReplyBlock(row);
+                }
+
+                function isExcludedMessageMedia(el, excludedBlock) {
+                    return Boolean(el && excludedBlock &&
+                        (el === excludedBlock || excludedBlock.contains(el)));
+                }
+
                 function getReplyText(block) {
                     if (!block) return "";
                     return clean(block.textContent);
@@ -7031,42 +7147,14 @@ def parse_max_group_media(
                     return false;
                 }
 
-                function getImageCandidateCount(row) {
-                    let count = 0;
-                    const seen = new Set();
-                    function isEmoji(el) {
-                        const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el,"data-type")}`;
-                        if (/sticker|стикер/i.test(meta)) return false;
-                        if (/(^|[ _:-])emoji([ _:-]|$)|animated.?emoji|эмодзи|emoticon|smiley|custom.?emoji/i.test(meta)) return true;
-                        try { const cp=[safeAttr(el,"data-codepoint"),safeAttr(el,"data-codepoints"),safeAttr(el,"data-unicode")].join(' '); if(/^(?:U\+|0x)?[0-9a-f]{4,6}(?:[-,\s]+(?:U\+|0x)?[0-9a-f]{4,6})*$/i.test(cp.trim())) return true; } catch(e) {}
-                        try { return /[\u2600-\u27BF\u{1F000}-\u{1FAFF}]/u.test(safeAttr(el,"alt") || safeAttr(el,"aria-label") || ""); } catch(e) { return false; }
-                    }
-                    try {
-                        row.querySelectorAll("img,picture source").forEach(img => {
-                            if (isLinkPreviewMedia(img, row)) return;
-                            const meta = `${safeAttr(img,"class")} ${safeAttr(img,"data-testid")} ${safeAttr(img,"aria-label")} ${safeAttr(img,"alt")} ${safeAttr(img,"title")} ${safeAttr(img,"data-type")}`.toLowerCase();
-                            if (/avatar|userpic|profile|favicon|spacer|blank/.test(meta) || isEmoji(img)) return;
-                            const r = img.getBoundingClientRect();
-                            if (r.width >= 20 && r.height >= 20) {
-                                const key=`${Math.round(r.left)}:${Math.round(r.top)}:${Math.round(r.width)}:${Math.round(r.height)}`;
-                                if (!seen.has(key)) {seen.add(key);count++;}
-                            }
-                        });
-                    } catch(e) {}
-                    try {
-                        row.querySelectorAll("a[href],div[data-image-url],div[data-photo-url],div[data-media-url],[style*='background-image' i]").forEach(el=>{
-                            if (isLinkPreviewMedia(el, row)) return;
-                            const meta=`${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")} ${safeAttr(el,"data-type")}`;
-                            if (/avatar|userpic|profile|favicon|spacer|blank/i.test(meta) || isEmoji(el)) return;
-                            const url=safeAttr(el,"href")||safeAttr(el,"data-image-url")||safeAttr(el,"data-photo-url")||safeAttr(el,"data-media-url");
-                            let bg=""; try{bg=getComputedStyle(el).backgroundImage||"";}catch(e){}
-                            if(url||/^url\(/i.test(bg)) count++;
-                        });
-                    } catch(e) {}
-                    return count;
+                function getImageCandidateCount(row, excludedBlock = null) {
+                    // Count the same logical image sources that will actually be
+                    // downloaded. Counting every srcset rendition inflated this
+                    // value and made thumbnails look like separate attachments.
+                    return getImageUrls(row, excludedBlock).length;
                 }
 
-                function getEmojiImageUrls(row) {
+                function getEmojiImageUrls(row, excludedBlock = null) {
                     const out=[]; const seen=new Set();
                     const add=u=>{ if(!u||typeof u!=='string'||u.startsWith('data:')) return; if(!seen.has(u)){seen.add(u);out.push(u);} };
                     const emojiMeta = el => {
@@ -7088,6 +7176,7 @@ def parse_max_group_media(
                         return !text.replace(/[\s\uFE0E\uFE0F\u200D]/g, "");
                     };
                     row.querySelectorAll('img,video,canvas,[role="img"],[class*="emoji" i],[class*="animated" i],[data-type*="emoji" i],[data-testid*="emoji" i],[data-emoji],[data-emoji-char],[data-animated-emoji],[data-custom-emoji],[data-emoji-id],[data-emoji-name],[data-emoji-code],[data-emoji-codepoint],[data-codepoint],[data-codepoints],[data-unicode]').forEach(el=>{
+                        if (isExcludedMessageMedia(el, excludedBlock)) return;
                         if (isLinkPreviewMedia(el, row)) return;
                         const meta=emojiMeta(el);
                         if(/sticker|стикер/.test(meta)) return;
@@ -7108,7 +7197,7 @@ def parse_max_group_media(
                     return out;
                 }
 
-                function getImageUrls(row) {
+                function getImageUrls(row, excludedBlock = null) {
                     const images = [];
                     const seen = new Set();
                     function add(src) {
@@ -7144,42 +7233,117 @@ def parse_max_group_media(
                         } catch(e) {}
                         return false;
                     }
+                    function validUrl(value) {
+                        let url = String(value || "").trim();
+                        if (!/^(?:https?:|blob:|\/\/|\/)/i.test(url)) return "";
+                        try {
+                            if (url.startsWith("//")) url = location.protocol + url;
+                            else if (url.startsWith("/")) url = new URL(url, location.href).href;
+                        } catch(e) {}
+                        return url;
+                    }
+                    function srcsetChoice(value) {
+                        let best = "";
+                        let bestScore = -1;
+                        for (const entry of String(value || "").split(",")) {
+                            const parts = entry.trim().split(/\s+/);
+                            const url = validUrl(parts[0]);
+                            if (!url) continue;
+                            const descriptor = String(parts[1] || "");
+                            const width = descriptor.match(/^(\d+(?:\.\d+)?)w$/i);
+                            const density = descriptor.match(/^(\d+(?:\.\d+)?)x$/i);
+                            const score = width ? Number(width[1]) : density ? Number(density[1]) * 1000 : 1;
+                            if (score > bestScore) { best = url; bestScore = score; }
+                        }
+                        return {url:best, score:bestScore};
+                    }
+                    function chooseImageUrl(img) {
+                        const ranked = [];
+                        const addRanked = (value, score) => {
+                            const url = validUrl(value);
+                            if (url) ranked.push({url, score});
+                        };
+                        // Prefer MAX's explicit original/download URLs, then the
+                        // largest responsive image, and only then the visible src.
+                        for (const attr of ["data-original", "data-original-src", "data-full-size", "data-full-src", "data-download-url", "data-file-url", "data-attachment-url", "data-content-url"]) {
+                            addRanked(safeAttr(img, attr), 100000);
+                        }
+                        const anchor = img.closest("a[href]");
+                        if (anchor && !isExcludedMessageMedia(anchor, excludedBlock) && !isLinkPreviewMedia(anchor, row)) {
+                            const href = safeAttr(anchor, "href");
+                            const meta = `${metaOf(anchor)} ${href}`;
+                            if (/\.(?:jpe?g|png|gif|webp|bmp|avif)(?:[?#].*)?$/i.test(href) || /^blob:/i.test(href) || /(photo|image|media|attachment|picture|фото|изображ|картин)/i.test(meta)) {
+                                addRanked(href, 95000);
+                            }
+                        }
+                        const responsive = [];
+                        const ownSrcset = srcsetChoice(safeAttr(img, "srcset") || safeAttr(img, "data-srcset"));
+                        if (ownSrcset.url) responsive.push(ownSrcset);
+                        const picture = img.closest("picture");
+                        if (picture) {
+                            for (const source of picture.querySelectorAll("source")) {
+                                if (isExcludedMessageMedia(source, excludedBlock) || isLinkPreviewMedia(source, row)) continue;
+                                const choice = srcsetChoice(safeAttr(source, "srcset") || safeAttr(source, "data-srcset"));
+                                if (choice.url) responsive.push(choice);
+                            }
+                        }
+                        if (responsive.length) {
+                            responsive.sort((a, b) => b.score - a.score);
+                            addRanked(responsive[0].url, 50000 + Math.max(0, responsive[0].score) * 10);
+                        }
+                        for (const attr of ["data-photo-url", "data-image-url", "data-media-url", "data-src", "data-lazy-src", "data-photo", "data-image"]) {
+                            addRanked(safeAttr(img, attr), 40000);
+                        }
+                        addRanked(img.currentSrc, 30000);
+                        addRanked(safeAttr(img, "src") || img.src, 20000);
+                        ranked.sort((a, b) => b.score - a.score);
+                        return ranked.length ? ranked[0].url : "";
+                    }
                     try {
                         row.querySelectorAll("img").forEach(img => {
+                            if (isExcludedMessageMedia(img, excludedBlock)) return;
+                            if (img.closest("video, audio")) return;
                             if (isLinkPreviewMedia(img, row)) return;
                             const meta = metaOf(img);
                             if (/avatar|userpic|profile|favicon|spacer|blank/.test(meta)) return;
                             if (isEmojiNode(img)) return;
-                            // Сначала собираем реальный URL. У lazy-photo MAX размер img
-                            // иногда временно равен 0x0, хотя src/data-* уже заполнены.
-                            const before = images.length;
-                            add((typeof img.currentSrc === "string" && img.currentSrc) || safeAttr(img,"src"));
-                            if (typeof img.src === "string") add(img.src);
-                            ["data-src","data-original","data-lazy-src","data-image","data-photo","data-image-url","data-photo-url","data-media-url","data-original-src","data-attachment-url","data-content-url","data-file-url"].forEach(a => add(safeAttr(img,a)));
-                            const srcset = safeAttr(img,"srcset") || safeAttr(img,"data-srcset");
-                            if (srcset) srcset.split(",").map(x=>x.trim().split(/\s+/)[0]).forEach(add);
+                            // Treat each rendered image as one attachment. MAX can
+                            // expose thumbnail, responsive and original URLs at once;
+                            // sending all of them made one photo appear several times.
+                            const imageUrl = chooseImageUrl(img);
+                            if (imageUrl) add(imageUrl);
                             // Если URL нет, только тогда требуем заметный размер.
                             const rect = img.getBoundingClientRect();
-                            if (images.length === before && (rect.width < 12 || rect.height < 12)) return;
+                            if (!imageUrl && (rect.width < 12 || rect.height < 12)) return;
                         });
                     } catch(e) {}
                     try {
                         row.querySelectorAll("picture source, source").forEach(el => {
-                            if (isLinkPreviewMedia(el, row)) return;
+                            if (isExcludedMessageMedia(el, excludedBlock) || isLinkPreviewMedia(el, row)) return;
+                            if (el.closest("video, audio")) return;
+                            if (el.parentElement && el.parentElement.querySelector("img")) return;
                             const meta = metaOf(el);
                             if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи/.test(meta) || isEmojiNode(el, false)) return;
-                            const srcset = safeAttr(el,"srcset") || safeAttr(el,"data-srcset");
-                            if (srcset) srcset.split(",").map(x=>x.trim().split(/\s+/)[0]).forEach(add);
-                            ["src","data-src","data-original","data-image-url","data-photo-url","data-media-url","data-attachment-url","data-content-url"].forEach(a=>add(safeAttr(el,a)));
-                            if (typeof el.src === "string") add(el.src);
+                            const choice = srcsetChoice(safeAttr(el,"srcset") || safeAttr(el,"data-srcset"));
+                            if (choice.url) add(choice.url);
+                            else add(safeAttr(el,"data-original") || safeAttr(el,"data-src") || safeAttr(el,"src") || el.src);
                         });
                     } catch(e) {}
                     try {
                         row.querySelectorAll("*").forEach(el => {
+                            if (isExcludedMessageMedia(el, excludedBlock)) return;
                             if (isLinkPreviewMedia(el, row)) return;
                             const meta = metaOf(el);
                             if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи/.test(meta) || isEmojiNode(el, false)) return;
-                            ["data-image-url","data-photo-url","data-media-url","data-image","data-photo","data-original","data-original-src","data-src","data-lazy-src","data-attachment-url","data-content-url","data-file-url"].forEach(a=>add(safeAttr(el,a)));
+                            // An image's descendants/wrappers are handled by its
+                            // <img>; do not rediscover a different thumbnail URL
+                            // from every node surrounding that same photo.
+                            if (el.querySelector && el.querySelector("img")) return;
+                            let dataUrl = "";
+                            for (const attr of ["data-original", "data-original-src", "data-full-size", "data-full-src", "data-download-url", "data-file-url", "data-attachment-url", "data-content-url", "data-photo-url", "data-image-url", "data-media-url", "data-image", "data-photo", "data-src", "data-lazy-src"]) {
+                                dataUrl = validUrl(safeAttr(el, attr));
+                                if (dataUrl) break;
+                            }
                             let candidates = [];
                             const style = safeAttr(el,"style");
                             const sm = style && style.match(/url\([\"']?(.*?)[\"']?\)/i);
@@ -7193,13 +7357,17 @@ def parse_max_group_media(
                             // У MAX анимированный стикер может быть CSS background-image, без img/src.
                             if (rect.width >= 40 && rect.height >= 40 &&
                                 /(photo|image|media|attachment|picture|sticker|стикер|фото|изображ|картин)/i.test(meta)) {
-                                candidates.forEach(v => { if (/^(?:https?:|blob:)/i.test(String(v||""))) add(v); });
+                                const backgroundUrl = candidates.map(validUrl).find(Boolean) || "";
+                                if (!dataUrl && backgroundUrl) dataUrl = backgroundUrl;
                             }
+                            if (dataUrl) add(dataUrl);
                         });
                     } catch(e) {}
                     try {
                         row.querySelectorAll("a[href]").forEach(a => {
+                            if (isExcludedMessageMedia(a, excludedBlock)) return;
                             if (isLinkPreviewMedia(a, row)) return;
+                            if (a.querySelector("img")) return;
                             const href = safeAttr(a,"href");
                             const meta = metaOf(a);
                             if (/avatar|userpic|profile|favicon/.test(meta) || isEmojiNode(a)) return;
@@ -7229,7 +7397,7 @@ def parse_max_group_media(
                 }
 
 
-                function getRichAttachments(row) {
+                function getRichAttachments(row, excludedBlock = null) {
                     const out = [];
                     const seen = new Set();
                     function push(type, url, filename, extra = {}) {
@@ -7283,7 +7451,8 @@ def parse_max_group_media(
                     // One video element may expose the same clip through <video>,
                     // several <source> nodes and MAX's data-* attributes. Keep the
                     // URL candidates together so they remain one attachment.
-                    const mediaOwners = Array.from(row.querySelectorAll("video, audio"));
+                    const mediaOwners = Array.from(row.querySelectorAll("video, audio"))
+                        .filter(el => !isExcludedMessageMedia(el, excludedBlock));
                     const videoOwnerAttachments = new Map();
                     mediaOwners.forEach(el => {
                         if (isLinkPreviewMedia(el, row) || isEmojiAttachment(el)) return;
@@ -7308,6 +7477,8 @@ def parse_max_group_media(
                         }
                         let parent = el.parentElement;
                         for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
+                            if (isExcludedMessageMedia(parent, excludedBlock)) break;
+                            if (excludedBlock && parent.contains(excludedBlock)) break;
                             // Stay inside this media's wrapper. A message row can hold
                             // several attachments; its download links must not become
                             // alternate sources for every video in that row.
@@ -7413,6 +7584,7 @@ def parse_max_group_media(
                     elements.forEach(el => {
                         // Attributes nested in an actual media element are alternate
                         // URLs for that same clip, already handled above.
+                        if (isExcludedMessageMedia(el, excludedBlock)) return;
                         if (isLinkPreviewMedia(el, row) || (el.closest && el.closest("video, audio"))) return;
                         if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
@@ -7428,6 +7600,7 @@ def parse_max_group_media(
                     });
                     // Некоторые версии MAX держат медиа в div/span как background-image.
                     row.querySelectorAll("div,span,a,canvas").forEach(el => {
+                        if (isExcludedMessageMedia(el, excludedBlock)) return;
                         if (isLinkPreviewMedia(el, row) || isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|sticker|media)/i.test(meta)) return;
@@ -7449,6 +7622,7 @@ def parse_max_group_media(
                     // Дополнительный fallback: некоторые MAX-карточки хранят видео/voice URL
                     // в произвольных data-* атрибутах контейнера.
                     row.querySelectorAll("*").forEach(el => {
+                        if (isExcludedMessageMedia(el, excludedBlock)) return;
                         if (isEmojiAttachment(el)) return;
                         const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"data-type")} ${safeAttr(el,"role")}`;
                         if (!/(video|voice|audio|круж|голос|media|videonote|video-note)/i.test(meta)) return;
@@ -7463,6 +7637,7 @@ def parse_max_group_media(
                     try {
                         let hasVideoAttachment = out.some(item => item.type === "video" || item.type === "video_note");
                         row.querySelectorAll("*").forEach(el => {
+                            if (isExcludedMessageMedia(el, excludedBlock)) return;
                             const t = clean(el.textContent);
                             if (!/^\d{1,2}:\d{2}$/.test(t)) return;
                             let node = el;
@@ -8055,16 +8230,19 @@ def parse_max_group_media(
                         const date = getDate(row);
                         const replyBlock = getReplyBlock(row);
                         const replyText = getReplyText(replyBlock);
+                        const replyMediaBlock = getReplyMediaBlock(row);
                         // Media and special-card selectors are scoped to this message's bubble.
                         // The outer .item can also contain nested/replied cards and UI controls.
-                        const images = getImageUrls(bubble);
-                        const emojiImageUrls = getEmojiImageUrls(bubble);
-                        const imageCandidateCount = getImageCandidateCount(bubble);
-                        let photoVisualHint = Boolean(bubble.querySelector("img, picture source, canvas, [data-image-url], [data-photo-url], [data-media-url], [style*='background-image' i]"));
+                        const images = getImageUrls(bubble, replyMediaBlock);
+                        const emojiImageUrls = getEmojiImageUrls(bubble, replyMediaBlock);
+                        const imageCandidateCount = getImageCandidateCount(bubble, replyMediaBlock);
+                        let photoVisualHint = Array.from(bubble.querySelectorAll("img, picture source, canvas, [data-image-url], [data-photo-url], [data-media-url], [style*='background-image' i]"))
+                            .some(el => !isExcludedMessageMedia(el, replyMediaBlock) && !isLinkPreviewMedia(el, bubble));
                         if (!photoVisualHint) {
                             try {
                                 const visualNodes = bubble.querySelectorAll("div,span,a,button,figure");
                                 for (const el of visualNodes) {
+                                    if (isExcludedMessageMedia(el, replyMediaBlock) || isLinkPreviewMedia(el, bubble)) continue;
                                     const meta = `${safeAttr(el,"class")} ${safeAttr(el,"data-testid")} ${safeAttr(el,"aria-label")} ${safeAttr(el,"alt")} ${safeAttr(el,"title")}`;
                                     if (/avatar|userpic|profile|favicon|emoji|animated.?emoji|эмодзи|sticker|стикер/i.test(meta)) continue;
                                     const rect = el.getBoundingClientRect();
@@ -8077,7 +8255,7 @@ def parse_max_group_media(
                                 }
                             } catch(e) {}
                         }
-                        const richAttachments = getRichAttachments(bubble);
+                        const richAttachments = getRichAttachments(bubble, replyMediaBlock);
                         const stickerHint = Boolean(bubble.querySelector("[class*='sticker' i],[data-testid*='sticker' i],[aria-label*='sticker' i],[aria-label*='стикер' i],[data-sticker]"));
                         const mediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("video,audio,source,button,[role='button'],[aria-label],[data-testid]")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')} ${el.tagName||''}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
                         const deepMediaMeta = (()=>{ try { return Array.from(bubble.querySelectorAll("*")).map(el=>`${safeAttr(el,'class')} ${safeAttr(el,'data-testid')} ${safeAttr(el,'aria-label')} ${safeAttr(el,'title')} ${safeAttr(el,'data-type')}`).join(' ').toLowerCase(); } catch(e) { return ''; } })();
